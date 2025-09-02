@@ -324,7 +324,7 @@ func (s *schema) getConnection() *Connection {
 		}
 	}
 
-	if db, exists := globalConnections[fmt.Sprintf("%s", s.Connection)]; exists {
+	if db, exists := globalConnections[s.Connection]; exists {
 		return db
 	}
 

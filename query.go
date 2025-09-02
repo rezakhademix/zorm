@@ -428,7 +428,7 @@ type selected struct {
 }
 
 func (s selected) String() string {
-	return fmt.Sprintf("%s", strings.Join(s.Columns, ","))
+	return strings.Join(s.Columns, ",")
 }
 
 // OrderBy adds an ORDER BY clause to the query.
@@ -577,9 +577,8 @@ func (b cond) ToSql() (string, []any, error) {
 		} else if rawThing, isRaw := b.Rhs.(*raw); isRaw {
 			return fmt.Sprintf("%s IN (%s)", b.Lhs, rawThing.sql), rawThing.args, nil
 		} else {
-			return "", nil, fmt.Errorf("Right hand side of Cond when operator is IN should be either a any slice or *raw")
+			return "", nil, fmt.Errorf("right side of Cond when operator is IN should be either a any slice or *raw")
 		}
-
 	} else {
 		phs = b.PlaceHolderGenerator(1)
 		return fmt.Sprintf("%s %s %s", b.Lhs, b.Op, pop(&phs)), []any{b.Rhs}, nil

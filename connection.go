@@ -165,7 +165,3 @@ func (c *Connection) exec(q string, args ...any) (sql.Result, error) {
 func (c *Connection) query(q string, args ...any) (*sql.Rows, error) {
 	return c.DB.Query(q, args...)
 }
-
-func (c *Connection) queryRow(q string, args ...any) *sql.Row {
-	return c.DB.QueryRow(q, args...)
-}

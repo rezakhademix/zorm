@@ -1,7 +1,6 @@
 package orm
 
 import (
-	"database/sql"
 	"errors"
 
 	"github.com/gertd/go-pluralize"
@@ -10,7 +9,6 @@ import (
 type EntityConfigurator struct {
 	connection        string
 	table             string
-	this              Entity
 	relations         map[string]any
 	resolveRelations  []func()
 	columnConstraints []*FieldConfigurator
@@ -163,7 +161,6 @@ func (ec *EntityConfigurator) BelongsToMany(owner Entity, config BelongsToManyCo
 
 type FieldConfigurator struct {
 	fieldName   string
-	nullable    sql.NullBool
 	primaryKey  bool
 	column      string
 	isCreatedAt bool
