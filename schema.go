@@ -3,7 +3,6 @@ package orm
 import (
 	"database/sql"
 	"database/sql/driver"
-	"fmt"
 	"maps"
 	"reflect"
 )
@@ -22,7 +21,7 @@ func getConnectionFor(e Entity) *Connection {
 		}
 	}
 
-	if db, exists := globalConnections[fmt.Sprintf("%s", configurator.connection)]; exists {
+	if db, exists := globalConnections[configurator.connection]; exists {
 		return db
 	}
 
@@ -223,16 +222,6 @@ func (s *schema) updatedAt() *field {
 	return nil
 }
 
-func (s *schema) deletedAt() *field {
-	for _, f := range s.fields {
-		if f.IsDeletedAt {
-			return f
-		}
-	}
-
-	return nil
-}
-
 func pointersOf(v reflect.Value) map[string]any {
 	m := map[string]any{}
 	actualV := v
@@ -324,7 +313,7 @@ func (s *schema) getConnection() *Connection {
 		}
 	}
 
-	if db, exists := globalConnections[fmt.Sprintf("%s", s.Connection)]; exists {
+	if db, exists := globalConnections[s.Connection]; exists {
 		return db
 	}
 
