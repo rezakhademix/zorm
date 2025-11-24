@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-// queryer returns the query executor (tx or db).
+// queryer returns the appropriate query executor based on transaction state.
+// If a transaction is active (m.tx != nil), it returns the transaction executor.
+// Otherwise, it returns the database connection executor.
+// This allows the ORM to seamlessly work with both transactional and non-transactional contexts.
 func (m *Model[T]) queryer() interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -88,7 +91,11 @@ func (m *Model[T]) Pluck(column string) ([]any, error) {
 		results = append(results, val)
 	}
 
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, WrapQueryError("SCAN", query, args, err)
+	}
+
+	return results, nil
 }
 
 // Count returns the number of records matching the query.
@@ -117,8 +124,11 @@ func (m *Model[T]) Count() (int64, error) {
 
 	var count int64
 	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, WrapQueryError("COUNT", query, args, err)
+	}
 
-	return count, err
+	return count, nil
 }
 
 // CountOver returns count of records partitioned by the specified column.
@@ -153,7 +163,10 @@ func (m *Model[T]) CountOver(column string) (map[any]int64, error) {
 	return result, rows.Err()
 }
 
-// buildSelectQuery constructs the SQL SELECT statement.
+// buildSelectQuery constructs the SQL SELECT statement from the query builder state.
+// It handles SELECT with DISTINCT, DISTINCT ON (PostgreSQL), columns, WHERE, GROUP BY,
+// HAVING, ORDER BY, LIMIT, and OFFSET clauses.
+// Returns the complete SQL query string and its corresponding arguments.
 func (m *Model[T]) buildSelectQuery() (string, []any) {
 	if m.rawQuery != "" {
 		return m.rawQuery, m.rawArgs
@@ -208,6 +221,8 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	return sb.String(), m.args
 }
 
+// buildWhereClause appends WHERE conditions to the query builder.
+// It uses "WHERE 1=1" as a base to simplify appending AND/OR conditions.
 func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 	if len(m.wheres) > 0 {
 		sb.WriteString(" WHERE 1=1 ") // Simplifies appending AND/OR
@@ -218,7 +233,31 @@ func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 	}
 }
 
+// prepareScanDestinations creates scan destinations for sql.Rows.Scan based on column names.
+// It maps database columns to struct fields using the model's column metadata.
+// Columns not found in the struct are ignored to allow SELECT with extra columns.
+// Returns a slice of pointers that can be passed to rows.Scan().
+func (m *Model[T]) prepareScanDestinations(columns []string, val reflect.Value) []any {
+	dest := make([]any, len(columns))
+
+	for i, colName := range columns {
+		if fieldInfo, ok := m.modelInfo.Columns[colName]; ok {
+			// Get the field value and take its address for scanning
+			// Both pointer and non-pointer fields use Addr() since sql.Scan needs **Type or *Type
+			fieldVal := val.FieldByName(fieldInfo.Name)
+			dest[i] = fieldVal.Addr().Interface()
+		} else {
+			// Column not in struct, ignore it
+			var ignore any
+			dest[i] = &ignore
+		}
+	}
+
+	return dest
+}
+
 // scanRows scans sql.Rows into a slice of *T.
+// It uses prepareScanDestinations to map columns to struct fields.
 func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -227,50 +266,13 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 
 	var results []*T
 
-	// Pre-calculate field mapping for performance
-	// We need to map DB column index -> Struct Field
-	// But we don't know the column order until now.
-
 	for rows.Next() {
 		// Create new instance of T
-		// T is a struct, so we need a pointer to it.
-		// new(T) returns *T
 		entity := new(T)
 		val := reflect.ValueOf(entity).Elem()
 
-		// Prepare scan destinations
-		dest := make([]any, len(columns))
-
-		for i, colName := range columns {
-			// Find the field for this column
-			if fieldInfo, ok := m.modelInfo.Columns[colName]; ok {
-				// Get the field value
-				fieldVal := val.FieldByName(fieldInfo.Name)
-
-				// If field is a pointer, we can scan directly into it?
-				// sql.Scan handles *int, *string etc.
-				// If field is int, we need &int.
-
-				if fieldVal.Kind() == reflect.Pointer {
-					// Field is *Type.
-					// Initialize it if nil? No, sql.Scan will set it?
-					// Actually sql.Scan needs a pointer to the value.
-					// If field is *string, we pass **string? No.
-					// We need to pass a pointer to the field.
-					// fieldVal.Addr().Interface() is **string.
-					// sql.Scan can handle **string and will allocate *string if not nil.
-					dest[i] = fieldVal.Addr().Interface()
-				} else {
-					// Field is value (e.g. string).
-					// We pass &string.
-					dest[i] = fieldVal.Addr().Interface()
-				}
-			} else {
-				// Column not in struct, ignore
-				var ignore any
-				dest[i] = &ignore
-			}
-		}
+		// Prepare scan destinations using helper
+		dest := m.prepareScanDestinations(columns, val)
 
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
@@ -313,7 +315,6 @@ func (c *Cursor[T]) Next() bool {
 
 // Scan scans the current row into a new entity.
 func (c *Cursor[T]) Scan() (*T, error) {
-	// We need to replicate scanRows logic for a single row
 	columns, err := c.rows.Columns()
 	if err != nil {
 		return nil, err
@@ -321,21 +322,9 @@ func (c *Cursor[T]) Scan() (*T, error) {
 
 	entity := new(T)
 	val := reflect.ValueOf(entity).Elem()
-	dest := make([]any, len(columns))
 
-	for i, colName := range columns {
-		if fieldInfo, ok := c.model.modelInfo.Columns[colName]; ok {
-			fieldVal := val.FieldByName(fieldInfo.Name)
-			if fieldVal.Kind() == reflect.Ptr {
-				dest[i] = fieldVal.Addr().Interface()
-			} else {
-				dest[i] = fieldVal.Addr().Interface()
-			}
-		} else {
-			var ignore any
-			dest[i] = &ignore
-		}
-	}
+	// Use helper to prepare scan destinations
+	dest := c.model.prepareScanDestinations(columns, val)
 
 	if err := c.rows.Scan(dest...); err != nil {
 		return nil, err
@@ -344,7 +333,7 @@ func (c *Cursor[T]) Scan() (*T, error) {
 	// Load Accessors
 	c.model.loadAccessors([]*T{entity})
 
-	// Load Relations
+	// Load Relations if any are configured
 	if len(c.model.relations) > 0 {
 		if err := c.model.loadRelations([]*T{entity}); err != nil {
 			return nil, err
@@ -360,7 +349,16 @@ func (c *Cursor[T]) Close() error {
 }
 
 // FirstOrCreate finds the first record matching attributes or creates it with attributes+values.
+// If found, returns the existing record. If not found, creates a new record with merged attributes+values.
 func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]any) (*T, error) {
+	// Validate inputs
+	if attributes == nil {
+		attributes = make(map[string]any)
+	}
+	if values == nil {
+		values = make(map[string]any)
+	}
+
 	// Build query from attributes
 	q := m
 	for k, v := range attributes {
@@ -390,7 +388,16 @@ func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]an
 }
 
 // UpdateOrCreate finds a record matching attributes and updates it with values, or creates it.
+// If found, updates the record with values. If not found, creates a new record with merged attributes+values.
 func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]any) (*T, error) {
+	// Validate inputs
+	if attributes == nil {
+		attributes = make(map[string]any)
+	}
+	if values == nil {
+		values = make(map[string]any)
+	}
+
 	// Build query from attributes
 	q := m
 	for k, v := range attributes {
@@ -428,6 +435,8 @@ func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]a
 }
 
 // scanRowsDynamic scans rows into a slice of pointers to structs defined by modelInfo.
+// This is used for loading relations with different model types than T.
+// It dynamically creates instances based on the provided ModelInfo.
 func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -438,21 +447,15 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 
 	for rows.Next() {
 		// Create new instance of the struct type
-		// modelInfo.Type is the struct type (e.g. User)
-		// We need *User
 		val := reflect.New(modelInfo.Type) // *User
 		elem := val.Elem()                 // User
 
+		// Prepare destinations - need inline version since this uses different modelInfo
 		dest := make([]any, len(columns))
-
 		for i, colName := range columns {
 			if fieldInfo, ok := modelInfo.Columns[colName]; ok {
 				fieldVal := elem.FieldByName(fieldInfo.Name)
-				if fieldVal.Kind() == reflect.Ptr {
-					dest[i] = fieldVal.Addr().Interface()
-				} else {
-					dest[i] = fieldVal.Addr().Interface()
-				}
+				dest[i] = fieldVal.Addr().Interface()
 			} else {
 				var ignore any
 				dest[i] = &ignore
@@ -473,6 +476,11 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 
 // Create inserts a new record.
 func (m *Model[T]) Create(entity *T) error {
+	// Validate input
+	if entity == nil {
+		return ErrNilPointer
+	}
+
 	// 1. BeforeCreate Hook
 	if hook, ok := any(entity).(interface{ BeforeCreate(context.Context) error }); ok {
 		if err := hook.BeforeCreate(m.ctx); err != nil {
@@ -481,9 +489,6 @@ func (m *Model[T]) Create(entity *T) error {
 	}
 
 	// 2. Build Insert Query
-	// We need to map struct fields to columns
-	// We use m.modelInfo
-
 	var columns []string
 	var values []any
 	var placeholders []string
@@ -491,10 +496,8 @@ func (m *Model[T]) Create(entity *T) error {
 	val := reflect.ValueOf(entity).Elem()
 
 	for _, field := range m.modelInfo.Fields {
-		// Skip ID if auto-increment and zero?
-		// For now, let's assume if ID is 0/empty we skip it.
+		// Skip auto-increment primary key if zero
 		if field.IsPrimary && field.IsAuto {
-			// Check if zero
 			fVal := val.FieldByName(field.Name)
 			if fVal.IsZero() {
 				continue
@@ -506,50 +509,27 @@ func (m *Model[T]) Create(entity *T) error {
 		placeholders = append(placeholders, "?")
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
 		m.modelInfo.TableName,
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "),
+		m.modelInfo.PrimaryKey,
 	)
 
-	// 3. Execute
-	// If Postgres, we might want RETURNING id.
-	// For generic SQL, we use LastInsertId (not supported by PG).
+	// 3. Execute and scan ID directly into the primary key field
+	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	if !ok {
+		return fmt.Errorf("primary key field %s not found in model", m.modelInfo.PrimaryKey)
+	}
 
-	query += " RETURNING " + m.modelInfo.PrimaryKey
+	fVal := val.FieldByName(pkField.Name)
+	if !fVal.CanSet() {
+		return fmt.Errorf("cannot set primary key field %s", pkField.Name)
+	}
 
-	var id any
-	// We need to scan the ID back into the entity
-	err := m.queryer().QueryRowContext(m.ctx, query, values...).Scan(&id)
+	err := m.queryer().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
 	if err != nil {
-		return err
-	}
-
-	// Set ID back to entity
-	// Find PK field
-	if pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]; ok {
-		fVal := val.FieldByName(pkField.Name)
-		if fVal.CanSet() {
-			// Convert id to field type if needed
-			// Scan already does this if we passed &id?
-			// No, we scanned into generic `id`.
-			// Better: Scan directly into the field.
-			// But we need a pointer to the field.
-			// fVal.Addr().Interface()
-
-			// Let's re-run QueryRow with direct scan
-		}
-	}
-
-	// Actually, let's just scan into the field directly.
-	if pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]; ok {
-		fVal := val.FieldByName(pkField.Name)
-		if fVal.CanSet() {
-			err = m.queryer().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
-			if err != nil {
-				return err
-			}
-		}
+		return WrapQueryError("INSERT", query, values, err)
 	}
 
 	// 4. AfterCreate Hook
@@ -562,8 +542,14 @@ func (m *Model[T]) Create(entity *T) error {
 	return nil
 }
 
-// Update updates records.
+// Update updates a single record based on its primary key.
+// The entity must not be nil and must have a valid primary key value.
 func (m *Model[T]) Update(entity *T) error {
+	// Validate input
+	if entity == nil {
+		return ErrNilPointer
+	}
+
 	// Hooks
 	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
 		if err := hook.BeforeUpdate(m.ctx); err != nil {
@@ -598,9 +584,10 @@ func (m *Model[T]) Update(entity *T) error {
 	sb.WriteString(fmt.Sprintf(" WHERE %s = ?", m.modelInfo.PrimaryKey))
 	values = append(values, pkVal)
 
-	_, err := m.queryer().ExecContext(m.ctx, sb.String(), values...)
+	query := sb.String()
+	_, err := m.queryer().ExecContext(m.ctx, query, values...)
 	if err != nil {
-		return err
+		return WrapQueryError("UPDATE", query, values, err)
 	}
 
 	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
@@ -612,15 +599,20 @@ func (m *Model[T]) Update(entity *T) error {
 	return nil
 }
 
-// Delete deletes records.
+// Delete deletes records matching the current query conditions.
+// WARNING: Without WHERE conditions, this will delete ALL records in the table.
 func (m *Model[T]) Delete() error {
 	var sb strings.Builder
 	sb.WriteString("DELETE FROM ")
 	sb.WriteString(m.modelInfo.TableName)
 	m.buildWhereClause(&sb)
 
-	_, err := m.queryer().ExecContext(m.ctx, sb.String(), m.args...)
-	return err
+	query := sb.String()
+	_, err := m.queryer().ExecContext(m.ctx, query, m.args...)
+	if err != nil {
+		return WrapQueryError("DELETE", query, m.args, err)
+	}
+	return nil
 }
 
 // Exec executes the query (Raw or Builder) and returns the result.
@@ -693,9 +685,10 @@ func (m *Model[T]) CreateMany(entities []*T) error {
 	// Postgres supports returning IDs for multiple rows.
 	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
 
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	query := sb.String()
+	rows, err := m.queryer().QueryContext(m.ctx, query, args...)
 	if err != nil {
-		return err
+		return WrapQueryError("INSERT", query, args, err)
 	}
 	defer rows.Close()
 
@@ -729,11 +722,11 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 	}
 
 	var sets []string
-	var args []any
+	var setArgs []any
 
 	for k, v := range values {
 		sets = append(sets, fmt.Sprintf("%s = ?", k))
-		args = append(args, v)
+		setArgs = append(setArgs, v)
 	}
 
 	var sb strings.Builder
@@ -744,11 +737,17 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 
 	m.buildWhereClause(&sb)
 
-	// Append where args
+	// Build args in correct order: SET values first, then WHERE values
+	args := make([]any, 0, len(setArgs)+len(m.args))
+	args = append(args, setArgs...)
 	args = append(args, m.args...)
 
-	_, err := m.queryer().ExecContext(m.ctx, sb.String(), args...)
-	return err
+	query := sb.String()
+	_, err := m.queryer().ExecContext(m.ctx, query, args...)
+	if err != nil {
+		return WrapQueryError("UPDATE", query, args, err)
+	}
+	return nil
 }
 
 // DeleteMany deletes records matching the query.
@@ -756,6 +755,11 @@ func (m *Model[T]) DeleteMany() error {
 	return m.Delete()
 }
 
+// loadAccessors calls accessor methods (e.g., GetFullName) on model instances
+// and populates the Attributes map with their return values.
+// Accessor methods must start with "Get", take no arguments, and return a single value.
+// The attribute key is the snake_case version of the method name with "Get" prefix removed.
+// For example, GetFullName() -> attributes["full_name"].
 func (m *Model[T]) loadAccessors(results []*T) {
 	if len(results) == 0 {
 		return
