@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"maps"
 	"time"
 )
 
@@ -42,10 +43,82 @@ type Model[T any] struct {
 // New creates a new Model instance for type T.
 func New[T any]() *Model[T] {
 	return &Model[T]{
-		ctx:       context.Background(),
-		db:        GlobalDB,
-		modelInfo: ParseModel[T](),
+		ctx:               context.Background(),
+		db:                GlobalDB,
+		modelInfo:         ParseModel[T](),
+		relationCallbacks: make(map[string]any),
+		morphRelations:    make(map[string]map[string][]string),
 	}
+}
+
+// Clone creates a deep copy of the Model.
+// This is useful for creating new queries based on an existing one without modifying it.
+func (m *Model[T]) Clone() *Model[T] {
+	newModel := &Model[T]{
+		ctx:       m.ctx,
+		db:        m.db,
+		tx:        m.tx,
+		modelInfo: m.modelInfo,
+		distinct:  m.distinct,
+		limit:     m.limit,
+		offset:    m.offset,
+		rawQuery:  m.rawQuery,
+	}
+
+	// Copy slices
+	if len(m.columns) > 0 {
+		newModel.columns = make([]string, len(m.columns))
+		copy(newModel.columns, m.columns)
+	}
+	if len(m.wheres) > 0 {
+		newModel.wheres = make([]string, len(m.wheres))
+		copy(newModel.wheres, m.wheres)
+	}
+	if len(m.args) > 0 {
+		newModel.args = make([]any, len(m.args))
+		copy(newModel.args, m.args)
+	}
+	if len(m.orderBys) > 0 {
+		newModel.orderBys = make([]string, len(m.orderBys))
+		copy(newModel.orderBys, m.orderBys)
+	}
+	if len(m.groupBys) > 0 {
+		newModel.groupBys = make([]string, len(m.groupBys))
+		copy(newModel.groupBys, m.groupBys)
+	}
+	if len(m.havings) > 0 {
+		newModel.havings = make([]string, len(m.havings))
+		copy(newModel.havings, m.havings)
+	}
+	if len(m.distinctOn) > 0 {
+		newModel.distinctOn = make([]string, len(m.distinctOn))
+		copy(newModel.distinctOn, m.distinctOn)
+	}
+	if len(m.relations) > 0 {
+		newModel.relations = make([]string, len(m.relations))
+		copy(newModel.relations, m.relations)
+	}
+	if len(m.rawArgs) > 0 {
+		newModel.rawArgs = make([]any, len(m.rawArgs))
+		copy(newModel.rawArgs, m.rawArgs)
+	}
+
+	// Copy maps
+	newModel.relationCallbacks = make(map[string]any)
+	if m.relationCallbacks != nil {
+		maps.Copy(newModel.relationCallbacks, m.relationCallbacks)
+	}
+
+	newModel.morphRelations = make(map[string]map[string][]string)
+	if m.morphRelations != nil {
+		for k, v := range m.morphRelations {
+			newMap := make(map[string][]string)
+			maps.Copy(newMap, v)
+			newModel.morphRelations[k] = newMap
+		}
+	}
+
+	return newModel
 }
 
 // WithContext sets the context for the query.
@@ -65,9 +138,8 @@ func (m *Model[T]) SetDB(db *sql.DB) *Model[T] {
 	return m
 }
 
-// ConfigureConnectionPoolSeconds accepts durations in seconds.
-// Pass 0 to leave duration unlimited / not set.
-func ConfigureConnectionPoolSeconds(db *sql.DB, maxOpen, maxIdle int, maxLifetimeSec, idleTimeoutSec int64) {
+// ConfigureConnectionPool configures the database connection pool.
+func ConfigureConnectionPool(db *sql.DB, maxOpen, maxIdle int, maxLifetime, idleTimeout time.Duration) {
 	if db == nil {
 		return
 	}
@@ -77,10 +149,10 @@ func ConfigureConnectionPoolSeconds(db *sql.DB, maxOpen, maxIdle int, maxLifetim
 	if maxIdle >= 0 {
 		db.SetMaxIdleConns(maxIdle)
 	}
-	if maxLifetimeSec >= 0 {
-		db.SetConnMaxLifetime(time.Duration(maxLifetimeSec) * time.Second)
+	if maxLifetime > 0 {
+		db.SetConnMaxLifetime(maxLifetime)
 	}
-	if idleTimeoutSec >= 0 {
-		db.SetConnMaxIdleTime(time.Duration(idleTimeoutSec) * time.Second)
+	if idleTimeout > 0 {
+		db.SetConnMaxIdleTime(idleTimeout)
 	}
 }
