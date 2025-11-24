@@ -41,47 +41,74 @@ func (m *Model[T]) Raw(query string, args ...any) *Model[T] {
 //
 //	Where("column", value) -> column = ?
 //	Where("column >", value) -> column > ?
-//	Where("column = ?", value) -> column = ?
+//	Where(map[string]any{"name": "John", "age": 30}) -> name = ? AND age = ?
+//	Where(&User{Name: "John"}) -> name = ?
 //	Where(func(q *Model[T]) { ... }) -> nested group with parentheses
 func (m *Model[T]) Where(query any, args ...any) *Model[T] {
-	// Check if query is a callback function
+	return m.addWhere("AND", query, args...)
+}
+
+// OrWhere adds an OR WHERE clause.
+func (m *Model[T]) OrWhere(query any, args ...any) *Model[T] {
+	return m.addWhere("OR", query, args...)
+}
+
+func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
+	// 1. Handle Callback
 	if callback, ok := query.(func(*Model[T])); ok {
-		// Create a new nested query builder
 		nested := &Model[T]{
 			ctx:       m.ctx,
 			db:        m.db,
 			tx:        m.tx,
 			modelInfo: m.modelInfo,
 		}
-
-		// Execute the callback
 		callback(nested)
-
-		// Build the nested WHERE clause
 		if len(nested.wheres) > 0 {
-			// Remove AND/OR prefixes and join with spaces
+			// Strip prefixes from nested wheres
 			var conditions []string
 			for _, w := range nested.wheres {
-				// Strip leading AND/OR
 				w = strings.TrimSpace(w)
-				if strings.HasPrefix(w, "AND ") {
-					w = strings.TrimPrefix(w, "AND ")
-				} else if strings.HasPrefix(w, "OR ") {
-					w = strings.TrimPrefix(w, "OR ")
-				}
+				w = strings.TrimPrefix(w, "AND ")
+				w = strings.TrimPrefix(w, "OR ")
 				conditions = append(conditions, w)
 			}
-
-			// Wrap in parentheses and add to main query
 			grouped := "(" + strings.Join(conditions, " ") + ")"
-			m.wheres = append(m.wheres, fmt.Sprintf("AND %s", grouped))
+			m.wheres = append(m.wheres, fmt.Sprintf("%s %s", typ, grouped))
 			m.args = append(m.args, nested.args...)
 		}
-
 		return m
 	}
 
-	// Original string-based WHERE logic
+	// 2. Handle Map
+	if conditionMap, ok := query.(map[string]any); ok {
+		for k, v := range conditionMap {
+			m.wheres = append(m.wheres, fmt.Sprintf("%s %s = ?", typ, k))
+			m.args = append(m.args, v)
+		}
+		return m
+	}
+
+	// 3. Handle Struct
+	val := reflect.ValueOf(query)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	if val.Kind() == reflect.Struct {
+		// Use ModelInfo if available and type matches?
+		// Or just iterate fields and use ToSnakeCase?
+		// Let's use ParseModelType to be safe and consistent
+		info := ParseModelType(val.Type())
+		for _, field := range info.Fields {
+			fVal := val.FieldByName(field.Name)
+			if !fVal.IsZero() {
+				m.wheres = append(m.wheres, fmt.Sprintf("%s %s = ?", typ, field.Column))
+				m.args = append(m.args, fVal.Interface())
+			}
+		}
+		return m
+	}
+
+	// 4. Handle String
 	queryStr, ok := query.(string)
 	if !ok {
 		return m
@@ -90,13 +117,20 @@ func (m *Model[T]) Where(query any, args ...any) *Model[T] {
 	// If args provided and no ? and no operator, assume =
 	if len(args) > 0 && !strings.Contains(queryStr, "?") {
 		trimmed := strings.TrimSpace(queryStr)
+		// Check for operator
+		// We split by space to get the last part?
+		// e.g. "age >" -> "age", ">"
+		// "age" -> "age"
+		parts := strings.Fields(trimmed)
 		hasOperator := false
-		operators := []string{"=", ">", "<", "LIKE", "ILIKE", "IS", "IN"}
-		upper := strings.ToUpper(trimmed)
-		for _, op := range operators {
-			if strings.HasSuffix(upper, op) {
+		if len(parts) > 1 {
+			op := strings.ToUpper(parts[len(parts)-1])
+			operators := map[string]bool{
+				"=": true, ">": true, "<": true, ">=": true, "<=": true,
+				"LIKE": true, "ILIKE": true, "IS": true, "IN": true, "<>": true, "!=": true,
+			}
+			if operators[op] {
 				hasOperator = true
-				break
 			}
 		}
 
@@ -106,62 +140,45 @@ func (m *Model[T]) Where(query any, args ...any) *Model[T] {
 			queryStr = trimmed + " = ?"
 		}
 	}
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", queryStr))
+
+	m.wheres = append(m.wheres, fmt.Sprintf("%s (%s)", typ, queryStr))
 	m.args = append(m.args, args...)
 	return m
 }
 
-// OrWhere adds an OR WHERE clause.
-// Supports the same forms as Where, including callbacks.
-func (m *Model[T]) OrWhere(query any, args ...any) *Model[T] {
-	// Check if query is a callback function
-	if callback, ok := query.(func(*Model[T])); ok {
-		// Create a new nested query builder
-		nested := &Model[T]{
-			ctx:       m.ctx,
-			db:        m.db,
-			tx:        m.tx,
-			modelInfo: m.modelInfo,
+// Chunk processes the results in chunks to save memory.
+func (m *Model[T]) Chunk(size int, callback func([]*T) error) error {
+	page := 1
+	for {
+		// Clone the builder to avoid modifying the original state permanently?
+		// Or just modify limit/offset.
+		// Since we are iterating, modifying m is fine if we reset or just keep moving.
+		// But m.Get() uses m.limit/m.offset.
+
+		// We need to preserve original conditions but update offset.
+		offset := (page - 1) * size
+		m.Limit(size).Offset(offset)
+
+		results, err := m.Get()
+		if err != nil {
+			return err
 		}
 
-		// Execute the callback
-		callback(nested)
-
-		// Build the nested WHERE clause
-		if len(nested.wheres) > 0 {
-			// Remove AND/OR prefixes and join
-			var conditions []string
-			for _, w := range nested.wheres {
-				w = strings.TrimSpace(w)
-				if strings.HasPrefix(w, "AND ") {
-					w = strings.TrimPrefix(w, "AND ")
-				} else if strings.HasPrefix(w, "OR ") {
-					w = strings.TrimPrefix(w, "OR ")
-				}
-				conditions = append(conditions, w)
-			}
-
-			// Wrap in parentheses
-			grouped := "(" + strings.Join(conditions, " ") + ")"
-			m.wheres = append(m.wheres, fmt.Sprintf("OR %s", grouped))
-			m.args = append(m.args, nested.args...)
+		if len(results) == 0 {
+			break
 		}
 
-		return m
-	}
+		if err := callback(results); err != nil {
+			return err
+		}
 
-	// Original string-based OrWhere logic
-	queryStr, ok := query.(string)
-	if !ok {
-		return m
-	}
+		if len(results) < size {
+			break
+		}
 
-	if len(args) > 0 && !strings.Contains(queryStr, "?") {
-		queryStr = strings.TrimSpace(queryStr) + " ?"
+		page++
 	}
-	m.wheres = append(m.wheres, fmt.Sprintf("OR (%s)", queryStr))
-	m.args = append(m.args, args...)
-	return m
+	return nil
 }
 
 // WhereIn adds a WHERE IN clause.
