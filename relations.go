@@ -432,9 +432,9 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := m.modelInfo.Columns[pkField]; ok {
 			fVal := val.FieldByName(field.Name)
-			if fVal.Kind() == reflect.Ptr {
+			if fVal.Kind() == reflect.Pointer {
 				if fVal.IsNil() {
-					ids[i] = nil // Or skip?
+					ids[i] = nil
 				} else {
 					ids[i] = fVal.Elem().Interface()
 				}
@@ -452,8 +452,8 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 		return fmt.Errorf("invalid relation config")
 	}
 
-	relatedPtr := rel.NewRelated()                   // *R
-	relatedType := reflect.TypeOf(relatedPtr).Elem() // R
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
 
 	// 3. Build Query
@@ -463,37 +463,8 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
 	}
 
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	if cols != "" {
-		sb.WriteString(cols)
-	} else {
-		sb.WriteString("*")
-	}
-	sb.WriteString(" FROM ")
-	sb.WriteString(relatedInfo.TableName)
-	sb.WriteString(" WHERE ")
-	sb.WriteString(foreignKey)
-	sb.WriteString(" IN (")
-
-	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	sb.WriteString(strings.Join(placeholders, ","))
-	sb.WriteString(")")
-
-	// Execute
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	// 4. Scan Results
-	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	// Use shared helper
+	relatedResults, err := m.loadRelationQuery(relatedInfo, foreignKey, ids, cols)
 	if err != nil {
 		return err
 	}
@@ -527,7 +498,7 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 				slice := reflect.MakeSlice(sliceType, 0, len(children))
 
 				for _, child := range children {
-					if sliceType.Elem().Kind() == reflect.Ptr {
+					if sliceType.Elem().Kind() == reflect.Pointer {
 						slice = reflect.Append(slice, child)
 					} else {
 						slice = reflect.Append(slice, child.Elem())
@@ -567,7 +538,6 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 				if p == "id" {
 					parts[j] = "ID"
 				} else {
-					// Manual title case to avoid deprecated strings.Title
 					if len(p) > 0 {
 						parts[j] = strings.ToUpper(p[:1]) + p[1:]
 					}
@@ -583,7 +553,7 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 
 		// Handle Pointers (Nullable FKs)
 		var fkVal any
-		if fieldVal.Kind() == reflect.Ptr {
+		if fieldVal.Kind() == reflect.Pointer {
 			if fieldVal.IsNil() {
 				continue
 			}
@@ -620,35 +590,8 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 		ownerKey = relatedInfo.PrimaryKey
 	}
 
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	if cols != "" {
-		sb.WriteString(cols)
-	} else {
-		sb.WriteString("*")
-	}
-	sb.WriteString(" FROM ")
-	sb.WriteString(relatedInfo.TableName)
-	sb.WriteString(" WHERE ")
-	sb.WriteString(ownerKey)
-	sb.WriteString(" IN (")
-
-	args := make([]any, len(fks))
-	placeholders := make([]string, len(fks))
-	for i, fk := range fks {
-		placeholders[i] = "?"
-		args[i] = fk
-	}
-	sb.WriteString(strings.Join(placeholders, ","))
-	sb.WriteString(")")
-
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	// Use shared helper
+	relatedResults, err := m.loadRelationQuery(relatedInfo, ownerKey, fks, cols)
 	if err != nil {
 		return err
 	}
@@ -678,7 +621,7 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 				parentVal := reflect.ValueOf(parent).Elem()
 				relField := parentVal.FieldByName(relName)
 				if relField.IsValid() && relField.CanSet() {
-					if relField.Kind() == reflect.Ptr {
+					if relField.Kind() == reflect.Pointer {
 						relField.Set(reflect.ValueOf(res))
 					} else {
 						relField.Set(reflect.ValueOf(res).Elem())
@@ -689,6 +632,39 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 	}
 
 	return nil
+}
+
+// loadRelationQuery executes a SELECT * FROM table WHERE key IN (ids)
+func (m *Model[T]) loadRelationQuery(relatedInfo *ModelInfo, key string, ids []any, cols string) ([]any, error) {
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(key)
+	sb.WriteString(" IN (")
+
+	args := make([]any, len(ids))
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	sb.WriteString(strings.Join(placeholders, ","))
+	sb.WriteString(")")
+
+	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return m.scanRowsDynamic(rows, relatedInfo)
 }
 
 func (m *Model[T]) loadMorphOneOrMany(results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
@@ -1008,6 +984,10 @@ func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, rel
 // Attach inserts rows into the pivot table for a BelongsToMany relation.
 // pivotData: map[any]map[string]any (RelatedID -> {Column: Value})
 func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
 	// 1. Get Relation Config
 	var t T
 	methodVal := reflect.ValueOf(t).MethodByName(relation)
@@ -1018,15 +998,9 @@ func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[a
 	relConfig := retVals[0].Interface()
 
 	// Check if it's a BelongsToMany struct
-	// We can't cast to BelongsToMany[any] because T is generic.
-	// We'll use reflection to read fields.
-
 	valConfig := reflect.ValueOf(relConfig)
-	if valConfig.Type().Name() != "BelongsToMany" {
-		// Strict check might fail if package name included? "zorm.BelongsToMany"
-		if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
-			return WrapRelationError(relation, fmt.Sprintf("%T", t), ErrInvalidRelation)
-		}
+	if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
+		return WrapRelationError(relation, fmt.Sprintf("%T", t), ErrInvalidRelation)
 	}
 	pivotTable := valConfig.FieldByName("PivotTable").String()
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
@@ -1050,46 +1024,65 @@ func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[a
 		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
 	}
 	if relatedKey == "" {
-		// We need related type name.
-		// relatedType := valConfig.FieldByName("RelatedType")? No.
-		// We can infer from method return type?
-		// Or just assume standard convention if missing.
-		// Ideally BelongsToMany struct should have it.
-		// Let's assume user provided it or we fail.
-		// Or we assume relatedKey is "related_model_id".
 		return WrapRelationError(relation, "pivot", ErrInvalidConfig)
 	}
 
-	// 3. Insert Loop
-	for _, id := range ids {
-		// Prepare columns and values
-		cols := []string{foreignKey, relatedKey}
-		vals := []any{parentID, id}
-		placeholders := []string{"?", "?"}
+	// 3. Bulk Insert
+	// We need to collect all columns first to ensure consistency
+	// Base columns: foreignKey, relatedKey
+	// Additional columns from pivotData
 
-		// Add pivot data
-		if pivotData != nil {
-			if data, ok := pivotData[id]; ok {
-				for k, v := range data {
-					cols = append(cols, k)
-					vals = append(vals, v)
-					placeholders = append(placeholders, "?")
-				}
-			}
-		}
-
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-			pivotTable,
-			strings.Join(cols, ", "),
-			strings.Join(placeholders, ", "))
-
-		_, err := m.queryer().ExecContext(m.ctx, query, vals...)
-		if err != nil {
-			return err
+	// Find all unique pivot columns
+	pivotColsMap := make(map[string]bool)
+	for _, data := range pivotData {
+		for k := range data {
+			pivotColsMap[k] = true
 		}
 	}
 
-	return nil
+	var extraCols []string
+	for k := range pivotColsMap {
+		extraCols = append(extraCols, k)
+	}
+
+	// Build Query
+	var cols []string
+	cols = append(cols, foreignKey, relatedKey)
+	cols = append(cols, extraCols...)
+
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(pivotTable)
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(cols, ", "))
+	sb.WriteString(") VALUES ")
+
+	var args []any
+	rowPlaceholders := "(" + strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",") + ")"
+
+	for i, id := range ids {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(rowPlaceholders)
+
+		// Add values
+		args = append(args, parentID, id)
+
+		// Add extra values
+		for _, col := range extraCols {
+			var val any
+			if pivotData != nil {
+				if data, ok := pivotData[id]; ok {
+					val = data[col]
+				}
+			}
+			args = append(args, val)
+		}
+	}
+
+	_, err := m.queryer().ExecContext(m.ctx, sb.String(), args...)
+	return err
 }
 
 // Detach deletes rows from the pivot table.
