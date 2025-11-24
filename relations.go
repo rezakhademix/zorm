@@ -1,0 +1,1277 @@
+package zorm
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+)
+
+// Relation types
+type RelationType string
+
+const (
+	RelationHasOne        RelationType = "HasOne"
+	RelationHasMany       RelationType = "HasMany"
+	RelationBelongsTo     RelationType = "BelongsTo"
+	RelationBelongsToMany RelationType = "BelongsToMany"
+)
+
+// RelationDefinition holds metadata about a relation.
+type RelationDefinition struct {
+	Type        RelationType
+	Field       string // The struct field name in the parent model
+	RelatedType reflect.Type
+
+	// Keys
+	ForeignKey string
+	LocalKey   string
+	OwnerKey   string // For BelongsTo
+
+	// Pivot (BelongsToMany)
+	PivotTable   string
+	PivotForeign string
+	PivotRelated string
+}
+
+// HasOne defines a HasOne relation.
+type HasOne[T any] struct {
+	ForeignKey string
+	LocalKey   string
+}
+
+// HasMany defines a HasMany relation.
+type HasMany[T any] struct {
+	ForeignKey string
+	LocalKey   string
+}
+
+// BelongsTo defines a BelongsTo relation.
+type BelongsTo[T any] struct {
+	ForeignKey string
+	OwnerKey   string
+}
+
+// BelongsToMany defines a BelongsToMany relation.
+type BelongsToMany[T any] struct {
+	PivotTable string
+	ForeignKey string
+	RelatedKey string
+	LocalKey   string
+	RelatedPK  string
+}
+
+// MorphTo defines a polymorphic BelongsTo relation.
+// T is usually `any` or a common interface, but in our generic system,
+// the field in the struct will likely be `any` or an interface.
+// However, `Relation` interface requires `NewRelated()`.
+// For MorphTo, `NewRelated` is dynamic.
+// We might need a special handling for MorphTo.
+type MorphTo[T any] struct {
+	Type    string         // Column name for Type (e.g. imageable_type)
+	ID      string         // Column name for ID (e.g. imageable_id)
+	TypeMap map[string]any // Map of DB type string to empty struct instance (e.g. "posts": Post{})
+}
+
+// MorphOne defines a polymorphic HasOne relation.
+type MorphOne[T any] struct {
+	Type string // Column name in related table (e.g. imageable_type)
+	ID   string // Column name in related table (e.g. imageable_id)
+}
+
+// MorphMany defines a polymorphic HasMany relation.
+type MorphMany[T any] struct {
+	Type string // Column name in related table (e.g. imageable_type)
+	ID   string // Column name in related table (e.g. imageable_id)
+}
+
+// Relation interface allows us to handle generics uniformly.
+type Relation interface {
+	RelationType() RelationType
+	NewRelated() any
+}
+
+func (HasOne[T]) RelationType() RelationType { return RelationHasOne }
+func (HasOne[T]) NewRelated() any            { return new(T) }
+
+func (HasMany[T]) RelationType() RelationType { return RelationHasMany }
+func (HasMany[T]) NewRelated() any            { return new(T) }
+
+func (BelongsTo[T]) RelationType() RelationType { return RelationBelongsTo }
+func (BelongsTo[T]) NewRelated() any            { return new(T) }
+
+func (BelongsToMany[T]) RelationType() RelationType { return RelationBelongsToMany }
+func (BelongsToMany[T]) NewRelated() any            { return new(T) }
+
+const (
+	RelationMorphTo   RelationType = "MorphTo"
+	RelationMorphOne  RelationType = "MorphOne"
+	RelationMorphMany RelationType = "MorphMany"
+)
+
+func (MorphTo[T]) RelationType() RelationType { return RelationMorphTo }
+func (MorphTo[T]) NewRelated() any            { return nil } // Dynamic
+
+func (MorphOne[T]) RelationType() RelationType { return RelationMorphOne }
+func (MorphOne[T]) NewRelated() any            { return new(T) }
+
+func (MorphMany[T]) RelationType() RelationType { return RelationMorphMany }
+func (MorphMany[T]) NewRelated() any            { return new(T) }
+
+// Load eager loads relations on a single entity.
+func (m *Model[T]) Load(entity *T, relations ...string) error {
+	m.relations = append(m.relations, relations...)
+	return m.loadRelations([]*T{entity})
+}
+
+// LoadSlice eager loads relations on a slice of entities.
+func (m *Model[T]) LoadSlice(entities []*T, relations ...string) error {
+	m.relations = append(m.relations, relations...)
+	return m.loadRelations(entities)
+}
+
+// LoadMorph eager loads a polymorphic relation with constraints on a slice.
+func (m *Model[T]) LoadMorph(entities []*T, relation string, typeMap map[string][]string) error {
+	if m.morphRelations == nil {
+		m.morphRelations = make(map[string]map[string][]string)
+	}
+	m.relations = append(m.relations, relation)
+	m.morphRelations[relation] = typeMap
+	return m.loadRelations(entities)
+}
+
+// loadRelations processes the With() clauses and loads data.
+func (m *Model[T]) loadRelations(results []*T) error {
+	if len(m.relations) == 0 || len(results) == 0 {
+		return nil
+	}
+
+	// Group relations by root
+	// Map: RootRelation -> {Cols, []SubRelations}
+	type relGroup struct {
+		Cols string
+		Subs []string
+	}
+	groups := make(map[string]*relGroup)
+
+	for _, relationName := range m.relations {
+		// Handle "relation:cols" syntax
+		parts := strings.Split(relationName, ":")
+		path := parts[0]
+		cols := ""
+		if len(parts) > 1 {
+			cols = parts[1]
+		}
+
+		// Handle dot notation "A.B"
+		dotParts := strings.SplitN(path, ".", 2)
+		root := dotParts[0]
+
+		if _, ok := groups[root]; !ok {
+			groups[root] = &relGroup{}
+		}
+
+		if len(dotParts) > 1 {
+			// It's a nested relation, add to Subs
+			// We need to preserve the cols for the leaf?
+			// Actually, "A.B:cols" means cols apply to B.
+			// "A:cols.B" is invalid syntax usually.
+			// Laravel: "A:id,name", "A.B"
+			// If we have "A.B:cols", we pass "B:cols" to A's loader.
+			sub := dotParts[1]
+			if cols != "" {
+				sub += ":" + cols
+			}
+			groups[root].Subs = append(groups[root].Subs, sub)
+		} else {
+			// It's the root itself.
+			if cols != "" {
+				groups[root].Cols = cols
+			}
+		}
+	}
+
+	for relName, group := range groups {
+		// Find the method on T
+		var t T
+		methodVal := reflect.ValueOf(t).MethodByName(relName)
+		if !methodVal.IsValid() {
+			// Try with "Relation" suffix to avoid name conflict with field
+			methodVal = reflect.ValueOf(t).MethodByName(relName + "Relation")
+			if !methodVal.IsValid() {
+				return WrapRelationError(relName, fmt.Sprintf("%T", t), ErrRelationNotFound)
+			}
+		}
+
+		// Call the method to get the relation config
+		retVals := methodVal.Call(nil)
+		if len(retVals) == 0 {
+			return fmt.Errorf("relation method %s must return a value", relName)
+		}
+
+		relConfig := retVals[0].Interface()
+
+		// Dispatch based on type
+		if rel, ok := relConfig.(Relation); ok {
+			switch rel.RelationType() {
+			case RelationHasMany:
+				// Pass group.Subs to loadHasMany to handle recursion
+				if err := m.loadHasMany(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationHasOne:
+				// HasOne uses HasMany logic but assigns single value
+				if err := m.loadHasMany(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationBelongsTo:
+				if err := m.loadBelongsTo(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationMorphTo:
+				// Check for morph constraints
+				var subMap map[string][]string
+				if m.morphRelations != nil {
+					subMap = m.morphRelations[relName]
+				}
+				if err := m.loadMorphTo(results, relConfig, relName, subMap); err != nil {
+					return err
+				}
+			case RelationMorphOne:
+				if err := m.loadMorphOneOrMany(results, relConfig, relName, group.Cols, group.Subs, true); err != nil {
+					return err
+				}
+			case RelationMorphMany:
+				if err := m.loadMorphOneOrMany(results, relConfig, relName, group.Cols, group.Subs, false); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadMorphTo(results []*T, relConfig any, relName string, typeMap map[string][]string) error {
+	// 1. Get Type and ID fields from MorphTo config
+	morphRel, _ := relConfig.(MorphTo[any])
+	typeField := morphRel.Type
+	idField := morphRel.ID
+
+	// 2. Group IDs by Type
+	// Map: Type -> []ID
+	idsByType := make(map[string][]any)
+	// Map: Type -> ID -> []ParentIndices
+	parentMap := make(map[string]map[any][]int)
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+
+		// Get Type
+		// Actually, `typeField` in MorphTo is usually the DB column name.
+		// We need the struct field name.
+		// Let's assume strict convention or we need to find the field.
+		// For now, assume struct field name is CamelCase of typeField (e.g. "imageable_type" -> "ImageableType")
+		// Or we use `FieldByName` if it exists.
+
+		// Better: Use ModelInfo to find field by column name?
+		// Or just assume the user passed the Struct Field Name in MorphTo config?
+		// The definition `Type: "ImageableType"` is better.
+
+		// Let's try to find the field.
+		tf := val.FieldByName(typeField)
+		if !tf.IsValid() {
+			// Try converting snake_case to PascalCase
+			// "imageable_type" -> "ImageableType"
+			// Simple conversion for now.
+			// TODO: Robust conversion
+			// For now assume user put Struct Field Name in MorphTo definition.
+			continue
+		}
+
+		var typeValue string
+		if tf.Kind() == reflect.Ptr {
+			if tf.IsNil() {
+				continue
+			}
+			typeValue = tf.Elem().String()
+		} else {
+			typeValue = tf.String()
+		}
+
+		if typeValue == "" {
+			continue
+		}
+
+		// Get ID
+		idf := val.FieldByName(idField)
+		if !idf.IsValid() {
+			continue
+		}
+
+		var idValue any
+		if idf.Kind() == reflect.Ptr {
+			if idf.IsNil() {
+				continue
+			}
+			idValue = idf.Elem().Interface()
+		} else {
+			idValue = idf.Interface()
+		}
+
+		idsByType[typeValue] = append(idsByType[typeValue], idValue)
+
+		if _, ok := parentMap[typeValue]; !ok {
+			parentMap[typeValue] = make(map[any][]int)
+		}
+		parentMap[typeValue][idValue] = append(parentMap[typeValue][idValue], i)
+	}
+
+	// 3. Query each type
+	for typeName, ids := range idsByType {
+		// Find Model for TypeName
+		// We use morphRel.TypeMap
+		modelInstance, ok := morphRel.TypeMap[typeName]
+		if !ok {
+			// Type not found in map, skip
+			continue
+		}
+
+		// We need to call `loadRelationsDynamic` equivalent but for "Find WhereIn ID".
+		// We can use `loadHasManyDynamic` logic but without the "Foreign Key" part, just "ID".
+
+		// We need to construct a query for this model.
+		// We can't use `New[Model]` because we don't know the type at compile time.
+		// We have `modelInstance` (empty struct).
+
+		modelType := reflect.TypeOf(modelInstance)
+
+		// Determine sub-relations for this type
+		var subRelations []string
+		if typeMap != nil {
+			subRelations = typeMap[typeName]
+		}
+
+		// Execute Query: SELECT * FROM table WHERE id IN (ids)
+		// We can reuse `loadHasManyDynamic` but trick it?
+		// `loadHasManyDynamic` does `WHERE foreign_key IN ...`.
+		// We want `WHERE id IN ...`.
+		// So we pass `ForeignKey` as the Primary Key of the related model.
+
+		relatedInfo := ParseModelType(modelType)
+		pk := relatedInfo.PrimaryKey
+
+		// We need a dummy config to pass to loadHasManyDynamic
+		// It expects a Relation config with ForeignKey field.
+		// We can create a struct on the fly? No.
+
+		// Let's duplicate the query logic here, it's safer.
+
+		var sb strings.Builder
+		sb.WriteString("SELECT * FROM ")
+		sb.WriteString(relatedInfo.TableName)
+		sb.WriteString(" WHERE ")
+		sb.WriteString(pk)
+		sb.WriteString(" IN (")
+
+		args := make([]any, len(ids))
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		sb.WriteString(strings.Join(placeholders, ","))
+		sb.WriteString(")")
+
+		rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+		if err != nil {
+			return err
+		}
+
+		// Recursive Load
+		if len(subRelations) > 0 && len(relatedResults) > 0 {
+			if err := m.loadRelationsDynamic(relatedResults, modelType, subRelations); err != nil {
+				return err
+			}
+		}
+
+		// 4. Map back
+		for _, res := range relatedResults {
+			val := reflect.ValueOf(res).Elem()
+			resID := val.FieldByName(relatedInfo.Columns[pk].Name).Interface()
+
+			// Find parents
+			if indices, ok := parentMap[typeName][resID]; ok {
+				for _, idx := range indices {
+					parent := results[idx]
+					parentVal := reflect.ValueOf(parent).Elem()
+					relField := parentVal.FieldByName(relName)
+					if relField.IsValid() && relField.CanSet() {
+						relField.Set(reflect.ValueOf(res)) // Set pointer? res is *T (any)
+						// If field is interface{}, it works.
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+	// 1. Get IDs from results
+	ids := make([]any, len(results))
+	pkField := m.modelInfo.PrimaryKey
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := m.modelInfo.Columns[pkField]; ok {
+			fVal := val.FieldByName(field.Name)
+			if fVal.Kind() == reflect.Ptr {
+				if fVal.IsNil() {
+					ids[i] = nil // Or skip?
+				} else {
+					ids[i] = fVal.Elem().Interface()
+				}
+			} else {
+				ids[i] = fVal.Interface()
+			}
+		} else {
+			ids[i] = val.FieldByName("ID").Interface()
+		}
+	}
+
+	// 2. Get Related Model Instance
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("invalid relation config")
+	}
+
+	relatedPtr := rel.NewRelated()                   // *R
+	relatedType := reflect.TypeOf(relatedPtr).Elem() // R
+	relatedInfo := ParseModelType(relatedType)
+
+	// 3. Build Query
+	valConfig := reflect.ValueOf(relConfig)
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(foreignKey)
+	sb.WriteString(" IN (")
+
+	args := make([]any, len(ids))
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	sb.WriteString(strings.Join(placeholders, ","))
+	sb.WriteString(")")
+
+	// Execute
+	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// 4. Scan Results
+	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	if err != nil {
+		return err
+	}
+
+	// 4.5 Recursive Loading
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	// 5. Map back to parents
+	relatedMap := make(map[any][]reflect.Value)
+
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := relatedInfo.Columns[foreignKey]; ok {
+			fkVal := val.FieldByName(field.Name).Interface()
+			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
+		}
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+
+		if children, ok := relatedMap[parentID]; ok {
+			relField := parentVal.FieldByName(relName)
+			if relField.IsValid() && relField.CanSet() {
+				sliceType := relField.Type()
+				slice := reflect.MakeSlice(sliceType, 0, len(children))
+
+				for _, child := range children {
+					if sliceType.Elem().Kind() == reflect.Ptr {
+						slice = reflect.Append(slice, child)
+					} else {
+						slice = reflect.Append(slice, child.Elem())
+					}
+				}
+
+				relField.Set(slice)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+	// 1. Get FKs from results (Parent.ForeignKey)
+	valConfig := reflect.ValueOf(relConfig)
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(relName) + "_id"
+	}
+
+	fks := make([]any, 0, len(results))
+	fkMap := make(map[any][]int) // FK -> []ParentIndices
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+
+		// Find FK field in Parent
+		var fieldName string
+		if field, ok := m.modelInfo.Columns[foreignKey]; ok {
+			fieldName = field.Name
+		} else {
+			// Fallback to CamelCase
+			parts := strings.Split(foreignKey, "_")
+			for j, p := range parts {
+				if p == "id" {
+					parts[j] = "ID"
+				} else {
+					// Manual title case to avoid deprecated strings.Title
+					if len(p) > 0 {
+						parts[j] = strings.ToUpper(p[:1]) + p[1:]
+					}
+				}
+			}
+			fieldName = strings.Join(parts, "")
+		}
+
+		fieldVal := val.FieldByName(fieldName)
+		if !fieldVal.IsValid() {
+			continue
+		}
+
+		// Handle Pointers (Nullable FKs)
+		var fkVal any
+		if fieldVal.Kind() == reflect.Ptr {
+			if fieldVal.IsNil() {
+				continue
+			}
+			fkVal = fieldVal.Elem().Interface()
+		} else {
+			fkVal = fieldVal.Interface()
+		}
+
+		if isZero(fkVal) {
+			continue
+		}
+
+		fks = append(fks, fkVal)
+		fkMap[fkVal] = append(fkMap[fkVal], i)
+	}
+
+	if len(fks) == 0 {
+		return nil
+	}
+
+	// 2. Get Related Model
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("invalid relation config")
+	}
+
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	// 3. Build Query
+	ownerKey := valConfig.FieldByName("OwnerKey").String()
+	if ownerKey == "" {
+		ownerKey = relatedInfo.PrimaryKey
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(ownerKey)
+	sb.WriteString(" IN (")
+
+	args := make([]any, len(fks))
+	placeholders := make([]string, len(fks))
+	for i, fk := range fks {
+		placeholders[i] = "?"
+		args[i] = fk
+	}
+	sb.WriteString(strings.Join(placeholders, ","))
+	sb.WriteString(")")
+
+	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	if err != nil {
+		return err
+	}
+
+	// Recursive Load
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	// 4. Map back
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		var pkFieldName string
+		if field, ok := relatedInfo.Columns[ownerKey]; ok {
+			pkFieldName = field.Name
+		} else {
+			pkFieldName = "ID"
+		}
+
+		resPK := val.FieldByName(pkFieldName).Interface()
+
+		if indices, ok := fkMap[resPK]; ok {
+			for _, idx := range indices {
+				parent := results[idx]
+				parentVal := reflect.ValueOf(parent).Elem()
+				relField := parentVal.FieldByName(relName)
+				if relField.IsValid() && relField.CanSet() {
+					if relField.Kind() == reflect.Ptr {
+						relField.Set(reflect.ValueOf(res))
+					} else {
+						relField.Set(reflect.ValueOf(res).Elem())
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadMorphOneOrMany(results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
+	// 1. Get IDs from results
+	ids := make([]any, len(results))
+	pkField := m.modelInfo.PrimaryKey
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := m.modelInfo.Columns[pkField]; ok {
+			fVal := val.FieldByName(field.Name)
+			if fVal.Kind() == reflect.Ptr {
+				if fVal.IsNil() {
+					ids[i] = nil
+				} else {
+					ids[i] = fVal.Elem().Interface()
+				}
+			} else {
+				ids[i] = fVal.Interface()
+			}
+		} else {
+			ids[i] = val.FieldByName("ID").Interface()
+		}
+	}
+
+	// 2. Get Related Model Instance
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("invalid relation config")
+	}
+
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	// 3. Build Query
+	valConfig := reflect.ValueOf(relConfig)
+	typeColumn := valConfig.FieldByName("Type").String()
+	idColumn := valConfig.FieldByName("ID").String()
+
+	if typeColumn == "" || idColumn == "" {
+		return fmt.Errorf("MorphOne/MorphMany requires Type and ID columns")
+	}
+
+	// Determine Morph Type Value (Parent Model Name)
+	// We use the struct name of T
+	parentType := m.modelInfo.Type.Name()
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(typeColumn)
+	sb.WriteString(" = ? AND ")
+	sb.WriteString(idColumn)
+	sb.WriteString(" IN (")
+
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, parentType)
+
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	sb.WriteString(strings.Join(placeholders, ","))
+	sb.WriteString(")")
+
+	// Execute
+	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	if err != nil {
+		return err
+	}
+
+	// Recursive Load
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	// 4. Map back
+	relatedMap := make(map[any][]reflect.Value)
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := relatedInfo.Columns[idColumn]; ok {
+			fkVal := val.FieldByName(field.Name).Interface()
+			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
+		}
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+
+		if children, ok := relatedMap[parentID]; ok {
+			relField := parentVal.FieldByName(relName)
+			if relField.IsValid() && relField.CanSet() {
+				if isOne {
+					// MorphOne: Set single value
+					if len(children) > 0 {
+						child := children[0]
+						if relField.Kind() == reflect.Ptr {
+							relField.Set(child) // child is *R (pointer to struct)
+						} else {
+							relField.Set(child.Elem())
+						}
+					}
+				} else {
+					// MorphMany: Set slice
+					sliceType := relField.Type()
+					slice := reflect.MakeSlice(sliceType, 0, len(children))
+					for _, child := range children {
+						if sliceType.Elem().Kind() == reflect.Ptr {
+							slice = reflect.Append(slice, child)
+						} else {
+							slice = reflect.Append(slice, child.Elem())
+						}
+					}
+					relField.Set(slice)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func isZero(v any) bool {
+	if v == nil {
+		return true
+	}
+	return reflect.ValueOf(v).IsZero()
+}
+
+// loadRelationsDynamic is a helper to load relations on a slice of any (which are *R).
+func (m *Model[T]) loadRelationsDynamic(results []any, modelType reflect.Type, relations []string) error {
+	// Group relations
+	type relGroup struct {
+		Cols string
+		Subs []string
+	}
+	groups := make(map[string]*relGroup)
+
+	for _, relationName := range relations {
+		parts := strings.Split(relationName, ":")
+		path := parts[0]
+		cols := ""
+		if len(parts) > 1 {
+			cols = parts[1]
+		}
+
+		dotParts := strings.SplitN(path, ".", 2)
+		root := dotParts[0]
+
+		if _, ok := groups[root]; !ok {
+			groups[root] = &relGroup{}
+		}
+
+		if len(dotParts) > 1 {
+			sub := dotParts[1]
+			if cols != "" {
+				sub += ":" + cols
+			}
+			groups[root].Subs = append(groups[root].Subs, sub)
+		} else {
+			if cols != "" {
+				groups[root].Cols = cols
+			}
+		}
+	}
+
+	for relName, group := range groups {
+		// Find method on modelType
+		// The relation might return *Related or Related.
+		// We want []*Related.
+		// relatedType is Related (struct type).
+		ptrType := reflect.PointerTo(modelType)
+		method, ok := ptrType.MethodByName(relName)
+		if !ok {
+			method, ok = modelType.MethodByName(relName)
+			if !ok {
+				return fmt.Errorf("relation method %s not found on %v", relName, modelType)
+			}
+		}
+
+		if len(results) == 0 {
+			return nil
+		}
+
+		res0 := reflect.ValueOf(results[0])
+		retVals := method.Func.Call([]reflect.Value{res0})
+		relConfig := retVals[0].Interface()
+
+		if rel, ok := relConfig.(Relation); ok {
+			switch rel.RelationType() {
+			case RelationHasMany:
+				if err := m.loadHasManyDynamic(results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
+	modelInfo := ParseModelType(modelType)
+	ids := make([]any, len(results))
+	pkField := modelInfo.PrimaryKey
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := modelInfo.Columns[pkField]; ok {
+			ids[i] = val.FieldByName(field.Name).Interface()
+		} else {
+			ids[i] = val.FieldByName("ID").Interface()
+		}
+	}
+
+	rel, _ := relConfig.(Relation)
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	valConfig := reflect.ValueOf(relConfig)
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(modelType.Name()) + "_id"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(foreignKey)
+	sb.WriteString(" IN (")
+
+	args := make([]any, len(ids))
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	sb.WriteString(strings.Join(placeholders, ","))
+	sb.WriteString(")")
+
+	// Execute
+	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	if err != nil {
+		return err
+	}
+
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	relatedMap := make(map[any][]reflect.Value)
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := relatedInfo.Columns[foreignKey]; ok {
+			fkVal := val.FieldByName(field.Name).Interface()
+			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
+		}
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+
+		if children, ok := relatedMap[parentID]; ok {
+			relField := parentVal.FieldByName(relName)
+			if relField.IsValid() && relField.CanSet() {
+				sliceType := relField.Type()
+				slice := reflect.MakeSlice(sliceType, 0, len(children))
+				for _, child := range children {
+					if sliceType.Elem().Kind() == reflect.Ptr {
+						slice = reflect.Append(slice, child)
+					} else {
+						slice = reflect.Append(slice, child.Elem())
+					}
+				}
+				relField.Set(slice)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Attach inserts rows into the pivot table for a BelongsToMany relation.
+// pivotData: map[any]map[string]any (RelatedID -> {Column: Value})
+func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
+	// 1. Get Relation Config
+	var t T
+	methodVal := reflect.ValueOf(t).MethodByName(relation)
+	if !methodVal.IsValid() {
+		return fmt.Errorf("relation method %s not found", relation)
+	}
+	retVals := methodVal.Call(nil)
+	relConfig := retVals[0].Interface()
+
+	// Check if it's a BelongsToMany struct
+	// We can't cast to BelongsToMany[any] because T is generic.
+	// We'll use reflection to read fields.
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Type().Name() != "BelongsToMany" {
+		// Strict check might fail if package name included? "zorm.BelongsToMany"
+		if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
+			return WrapRelationError(relation, fmt.Sprintf("%T", t), ErrInvalidRelation)
+		}
+	}
+	pivotTable := valConfig.FieldByName("PivotTable").String()
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	relatedKey := valConfig.FieldByName("RelatedKey").String()
+
+	if pivotTable == "" {
+		return WrapRelationError(relation, "pivot", ErrInvalidConfig)
+	}
+
+	// 2. Get Parent ID
+	parentVal := reflect.ValueOf(entity).Elem()
+	pkField := m.modelInfo.PrimaryKey
+	var parentID any
+	if field, ok := m.modelInfo.Columns[pkField]; ok {
+		parentID = parentVal.FieldByName(field.Name).Interface()
+	} else {
+		parentID = parentVal.FieldByName("ID").Interface()
+	}
+
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+	if relatedKey == "" {
+		// We need related type name.
+		// relatedType := valConfig.FieldByName("RelatedType")? No.
+		// We can infer from method return type?
+		// Or just assume standard convention if missing.
+		// Ideally BelongsToMany struct should have it.
+		// Let's assume user provided it or we fail.
+		// Or we assume relatedKey is "related_model_id".
+		return WrapRelationError(relation, "pivot", ErrInvalidConfig)
+	}
+
+	// 3. Insert Loop
+	for _, id := range ids {
+		// Prepare columns and values
+		cols := []string{foreignKey, relatedKey}
+		vals := []any{parentID, id}
+		placeholders := []string{"?", "?"}
+
+		// Add pivot data
+		if pivotData != nil {
+			if data, ok := pivotData[id]; ok {
+				for k, v := range data {
+					cols = append(cols, k)
+					vals = append(vals, v)
+					placeholders = append(placeholders, "?")
+				}
+			}
+		}
+
+		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+			pivotTable,
+			strings.Join(cols, ", "),
+			strings.Join(placeholders, ", "))
+
+		_, err := m.queryer().ExecContext(m.ctx, query, vals...)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Detach deletes rows from the pivot table.
+func (m *Model[T]) Detach(entity *T, relation string, ids []any) error {
+	// 1. Get Relation Config (Same as Attach)
+	var t T
+	methodVal := reflect.ValueOf(t).MethodByName(relation)
+	if !methodVal.IsValid() {
+		return fmt.Errorf("relation method %s not found", relation)
+	}
+	retVals := methodVal.Call(nil)
+	relConfig := retVals[0].Interface()
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Type().Name() != "BelongsToMany" {
+		// Strict check might fail if package name included? "zorm.BelongsToMany"
+		if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
+			return fmt.Errorf("relation %s is not BelongsToMany", relation)
+		}
+	}
+
+	pivotTable := valConfig.FieldByName("PivotTable").String()
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	relatedKey := valConfig.FieldByName("RelatedKey").String()
+
+	if pivotTable == "" {
+		return fmt.Errorf("pivot table not defined")
+	}
+
+	// 2. Get Parent ID
+	parentVal := reflect.ValueOf(entity).Elem()
+	pkField := m.modelInfo.PrimaryKey
+	var parentID any
+	if field, ok := m.modelInfo.Columns[pkField]; ok {
+		parentID = parentVal.FieldByName(field.Name).Interface()
+	} else {
+		parentID = parentVal.FieldByName("ID").Interface()
+	}
+
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+
+	// 3. Delete
+	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", pivotTable, foreignKey)
+	args := []any{parentID}
+
+	if len(ids) > 0 {
+		if relatedKey == "" {
+			return fmt.Errorf("RelatedKey must be defined for Detach with IDs")
+		}
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += fmt.Sprintf(" AND %s IN (%s)", relatedKey, strings.Join(placeholders, ","))
+	}
+
+	_, err := m.queryer().ExecContext(m.ctx, query, args...)
+	return err
+}
+
+// Sync synchronizes the association with the given IDs.
+// It attaches missing IDs and detaches IDs that are not in the new list.
+// pivotData: map[any]map[string]any (RelatedID -> {Column: Value})
+func (m *Model[T]) Sync(entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
+	// 1. Get Relation Config
+	var t T
+	methodVal := reflect.ValueOf(t).MethodByName(relation)
+	if !methodVal.IsValid() {
+		// Try with "Relation" suffix
+		methodVal = reflect.ValueOf(t).MethodByName(relation + "Relation")
+		if !methodVal.IsValid() {
+			return fmt.Errorf("relation method %s not found", relation)
+		}
+	}
+	retVals := methodVal.Call(nil)
+	relConfig := retVals[0].Interface()
+
+	valConfig := reflect.ValueOf(relConfig)
+	if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
+		return fmt.Errorf("relation %s is not BelongsToMany", relation)
+	}
+
+	pivotTable := valConfig.FieldByName("PivotTable").String()
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	relatedKey := valConfig.FieldByName("RelatedKey").String()
+
+	if pivotTable == "" {
+		return fmt.Errorf("pivot table not defined")
+	}
+
+	// 2. Get Parent ID
+	parentVal := reflect.ValueOf(entity).Elem()
+	pkField := m.modelInfo.PrimaryKey
+	var parentID any
+	if field, ok := m.modelInfo.Columns[pkField]; ok {
+		parentID = parentVal.FieldByName(field.Name).Interface()
+	} else {
+		parentID = parentVal.FieldByName("ID").Interface()
+	}
+
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+	if relatedKey == "" {
+		return fmt.Errorf("RelatedKey must be defined for Sync")
+	}
+
+	// 3. Get Current IDs
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", relatedKey, pivotTable, foreignKey)
+	rows, err := m.queryer().QueryContext(m.ctx, query, parentID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	currentIDs := make(map[any]bool)
+	for rows.Next() {
+		var id any
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		// Handle type mismatch? Scan into interface{} might give int64, but input might be int.
+		// We should normalize or be careful.
+		// For simplicity, let's assume compatible types or string comparison if needed.
+		currentIDs[id] = true
+	}
+
+	// 4. Determine Attach and Detach
+	var toAttach []any
+	var toDetach []any
+
+	// Normalize input IDs to map for lookup
+	newIDsMap := make(map[any]bool)
+	for _, id := range ids {
+		newIDsMap[id] = true
+	}
+
+	// Find toAttach (in new but not in current)
+	for _, id := range ids {
+		// We need to check if id is in currentIDs.
+		// Handle type conversion properly for numeric types
+		found := false
+		for curID := range currentIDs {
+			if compareIDs(curID, id) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			toAttach = append(toAttach, id)
+		}
+	}
+
+	// Find toDetach (in current but not in new)
+	for curID := range currentIDs {
+		found := false
+		for _, id := range ids {
+			if compareIDs(curID, id) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			toDetach = append(toDetach, curID)
+		}
+	}
+
+	// 5. Execute
+	if len(toDetach) > 0 {
+		if err := m.Detach(entity, relation, toDetach); err != nil {
+			return err
+		}
+	}
+
+	if len(toAttach) > 0 {
+		if err := m.Attach(entity, relation, toAttach, pivotData); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
