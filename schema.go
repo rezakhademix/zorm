@@ -1,7 +1,10 @@
 package zorm
 
 import (
+	"database/sql"
+	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -41,7 +44,7 @@ func ParseModel[T any]() *ModelInfo {
 // ParseModelType inspects the type and returns its metadata.
 func ParseModelType(typ reflect.Type) *ModelInfo {
 	// Handle pointer types
-	if typ.Kind() == reflect.Ptr {
+	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
 	if typ.Kind() != reflect.Struct {
@@ -89,12 +92,26 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		info.PrimaryKey = "id" // Default
 	}
 
-	// 3. Parse Fields
+	// 3. Parse Fields (including embedded)
+	parseFields(typ, info, []int{})
+
+	modelCache[typ] = info
+	return info
+}
+
+func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 
 		// Skip unexported fields
 		if field.PkgPath != "" {
+			continue
+		}
+
+		// Handle Embedded Structs
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			newIndex := append(indexPrefix, i)
+			parseFields(field.Type, info, newIndex)
 			continue
 		}
 
@@ -106,6 +123,7 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 
 		dbCol := ToSnakeCase(field.Name)
 		isPrimary := false
+		isAuto := false
 
 		// Parse tag
 		if tag != "" {
@@ -123,6 +141,8 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 					dbCol = val
 				case "primary":
 					isPrimary = true
+				case "auto":
+					isAuto = true
 				}
 			}
 		}
@@ -130,6 +150,7 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		// If field name is "ID" and no tag specified, it's primary
 		if field.Name == "ID" && !isPrimary {
 			isPrimary = true
+			isAuto = true // Default ID to auto-increment
 		}
 
 		// Override model primary key if found on field
@@ -137,58 +158,306 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 			info.PrimaryKey = dbCol
 		}
 
+		// Construct full index path
+		currentIndex := append(indexPrefix, i)
+		// We need to copy the slice to avoid sharing backing array issues in recursion?
+		// append creates a new slice if capacity is exceeded, but better be safe.
+		// Actually, since we pass by value (slice header), and append returns new header,
+		// it should be fine as long as we don't modify the passed slice.
+		// But `indexPrefix` is reused in the loop? No, it's constant for this call.
+		// `newIndex` in recursive call is a new slice.
+		// `currentIndex` here is a new slice.
+		// However, `indexPrefix` backing array might be shared.
+		// To be safe, let's force copy if needed, but `append` usually handles it.
+		// Let's explicitly copy to be 100% safe against subtle bugs.
+		finalIndex := make([]int, len(currentIndex))
+		copy(finalIndex, currentIndex)
+
 		fInfo := &FieldInfo{
 			Name:      field.Name,
 			Column:    dbCol,
 			IsPrimary: isPrimary,
+			IsAuto:    isAuto,
 			FieldType: field.Type,
-			Index:     field.Index,
+			Index:     finalIndex,
 		}
 
 		info.Fields[field.Name] = fInfo
 		info.Columns[dbCol] = fInfo
 	}
-
-	modelCache[typ] = info
-	return info
 }
 
 // ToSnakeCase converts a string to snake_case.
+// Handles acronyms correctly (e.g., UserID -> user_id, HTTPClient -> http_client).
 func ToSnakeCase(s string) string {
 	var result strings.Builder
+	result.Grow(len(s) + 5) // Pre-allocate some space
+
 	for i, r := range s {
-		if i > 0 && unicode.IsUpper(r) {
-			result.WriteByte('_')
+		if i > 0 {
+			// If current is upper
+			if unicode.IsUpper(r) {
+				// Check previous char
+				prev := rune(s[i-1])
+				// If previous was lower, we definitely need underscore (e.g. aB -> a_b)
+				if unicode.IsLower(prev) {
+					result.WriteByte('_')
+				} else if unicode.IsUpper(prev) {
+					// If previous was upper, we might need underscore if next is lower
+					// e.g. HTTPClient -> HTTP_Client (at 'C')
+					// But wait, HTTPClient -> http_client
+					// H T T P C lient
+					// i=0 H
+					// i=1 T (prev=H). No _
+					// ...
+					// i=4 C (prev=P). No _ ?
+					// i=5 l (prev=C).
+					// If we have ID, I D.
+					// UserID -> user_id.
+					// U s e r I D
+					// r I -> r_i
+					// I D -> id
+					// HTTPClient -> http_client
+					// P C -> p_c ? No.
+					// We want http_client.
+					// So if current is upper, and next is lower, and previous is upper -> underscore before current.
+					// e.g. P(prev) C(curr) l(next) -> P_Cl
+					if i+1 < len(s) {
+						next := rune(s[i+1])
+						if unicode.IsLower(next) {
+							result.WriteByte('_')
+						}
+					}
+				} else if unicode.IsDigit(prev) {
+					// 1A -> 1_a
+					result.WriteByte('_')
+				}
+			} else if unicode.IsDigit(r) {
+				// a1 -> a_1
+				prev := rune(s[i-1])
+				if !unicode.IsDigit(prev) {
+					result.WriteByte('_')
+				}
+			}
 		}
 		result.WriteRune(unicode.ToLower(r))
 	}
-	return string(result.String())
+	return result.String()
 }
 
-// fillStruct populates a struct with values from a map.
+// fillStruct populates a struct with values from a map using ModelInfo.
 func fillStruct[T any](entity *T, data map[string]any) error {
 	val := reflect.ValueOf(entity).Elem()
-	typ := val.Type()
+	// We need ModelInfo to know mapping
+	info := ParseModel[T]()
 
-	for i := 0; i < val.NumField(); i++ {
-		field := typ.Field(i)
-		fieldVal := val.Field(i)
+	for colName, valData := range data {
+		// Find field info by column name
+		fieldInfo, ok := info.Columns[colName]
+		if !ok {
+			continue
+		}
 
-		// Skip unexported fields
+		// Get field value using Index (supports embedded structs)
+		fieldVal := val.FieldByIndex(fieldInfo.Index)
+
 		if !fieldVal.CanSet() {
 			continue
 		}
 
-		// Find key in data (snake_case)
-		key := ToSnakeCase(field.Name)
-		if v, ok := data[key]; ok {
-			// Simple type setting
-			// TODO: robust type conversion
-			safeVal := reflect.ValueOf(v)
-			if safeVal.IsValid() && safeVal.Type().ConvertibleTo(fieldVal.Type()) {
-				fieldVal.Set(safeVal.Convert(fieldVal.Type()))
-			}
+		// Set value with conversion
+		if err := setFieldValue(fieldVal, valData); err != nil {
+			return fmt.Errorf("failed to set field %s (col %s): %w", fieldInfo.Name, colName, err)
 		}
+	}
+	return nil
+}
+
+// setFieldValue sets a reflect.Value with type conversion.
+func setFieldValue(field reflect.Value, value any) error {
+	if value == nil {
+		// If field is a pointer, set to nil
+		if field.Kind() == reflect.Pointer {
+			field.Set(reflect.Zero(field.Type()))
+			return nil
+		}
+		// If field is not pointer, we can't set nil. Ignore or error?
+		// Ignore is safer for partial updates.
+		return nil
+	}
+
+	// Handle sql.Scanner
+	if scanner, ok := field.Addr().Interface().(sql.Scanner); ok {
+		return scanner.Scan(value)
+	}
+
+	// Handle pointer fields: we want to set the element
+	if field.Kind() == reflect.Pointer {
+		// If value is nil, handled above.
+		// Allocate new value if nil
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		// Recurse to set the element
+		return setFieldValue(field.Elem(), value)
+	}
+
+	val := reflect.ValueOf(value)
+	valType := val.Type()
+	fieldType := field.Type()
+
+	// Direct assignment if types match
+	if valType.AssignableTo(fieldType) {
+		field.Set(val)
+		return nil
+	}
+
+	// Type Conversion
+	if valType.ConvertibleTo(fieldType) {
+		field.Set(val.Convert(fieldType))
+		return nil
+	}
+
+	// Common conversions (e.g. int64 -> int, []byte -> string)
+	switch field.Kind() {
+	case reflect.String:
+		if val.Kind() == reflect.Slice && valType.Elem().Kind() == reflect.Uint8 {
+			// []byte to string
+			field.SetString(string(val.Bytes()))
+			return nil
+		}
+		// Fallback to fmt.Sprint
+		field.SetString(fmt.Sprint(value))
+		return nil
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return setIntField(field, value)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return setUintField(field, value)
+
+	case reflect.Float32, reflect.Float64:
+		return setFloatField(field, value)
+
+	case reflect.Bool:
+		return setBoolField(field, value)
+	}
+
+	return fmt.Errorf("unsupported type conversion from %T to %s", value, fieldType)
+}
+
+func setIntField(field reflect.Value, value any) error {
+	switch v := value.(type) {
+	case int64:
+		field.SetInt(v)
+	case int:
+		field.SetInt(int64(v))
+	case int32:
+		field.SetInt(int64(v))
+	case int16:
+		field.SetInt(int64(v))
+	case int8:
+		field.SetInt(int64(v))
+	case float64:
+		field.SetInt(int64(v))
+	case float32:
+		field.SetInt(int64(v))
+	case []byte:
+		i, err := strconv.ParseInt(string(v), 10, 64)
+		if err != nil {
+			return err
+		}
+		field.SetInt(i)
+	case string:
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return err
+		}
+		field.SetInt(i)
+	default:
+		return fmt.Errorf("cannot convert %T to int", value)
+	}
+	return nil
+}
+
+func setUintField(field reflect.Value, value any) error {
+	switch v := value.(type) {
+	case int64:
+		field.SetUint(uint64(v))
+	case uint64:
+		field.SetUint(v)
+	case int:
+		field.SetUint(uint64(v))
+	case float64:
+		field.SetUint(uint64(v))
+	case []byte:
+		i, err := strconv.ParseUint(string(v), 10, 64)
+		if err != nil {
+			return err
+		}
+		field.SetUint(i)
+	case string:
+		i, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return err
+		}
+		field.SetUint(i)
+	default:
+		return fmt.Errorf("cannot convert %T to uint", value)
+	}
+	return nil
+}
+
+func setFloatField(field reflect.Value, value any) error {
+	switch v := value.(type) {
+	case float64:
+		field.SetFloat(v)
+	case float32:
+		field.SetFloat(float64(v))
+	case int64:
+		field.SetFloat(float64(v))
+	case int:
+		field.SetFloat(float64(v))
+	case []byte:
+		f, err := strconv.ParseFloat(string(v), 64)
+		if err != nil {
+			return err
+		}
+		field.SetFloat(f)
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return err
+		}
+		field.SetFloat(f)
+	default:
+		return fmt.Errorf("cannot convert %T to float", value)
+	}
+	return nil
+}
+
+func setBoolField(field reflect.Value, value any) error {
+	switch v := value.(type) {
+	case bool:
+		field.SetBool(v)
+	case int64:
+		field.SetBool(v != 0)
+	case int:
+		field.SetBool(v != 0)
+	case string:
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return err
+		}
+		field.SetBool(b)
+	case []byte:
+		b, err := strconv.ParseBool(string(v))
+		if err != nil {
+			return err
+		}
+		field.SetBool(b)
+	default:
+		return fmt.Errorf("cannot convert %T to bool", value)
 	}
 	return nil
 }
