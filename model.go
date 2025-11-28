@@ -38,6 +38,16 @@ type Model[T any] struct {
 	// Raw Query State
 	rawQuery string
 	rawArgs  []any
+
+	// CTE State
+	ctes []CTE
+}
+
+// CTE represents a Common Table Expression.
+type CTE struct {
+	Name  string
+	Query any // string or *Model[T]
+	Args  []any
 }
 
 // New creates a new Model instance for type T.
@@ -101,6 +111,10 @@ func (m *Model[T]) Clone() *Model[T] {
 	if len(m.rawArgs) > 0 {
 		newModel.rawArgs = make([]any, len(m.rawArgs))
 		copy(newModel.rawArgs, m.rawArgs)
+	}
+	if len(m.ctes) > 0 {
+		newModel.ctes = make([]CTE, len(m.ctes))
+		copy(newModel.ctes, m.ctes)
 	}
 
 	// Copy maps
