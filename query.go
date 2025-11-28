@@ -609,3 +609,21 @@ func (m *Model[T]) UseReplica(index int) *Model[T] {
 	m.forceReplica = index
 	return m
 }
+
+// Print returns the SQL query and arguments that would be executed without running it.
+// This is useful for debugging and logging the generated SQL.
+// Example:
+//
+//	sql, args := m.Where("status", "active").Limit(10).Print()
+//	fmt.Println(sql, args)
+//
+// Output: "SELECT * FROM users WHERE 1=1 AND (status = ?) LIMIT 10" [active]
+func (m *Model[T]) Print() (string, []any) {
+	// If raw query is set, return it
+	if m.rawQuery != "" {
+		return m.rawQuery, m.rawArgs
+	}
+
+	// Otherwise, build the SELECT query
+	return m.buildSelectQuery()
+}
