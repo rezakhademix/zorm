@@ -127,7 +127,7 @@ func TestModel_Transaction(t *testing.T) {
 	m.SetDB(db)
 
 	// Test Commit
-	err = m.Transaction(func(tx *Tx) error {
+	err = m.Transaction(context.Background(), func(tx *Tx) error {
 		return nil
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func TestModel_Transaction(t *testing.T) {
 	// Test Rollback
 	tx = &mockTx{}
 	conn.tx = tx
-	err = m.Transaction(func(tx *Tx) error {
+	err = m.Transaction(context.Background(), func(tx *Tx) error {
 		return errors.New("fail")
 	})
 	if err == nil {

@@ -22,8 +22,8 @@ func Transaction(ctx context.Context, fn func(tx *Tx) error) error {
 }
 
 // Transaction executes a function within a transaction using the model's database connection.
-func (m *Model[T]) Transaction(fn func(tx *Tx) error) error {
-	return transaction(m.ctx, m.db, fn)
+func (m *Model[T]) Transaction(ctx context.Context, fn func(tx *Tx) error) error {
+	return transaction(ctx, m.db, fn)
 }
 
 // transaction is a helper to execute a function within a transaction.
