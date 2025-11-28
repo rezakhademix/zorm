@@ -7,13 +7,20 @@ import (
 	"time"
 )
 
-// DB is the global database connection pool.
+// GlobalDB is the global database connection pool.
 // In a real app, this might be managed differently, but for this ORM style,
 // we often have a global or a passed-in DB.
 // For now, we'll allow setting it globally or per-instance.
 var GlobalDB *sql.DB
 
-// Model[T] is the main struct for the ORM.
+// Model provides a strongly typed ORM interface for working with the entity
+// type T. It stores the active query state—including selected columns, filters,
+// ordering, grouping, relation loading rules, and raw SQL segments—allowing the
+// builder to compose complex queries in a structured and chainable manner.
+//
+// The Model also tracks the execution context, database handle or transaction,
+// and metadata derived from T that is used for mapping database rows into
+// entities.
 type Model[T any] struct {
 	ctx       context.Context
 	db        *sql.DB

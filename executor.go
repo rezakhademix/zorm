@@ -338,7 +338,8 @@ func (m *Model[T]) Cursor() (*Cursor[T], error) {
 	}, nil
 }
 
-// Cursor[T] allows iterating over query results.
+// Cursor provides a typed, forward-only iterator over database query results.
+// It wraps sql.Rows and maps each row into the generic model type T.
 type Cursor[T any] struct {
 	rows  *sql.Rows
 	model *Model[T]
