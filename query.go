@@ -210,6 +210,34 @@ func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
 	return m
 }
 
+// GroupByRollup adds a GROUP BY ROLLUP clause.
+func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
+	m.groupBys = append(m.groupBys, fmt.Sprintf("ROLLUP (%s)", strings.Join(columns, ", ")))
+	return m
+}
+
+// GroupByCube adds a GROUP BY CUBE clause.
+func (m *Model[T]) GroupByCube(columns ...string) *Model[T] {
+	m.groupBys = append(m.groupBys, fmt.Sprintf("CUBE (%s)", strings.Join(columns, ", ")))
+	return m
+}
+
+// GroupByGroupingSets adds a GROUP BY GROUPING SETS clause.
+// Each slice in sets represents a grouping set.
+// Empty slice represents empty grouping set ().
+func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
+	var setStrings []string
+	for _, set := range sets {
+		if len(set) == 0 {
+			setStrings = append(setStrings, "()")
+		} else {
+			setStrings = append(setStrings, fmt.Sprintf("(%s)", strings.Join(set, ", ")))
+		}
+	}
+	m.groupBys = append(m.groupBys, fmt.Sprintf("GROUPING SETS (%s)", strings.Join(setStrings, ", ")))
+	return m
+}
+
 // Having adds a HAVING clause (used with GROUP BY).
 func (m *Model[T]) Having(query string, args ...any) *Model[T] {
 	// Similar to Where, but for HAVING

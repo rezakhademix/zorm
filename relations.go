@@ -6,13 +6,24 @@ import (
 	"strings"
 )
 
-// Relation types
+// RelationType defines the type of relationship between two models in the ORM.
 type RelationType string
 
 const (
-	RelationHasOne        RelationType = "HasOne"
-	RelationHasMany       RelationType = "HasMany"
-	RelationBelongsTo     RelationType = "BelongsTo"
+	// RelationHasOne represents a one-to-one relationship where the current
+	// model owns a single related record.
+	RelationHasOne RelationType = "HasOne"
+
+	// RelationHasMany represents a one-to-many relationship where the current
+	// model owns multiple related records.
+	RelationHasMany RelationType = "HasMany"
+
+	// RelationBelongsTo represents an inverse one-to-one or one-to-many
+	// relationship where the current model references a parent record.
+	RelationBelongsTo RelationType = "BelongsTo"
+
+	// RelationBelongsToMany represents a many-to-many relationship between
+	// two models, typically connected through a join table.
 	RelationBelongsToMany RelationType = "BelongsToMany"
 )
 
@@ -103,8 +114,19 @@ func (BelongsToMany[T]) RelationType() RelationType { return RelationBelongsToMa
 func (BelongsToMany[T]) NewRelated() any            { return new(T) }
 
 const (
-	RelationMorphTo   RelationType = "MorphTo"
-	RelationMorphOne  RelationType = "MorphOne"
+	// RelationMorphTo represents a polymorphic inverse relationship where the
+	// current model can belong to one of several different model types. The
+	// actual target type and ID are determined by discriminator columns such as
+	// "morph_type" and "morph_id".
+	RelationMorphTo RelationType = "MorphTo"
+
+	// RelationMorphOne represents a polymorphic one-to-one relationship where a
+	// single related record can be associated with multiple possible parent
+	// model types.
+	RelationMorphOne RelationType = "MorphOne"
+
+	// RelationMorphMany represents a polymorphic one-to-many relationship where
+	// multiple related records can be associated with various parent model types.
 	RelationMorphMany RelationType = "MorphMany"
 )
 
