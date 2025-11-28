@@ -58,6 +58,9 @@ type Model[T any] struct {
 
 	// CTE State
 	ctes []CTE
+
+	// Statement Cache (optional)
+	stmtCache *StmtCache
 }
 
 // CTE represents a Common Table Expression.
@@ -91,6 +94,7 @@ func (m *Model[T]) Clone() *Model[T] {
 		limit:     m.limit,
 		offset:    m.offset,
 		rawQuery:  m.rawQuery,
+		stmtCache: m.stmtCache, // Preserve statement cache reference
 	}
 
 	// Copy slices
@@ -167,6 +171,20 @@ func (m *Model[T]) TableName() string {
 // SetDB sets a custom database connection for this model instance.
 func (m *Model[T]) SetDB(db *sql.DB) *Model[T] {
 	m.db = db
+	return m
+}
+
+// WithStmtCache enables statement caching for this model instance.
+// The cache will be used to store and reuse prepared statements,
+// improving performance by avoiding re-preparation of frequently used queries.
+//
+// Example:
+//
+//	cache := NewStmtCache(100)
+//	defer cache.Close()
+//	model := New[User]().WithStmtCache(cache)
+func (m *Model[T]) WithStmtCache(cache *StmtCache) *Model[T] {
+	m.stmtCache = cache
 	return m
 }
 
