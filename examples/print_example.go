@@ -44,14 +44,6 @@ func main() {
 	fmt.Println("Args:", args)
 	fmt.Println()
 
-	// Example 3: Full-text search
-	m3 := zorm.New[User]()
-	sql, args = m3.WhereFullText("bio", "golang developer").Limit(20).ToSQL()
-	fmt.Println("Query 3:")
-	fmt.Println("SQL:", sql)
-	fmt.Println("Args:", args)
-	fmt.Println()
-
 	// Example 4: Raw query
 	m4 := zorm.New[User]()
 	sql, args = m4.Raw("SELECT * FROM users WHERE email = ? AND age > ?", "test@example.com", 18).Print()
