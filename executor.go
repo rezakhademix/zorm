@@ -7,6 +7,7 @@ import (
 	"maps"
 	"reflect"
 	"strings"
+	"time"
 )
 
 // queryer returns the appropriate query executor based on transaction state and resolver configuration.
@@ -732,6 +733,16 @@ func (m *Model[T]) Update(entity *T) error {
 		return ErrNilPointer
 	}
 
+	// Auto-update updated_at if it exists
+	if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
+		val := reflect.ValueOf(entity).Elem()
+		fieldVal := val.FieldByIndex(fieldInfo.Index)
+		if fieldVal.CanSet() {
+			// Use setFieldValue to handle type conversion safely
+			_ = setFieldValue(fieldVal, time.Now())
+		}
+	}
+
 	// Hooks
 	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
 		if err := hook.BeforeUpdate(m.ctx); err != nil {
@@ -910,6 +921,13 @@ func (m *Model[T]) CreateMany(entities []*T) error {
 func (m *Model[T]) UpdateMany(values map[string]any) error {
 	if len(values) == 0 {
 		return nil
+	}
+
+	// Auto-update updated_at if it exists and not provided
+	if _, ok := m.modelInfo.Columns["updated_at"]; ok {
+		if _, exists := values["updated_at"]; !exists {
+			values["updated_at"] = time.Now()
+		}
 	}
 
 	var sets []string
