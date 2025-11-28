@@ -13,6 +13,11 @@ import (
 // For now, we'll allow setting it globally or per-instance.
 var GlobalDB *sql.DB
 
+// GlobalResolver is the global database resolver for primary/replica setup.
+// If configured, it will automatically route read queries to replicas
+// and write queries to the primary database.
+var GlobalResolver *DBResolver
+
 // Model provides a strongly typed ORM interface for working with the entity
 // type T. It stores the active query state—including selected columns, filters,
 // ordering, grouping, relation loading rules, and raw SQL segments—allowing the
@@ -43,6 +48,10 @@ type Model[T any] struct {
 	morphRelations    map[string]map[string][]string // Map of relation -> type -> []relations
 	lockMode          string                         // Lock mode for SELECT ... FOR UPDATE/SHARE
 
+	// Resolver State (for primary/replica routing)
+	forcePrimary bool // Force use of primary database
+	forceReplica int  // Force specific replica (-1 = auto, 0+ = replica index)
+
 	// Raw Query State
 	rawQuery string
 	rawArgs  []any
@@ -66,6 +75,7 @@ func New[T any]() *Model[T] {
 		modelInfo:         ParseModel[T](),
 		relationCallbacks: make(map[string]any),
 		morphRelations:    make(map[string]map[string][]string),
+		forceReplica:      -1, // -1 means auto-select
 	}
 }
 
@@ -176,5 +186,22 @@ func ConfigureConnectionPool(db *sql.DB, maxOpen, maxIdle int, maxLifetime, idle
 	}
 	if idleTimeout > 0 {
 		db.SetConnMaxIdleTime(idleTimeout)
+	}
+}
+
+// ConfigureDBResolver configures the global database resolver for primary/replica setup.
+// Example:
+//
+//	ConfigureDBResolver(
+//	    WithPrimary(primaryDB),
+//	    WithReplicas(replica1, replica2),
+//	    WithLoadBalancer(RoundRobinLB),
+//	)
+func ConfigureDBResolver(opts ...ResolverOption) {
+	GlobalResolver = &DBResolver{
+		lb: &RoundRobinLoadBalancer{}, // Default load balancer
+	}
+	for _, opt := range opts {
+		opt(GlobalResolver)
 	}
 }
