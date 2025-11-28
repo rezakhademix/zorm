@@ -110,13 +110,15 @@ func (m *Model[T]) Count() (int64, error) {
 
 	tableName := m.modelInfo.TableName
 	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
 	sb.WriteString("SELECT COUNT(*) FROM ")
 	sb.WriteString(tableName)
 
 	m.buildWhereClause(&sb)
 
 	query := sb.String()
-	args := m.args
+	args := append(cteArgs, m.args...)
 
 	// Restore state
 	m.limit, m.offset = limit, offset
@@ -173,6 +175,8 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	}
 
 	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
 	sb.WriteString("SELECT ")
 
 	if len(m.distinctOn) > 0 {
@@ -218,7 +222,39 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 		sb.WriteString(fmt.Sprintf(" OFFSET %d", m.offset))
 	}
 
-	return sb.String(), m.args
+	return sb.String(), append(cteArgs, m.args...)
+}
+
+// buildWithClause constructs the WITH clause for CTEs.
+func (m *Model[T]) buildWithClause(sb *strings.Builder) []any {
+	if len(m.ctes) == 0 {
+		return nil
+	}
+
+	sb.WriteString("WITH ")
+	var args []any
+
+	for i, cte := range m.ctes {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(cte.Name)
+		sb.WriteString(" AS (")
+
+		if q, ok := cte.Query.(string); ok {
+			sb.WriteString(q)
+		} else if subBuilder, ok := cte.Query.(interface {
+			buildSelectQuery() (string, []any)
+		}); ok {
+			subQuery, subArgs := subBuilder.buildSelectQuery()
+			sb.WriteString(subQuery)
+			args = append(args, subArgs...)
+		}
+
+		sb.WriteString(")")
+	}
+	sb.WriteString(" ")
+	return args
 }
 
 // buildWhereClause appends WHERE conditions to the query builder.
@@ -572,6 +608,8 @@ func (m *Model[T]) Update(entity *T) error {
 	}
 
 	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
 	sb.WriteString("UPDATE ")
 	sb.WriteString(m.modelInfo.TableName)
 	sb.WriteString(" SET ")
@@ -585,7 +623,11 @@ func (m *Model[T]) Update(entity *T) error {
 	values = append(values, pkVal)
 
 	query := sb.String()
-	_, err := m.queryer().ExecContext(m.ctx, query, values...)
+
+	// args: CTE args + SET values + WHERE values
+	allArgs := append(cteArgs, values...)
+
+	_, err := m.queryer().ExecContext(m.ctx, query, allArgs...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, values, err)
 	}
@@ -603,12 +645,15 @@ func (m *Model[T]) Update(entity *T) error {
 // WARNING: Without WHERE conditions, this will delete ALL records in the table.
 func (m *Model[T]) Delete() error {
 	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
 	sb.WriteString("DELETE FROM ")
 	sb.WriteString(m.modelInfo.TableName)
 	m.buildWhereClause(&sb)
 
 	query := sb.String()
-	_, err := m.queryer().ExecContext(m.ctx, query, m.args...)
+	args := append(cteArgs, m.args...)
+	_, err := m.queryer().ExecContext(m.ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("DELETE", query, m.args, err)
 	}
@@ -730,6 +775,8 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 	}
 
 	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
 	sb.WriteString("UPDATE ")
 	sb.WriteString(m.modelInfo.TableName)
 	sb.WriteString(" SET ")
@@ -737,8 +784,9 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 
 	m.buildWhereClause(&sb)
 
-	// Build args in correct order: SET values first, then WHERE values
-	args := make([]any, 0, len(setArgs)+len(m.args))
+	// Build args in correct order: CTE args, SET values, then WHERE values
+	args := make([]any, 0, len(cteArgs)+len(setArgs)+len(m.args))
+	args = append(args, cteArgs...)
 	args = append(args, setArgs...)
 	args = append(args, m.args...)
 
