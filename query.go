@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -147,7 +148,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 }
 
 // Chunk processes the results in chunks to save memory.
-func (m *Model[T]) Chunk(size int, callback func([]*T) error) error {
+func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) error) error {
 	page := 1
 	for {
 		// Clone the builder to avoid modifying the original state permanently?
@@ -159,7 +160,7 @@ func (m *Model[T]) Chunk(size int, callback func([]*T) error) error {
 		offset := (page - 1) * size
 		m.Limit(size).Offset(offset)
 
-		results, err := m.Get()
+		results, err := m.Get(ctx)
 		if err != nil {
 			return err
 		}
@@ -309,7 +310,7 @@ type PaginationResult[T any] struct {
 }
 
 // Paginate executes the query with pagination.
-func (m *Model[T]) Paginate(page, perPage int) (*PaginationResult[T], error) {
+func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
 	// 1. Count total
 	// We need to clone the model to count without limit/offset?
 	// Or just count current query ignoring limit/offset (which are not set yet usually).
@@ -325,7 +326,7 @@ func (m *Model[T]) Paginate(page, perPage int) (*PaginationResult[T], error) {
 	// We need to temporarily remove select columns for count?
 	// m.Count() does `SELECT COUNT(*)`.
 
-	total, err := m.Count()
+	total, err := m.Count(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +336,7 @@ func (m *Model[T]) Paginate(page, perPage int) (*PaginationResult[T], error) {
 	m.Limit(perPage).Offset(offset)
 
 	// 3. Get Data
-	data, err := m.Get()
+	data, err := m.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -357,11 +358,11 @@ func (m *Model[T]) Paginate(page, perPage int) (*PaginationResult[T], error) {
 // SimplePaginate executes the query with pagination but skips the count query.
 // Use this when you don't need the total count (e.g., "Load More" buttons).
 // This is ~2x faster than Paginate() since it only runs 1 query.
-func (m *Model[T]) SimplePaginate(page, perPage int) (*PaginationResult[T], error) {
+func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
 	offset := (page - 1) * perPage
 	m.Limit(perPage).Offset(offset)
 
-	data, err := m.Get()
+	data, err := m.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
