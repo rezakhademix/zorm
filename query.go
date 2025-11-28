@@ -590,3 +590,22 @@ func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
 	m.args = append(m.args, phrase)
 	return m
 }
+
+// UsePrimary forces the next query to use the primary database connection.
+// This is useful when you need to read from primary for consistency,
+// such as immediately after a write operation.
+// Example: m.UsePrimary().Get()
+func (m *Model[T]) UsePrimary() *Model[T] {
+	m.forcePrimary = true
+	m.forceReplica = -1
+	return m
+}
+
+// UseReplica forces the next query to use a specific replica by index.
+// This is useful for testing or when you want to target a specific replica.
+// Example: m.UseReplica(0).Get()
+func (m *Model[T]) UseReplica(index int) *Model[T] {
+	m.forcePrimary = false
+	m.forceReplica = index
+	return m
+}

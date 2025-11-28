@@ -9,19 +9,77 @@ import (
 	"strings"
 )
 
-// queryer returns the appropriate query executor based on transaction state.
+// queryer returns the appropriate query executor based on transaction state and resolver configuration.
 // If a transaction is active (m.tx != nil), it returns the transaction executor.
+// If GlobalResolver is configured, it routes based on forcePrimary/forceReplica flags.
 // Otherwise, it returns the database connection executor.
-// This allows the ORM to seamlessly work with both transactional and non-transactional contexts.
+// This allows the ORM to seamlessly work with both transactional and non-transactional contexts,
+// as well as primary/replica setups.
 func (m *Model[T]) queryer() interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 } {
+	// Transactions always use their own connection
 	if m.tx != nil {
 		return m.tx
 	}
-	return m.db
+
+	// If resolver is configured, use it for routing
+	if GlobalResolver != nil {
+		return m.resolveDB()
+	}
+
+	// Fallback to model or global DB
+	if m.db != nil {
+		return m.db
+	}
+	return GlobalDB
+}
+
+// resolveDB determines which database connection to use based on resolver configuration.
+func (m *Model[T]) resolveDB() *sql.DB {
+	// Manual override: force primary
+	if m.forcePrimary {
+		return GlobalResolver.Primary()
+	}
+
+	// Manual override: force specific replica
+	if m.forceReplica >= 0 {
+		db := GlobalResolver.ReplicaAt(m.forceReplica)
+		if db != nil {
+			return db
+		}
+		// Fallback to load-balanced replica if index is invalid
+	}
+
+	// Auto-select replica (load balanced)
+	// For read operations, this will be called by executor
+	return GlobalResolver.Replica()
+}
+
+// queryerForWrite returns the primary database for write operations.
+// This should be used by Create, Update, Delete, and other write methods.
+func (m *Model[T]) queryerForWrite() interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+} {
+	// Transactions always use their own connection
+	if m.tx != nil {
+		return m.tx
+	}
+
+	// If resolver is configured, always use primary for writes
+	if GlobalResolver != nil {
+		return GlobalResolver.Primary()
+	}
+
+	// Fallback to model or global DB
+	if m.db != nil {
+		return m.db
+	}
+	return GlobalDB
 }
 
 // Get executes the query and returns a slice of results.
@@ -651,7 +709,7 @@ func (m *Model[T]) Create(entity *T) error {
 		return fmt.Errorf("cannot set primary key field %s", pkField.Name)
 	}
 
-	err := m.queryer().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
+	err := m.queryerForWrite().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
 	if err != nil {
 		return WrapQueryError("INSERT", query, values, err)
 	}
@@ -715,7 +773,7 @@ func (m *Model[T]) Update(entity *T) error {
 	// args: CTE args + SET values + WHERE values
 	allArgs := append(cteArgs, values...)
 
-	_, err := m.queryer().ExecContext(m.ctx, query, allArgs...)
+	_, err := m.queryerForWrite().ExecContext(m.ctx, query, allArgs...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, values, err)
 	}
@@ -741,7 +799,7 @@ func (m *Model[T]) Delete() error {
 
 	query := sb.String()
 	args := append(cteArgs, m.args...)
-	_, err := m.queryer().ExecContext(m.ctx, query, args...)
+	_, err := m.queryerForWrite().ExecContext(m.ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("DELETE", query, m.args, err)
 	}
@@ -751,7 +809,7 @@ func (m *Model[T]) Delete() error {
 // Exec executes the query (Raw or Builder) and returns the result.
 func (m *Model[T]) Exec() (sql.Result, error) {
 	if m.rawQuery != "" {
-		return m.queryer().ExecContext(m.ctx, m.rawQuery, m.rawArgs...)
+		return m.queryerForWrite().ExecContext(m.ctx, m.rawQuery, m.rawArgs...)
 	}
 	// For builder, we assume Delete or Update was called which executes immediately.
 	// But if user wants to build a custom query?
@@ -819,7 +877,7 @@ func (m *Model[T]) CreateMany(entities []*T) error {
 	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
 
 	query := sb.String()
-	rows, err := m.queryer().QueryContext(m.ctx, query, args...)
+	rows, err := m.queryerForWrite().QueryContext(m.ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("INSERT", query, args, err)
 	}
@@ -879,7 +937,7 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 	args = append(args, m.args...)
 
 	query := sb.String()
-	_, err := m.queryer().ExecContext(m.ctx, query, args...)
+	_, err := m.queryerForWrite().ExecContext(m.ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, args, err)
 	}
