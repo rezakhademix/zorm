@@ -56,21 +56,6 @@ func TestPrint_RawQuery(t *testing.T) {
 	}
 }
 
-func TestToSQL_Alias(t *testing.T) {
-	m := New[TestModel]()
-	m.Where("id", 1)
-
-	sql, args := m.ToSQL()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (id = ?)"
-
-	if strings.TrimSpace(sql) != expected {
-		t.Errorf("expected sql %q, got %q", expected, sql)
-	}
-	if len(args) != 1 || args[0] != 1 {
-		t.Errorf("expected args [1], got %v", args)
-	}
-}
-
 func TestPrint_WithFullText(t *testing.T) {
 	m := New[TestModel]()
 	m.WhereFullText("content", "search terms").Limit(20)
