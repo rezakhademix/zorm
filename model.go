@@ -41,6 +41,7 @@ type Model[T any] struct {
 	relations         []string
 	relationCallbacks map[string]any                 // Map of relation name to callback function
 	morphRelations    map[string]map[string][]string // Map of relation -> type -> []relations
+	lockMode          string                         // Lock mode for SELECT ... FOR UPDATE/SHARE
 
 	// Raw Query State
 	rawQuery string
