@@ -1,3 +1,6 @@
+//go:build ignore
+// +build ignore
+
 package main
 
 import (
@@ -30,7 +33,7 @@ func main() {
 	cache := zorm.NewStmtCache(100)
 	defer cache.Close()
 
-	fmt.Println("=== Statement Caching Example ===\n")
+	fmt.Println("=== Statement Caching Example ===")
 
 	// Create a model with statement caching enabled
 	model := zorm.New[User]().WithStmtCache(cache)
