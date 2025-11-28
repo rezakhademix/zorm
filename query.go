@@ -539,3 +539,11 @@ func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
 	})
 	return m
 }
+
+// Lock adds a locking clause to the SELECT query.
+// Common modes: "UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"
+// This will generate: SELECT ... FOR [mode]
+func (m *Model[T]) Lock(mode string) *Model[T] {
+	m.lockMode = mode
+	return m
+}

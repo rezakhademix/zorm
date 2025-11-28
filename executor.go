@@ -133,6 +133,88 @@ func (m *Model[T]) Count() (int64, error) {
 	return count, nil
 }
 
+// Sum calculates the sum of a column.
+// Returns 0 if no rows match or the sum is null.
+func (m *Model[T]) Sum(column string) (float64, error) {
+	// Backup limit/offset/order
+	limit, offset := m.limit, m.offset
+	orderBys := m.orderBys
+
+	// Reset for sum
+	m.limit, m.offset = 0, 0
+	m.orderBys = nil
+
+	tableName := m.modelInfo.TableName
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
+	sb.WriteString("SELECT SUM(")
+	sb.WriteString(column)
+	sb.WriteString(") FROM ")
+	sb.WriteString(tableName)
+
+	m.buildWhereClause(&sb)
+
+	query := sb.String()
+	args := append(cteArgs, m.args...)
+
+	// Restore state
+	m.limit, m.offset = limit, offset
+	m.orderBys = orderBys
+
+	var result sql.NullFloat64
+	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+	if err != nil {
+		return 0, WrapQueryError("SUM", query, args, err)
+	}
+
+	if result.Valid {
+		return result.Float64, nil
+	}
+	return 0, nil
+}
+
+// Avg calculates the average of a column.
+// Returns 0 if no rows match or the average is null.
+func (m *Model[T]) Avg(column string) (float64, error) {
+	// Backup limit/offset/order
+	limit, offset := m.limit, m.offset
+	orderBys := m.orderBys
+
+	// Reset for avg
+	m.limit, m.offset = 0, 0
+	m.orderBys = nil
+
+	tableName := m.modelInfo.TableName
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
+	sb.WriteString("SELECT AVG(")
+	sb.WriteString(column)
+	sb.WriteString(") FROM ")
+	sb.WriteString(tableName)
+
+	m.buildWhereClause(&sb)
+
+	query := sb.String()
+	args := append(cteArgs, m.args...)
+
+	// Restore state
+	m.limit, m.offset = limit, offset
+	m.orderBys = orderBys
+
+	var result sql.NullFloat64
+	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+	if err != nil {
+		return 0, WrapQueryError("AVG", query, args, err)
+	}
+
+	if result.Valid {
+		return result.Float64, nil
+	}
+	return 0, nil
+}
+
 // CountOver returns count of records partitioned by the specified column.
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
@@ -212,6 +294,11 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	if len(m.orderBys) > 0 {
 		sb.WriteString(" ORDER BY ")
 		sb.WriteString(strings.Join(m.orderBys, ", "))
+	}
+
+	if m.lockMode != "" {
+		sb.WriteString(" FOR ")
+		sb.WriteString(m.lockMode)
 	}
 
 	if m.limit > 0 {
