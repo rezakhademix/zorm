@@ -501,3 +501,13 @@ func (m *Model[T]) WithMorph(relation string, typeMap map[string][]string) *Mode
 	m.morphRelations[relation] = typeMap
 	return m
 }
+
+// WithCTE adds a Common Table Expression (CTE) to the query.
+// query can be a string or a *Model[T].
+func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
+	m.ctes = append(m.ctes, CTE{
+		Name:  name,
+		Query: query,
+	})
+	return m
+}
