@@ -547,3 +547,46 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 	m.lockMode = mode
 	return m
 }
+
+// WhereFullText adds a full-text search condition using tsvector and tsquery.
+// Uses default 'english' configuration and plainto_tsquery for user-friendly search.
+// Example: WhereFullText("content", "search terms")
+// Generates: WHERE to_tsvector('english', content) @@ plainto_tsquery('english', ?)
+func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
+	clause := fmt.Sprintf("to_tsvector('english', %s) @@ plainto_tsquery('english', ?)", column)
+	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.args = append(m.args, searchText)
+	return m
+}
+
+// WhereFullTextWithConfig adds a full-text search condition with a custom text search configuration.
+// Example: WhereFullTextWithConfig("content", "search terms", "spanish")
+// Generates: WHERE to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)
+func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *Model[T] {
+	clause := fmt.Sprintf("to_tsvector('%s', %s) @@ plainto_tsquery('%s', ?)", config, column, config)
+	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.args = append(m.args, searchText)
+	return m
+}
+
+// WhereTsVector adds a full-text search condition on a pre-computed tsvector column.
+// This is more efficient when you have an indexed tsvector column.
+// Example: WhereTsVector("search_vector", "fat & rat")
+// Generates: WHERE search_vector @@ to_tsquery('english', ?)
+func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
+	clause := fmt.Sprintf("%s @@ to_tsquery('english', ?)", tsvectorColumn)
+	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.args = append(m.args, tsquery)
+	return m
+}
+
+// WherePhraseSearch adds an exact phrase search condition.
+// Uses phraseto_tsquery which preserves word order.
+// Example: WherePhraseSearch("content", "fat cat")
+// Generates: WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', ?)
+func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
+	clause := fmt.Sprintf("to_tsvector('english', %s) @@ phraseto_tsquery('english', ?)", column)
+	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.args = append(m.args, phrase)
+	return m
+}
