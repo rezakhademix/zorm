@@ -84,10 +84,10 @@ func (m *Model[T]) queryerForWrite() interface {
 }
 
 // Get executes the query and returns a slice of results.
-func (m *Model[T]) Get() ([]*T, error) {
+func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 	query, args := m.buildSelectQuery()
 
-	rows, err := m.queryer().QueryContext(m.ctx, query, args...)
+	rows, err := m.queryer().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, WrapQueryError("SELECT", query, args, err)
 	}
@@ -106,9 +106,10 @@ func (m *Model[T]) Get() ([]*T, error) {
 }
 
 // First executes the query and returns the first result.
-func (m *Model[T]) First() (*T, error) {
-	m.Limit(1)
-	results, err := m.Get()
+func (m *Model[T]) First(ctx context.Context) (*T, error) {
+	// Enforce limit 1
+	m.limit = 1
+	results, err := m.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -119,23 +120,25 @@ func (m *Model[T]) First() (*T, error) {
 }
 
 // Find finds a record by ID.
-func (m *Model[T]) Find(id any) (*T, error) {
-	return m.Where(m.modelInfo.PrimaryKey+" = ?", id).First()
+func (m *Model[T]) Find(ctx context.Context, id any) (*T, error) {
+	return m.Where(m.modelInfo.PrimaryKey+" = ?", id).First(ctx)
 }
 
 // FindOrFail finds a record by ID or returns an error.
 // In Go, this is identical to Find, but added for API parity.
-func (m *Model[T]) FindOrFail(id any) (*T, error) {
-	return m.Find(id)
+func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
+	return m.Find(ctx, id)
 }
 
 // Pluck retrieves a single column's values from the result set.
-func (m *Model[T]) Pluck(column string) ([]any, error) {
-	// Select only that column
+func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
+	// We only select the specific column
+	// But we need to be careful not to overwrite existing select if user manually selected?
+	// Usually Pluck overrides select.
 	m.columns = []string{column}
 
 	query, args := m.buildSelectQuery()
-	rows, err := m.queryer().QueryContext(m.ctx, query, args...)
+	rows, err := m.queryer().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, WrapQueryError("SELECT", query, args, err)
 	}
@@ -158,7 +161,7 @@ func (m *Model[T]) Pluck(column string) ([]any, error) {
 }
 
 // Count returns the number of records matching the query.
-func (m *Model[T]) Count() (int64, error) {
+func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	// Backup limit/offset/order
 	limit, offset := m.limit, m.offset
 	orderBys := m.orderBys
@@ -184,7 +187,7 @@ func (m *Model[T]) Count() (int64, error) {
 	m.orderBys = orderBys
 
 	var count int64
-	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&count)
+	err := m.queryer().QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
 		return 0, WrapQueryError("COUNT", query, args, err)
 	}
@@ -194,7 +197,7 @@ func (m *Model[T]) Count() (int64, error) {
 
 // Sum calculates the sum of a column.
 // Returns 0 if no rows match or the sum is null.
-func (m *Model[T]) Sum(column string) (float64, error) {
+func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 	// Backup limit/offset/order
 	limit, offset := m.limit, m.offset
 	orderBys := m.orderBys
@@ -222,7 +225,7 @@ func (m *Model[T]) Sum(column string) (float64, error) {
 	m.orderBys = orderBys
 
 	var result sql.NullFloat64
-	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+	err := m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	if err != nil {
 		return 0, WrapQueryError("SUM", query, args, err)
 	}
@@ -235,7 +238,7 @@ func (m *Model[T]) Sum(column string) (float64, error) {
 
 // Avg calculates the average of a column.
 // Returns 0 if no rows match or the average is null.
-func (m *Model[T]) Avg(column string) (float64, error) {
+func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	// Backup limit/offset/order
 	limit, offset := m.limit, m.offset
 	orderBys := m.orderBys
@@ -263,7 +266,7 @@ func (m *Model[T]) Avg(column string) (float64, error) {
 	m.orderBys = orderBys
 
 	var result sql.NullFloat64
-	err := m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+	err := m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	if err != nil {
 		return 0, WrapQueryError("AVG", query, args, err)
 	}
@@ -277,7 +280,7 @@ func (m *Model[T]) Avg(column string) (float64, error) {
 // CountOver returns count of records partitioned by the specified column.
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
-func (m *Model[T]) CountOver(column string) (map[any]int64, error) {
+func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64, error) {
 	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
 	query := fmt.Sprintf("SELECT %s, COUNT(*) OVER (PARTITION BY %s) as count FROM %s",
 		column, column, m.modelInfo.TableName)
@@ -287,7 +290,7 @@ func (m *Model[T]) CountOver(column string) (map[any]int64, error) {
 	sb.WriteString(query)
 	m.buildWhereClause(&sb)
 
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), m.args...)
+	rows, err := m.queryer().QueryContext(ctx, sb.String(), m.args...)
 	if err != nil {
 		return nil, err
 	}
@@ -471,9 +474,9 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 
 // Cursor returns a cursor for iterating over results one by one.
 // Useful for large datasets to avoid loading everything into memory.
-func (m *Model[T]) Cursor() (*Cursor[T], error) {
+func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
 	query, args := m.buildSelectQuery()
-	rows, err := m.queryer().QueryContext(m.ctx, query, args...)
+	rows, err := m.queryer().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -533,7 +536,7 @@ func (c *Cursor[T]) Close() error {
 
 // FirstOrCreate finds the first record matching attributes or creates it with attributes+values.
 // If found, returns the existing record. If not found, creates a new record with merged attributes+values.
-func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]any) (*T, error) {
+func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any, values map[string]any) (*T, error) {
 	// Validate inputs
 	if attributes == nil {
 		attributes = make(map[string]any)
@@ -548,7 +551,7 @@ func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]an
 		q = q.Where(k+" = ?", v)
 	}
 
-	result, err := q.First()
+	result, err := q.First(ctx)
 	if err == nil && result != nil {
 		return result, nil
 	}
@@ -564,7 +567,7 @@ func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]an
 		return nil, err
 	}
 
-	if err := m.Create(entity); err != nil {
+	if err := m.Create(ctx, entity); err != nil {
 		return nil, err
 	}
 	return entity, nil
@@ -572,7 +575,7 @@ func (m *Model[T]) FirstOrCreate(attributes map[string]any, values map[string]an
 
 // UpdateOrCreate finds a record matching attributes and updates it with values, or creates it.
 // If found, updates the record with values. If not found, creates a new record with merged attributes+values.
-func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]any) (*T, error) {
+func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any, values map[string]any) (*T, error) {
 	// Validate inputs
 	if attributes == nil {
 		attributes = make(map[string]any)
@@ -587,7 +590,7 @@ func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]a
 		q = q.Where(k+" = ?", v)
 	}
 
-	result, err := q.First()
+	result, err := q.First(ctx)
 	if err == nil && result != nil {
 		// Found, update
 		if err := fillStruct(result, values); err != nil {
@@ -595,7 +598,7 @@ func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]a
 		}
 		// We need to update only the changed fields? Or all values?
 		// Update() updates all fields of the struct currently.
-		if err := m.Update(result); err != nil {
+		if err := m.Update(ctx, result); err != nil {
 			return nil, err
 		}
 		return result, nil
@@ -611,7 +614,7 @@ func (m *Model[T]) UpdateOrCreate(attributes map[string]any, values map[string]a
 		return nil, err
 	}
 
-	if err := m.Create(entity); err != nil {
+	if err := m.Create(ctx, entity); err != nil {
 		return nil, err
 	}
 	return entity, nil
@@ -658,7 +661,7 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 }
 
 // Create inserts a new record.
-func (m *Model[T]) Create(entity *T) error {
+func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Validate input
 	if entity == nil {
 		return ErrNilPointer
@@ -666,7 +669,7 @@ func (m *Model[T]) Create(entity *T) error {
 
 	// 1. BeforeCreate Hook
 	if hook, ok := any(entity).(interface{ BeforeCreate(context.Context) error }); ok {
-		if err := hook.BeforeCreate(m.ctx); err != nil {
+		if err := hook.BeforeCreate(ctx); err != nil {
 			return err
 		}
 	}
@@ -710,14 +713,14 @@ func (m *Model[T]) Create(entity *T) error {
 		return fmt.Errorf("cannot set primary key field %s", pkField.Name)
 	}
 
-	err := m.queryerForWrite().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
+	err := m.queryerForWrite().QueryRowContext(ctx, query, values...).Scan(fVal.Addr().Interface())
 	if err != nil {
 		return WrapQueryError("INSERT", query, values, err)
 	}
 
 	// 4. AfterCreate Hook
 	if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
-		if err := hook.AfterCreate(m.ctx); err != nil {
+		if err := hook.AfterCreate(ctx); err != nil {
 			return err
 		}
 	}
@@ -727,7 +730,7 @@ func (m *Model[T]) Create(entity *T) error {
 
 // Update updates a single record based on its primary key.
 // The entity must not be nil and must have a valid primary key value.
-func (m *Model[T]) Update(entity *T) error {
+func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// Validate input
 	if entity == nil {
 		return ErrNilPointer
@@ -745,7 +748,7 @@ func (m *Model[T]) Update(entity *T) error {
 
 	// Hooks
 	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
-		if err := hook.BeforeUpdate(m.ctx); err != nil {
+		if err := hook.BeforeUpdate(ctx); err != nil {
 			return err
 		}
 	}
@@ -784,13 +787,13 @@ func (m *Model[T]) Update(entity *T) error {
 	// args: CTE args + SET values + WHERE values
 	allArgs := append(cteArgs, values...)
 
-	_, err := m.queryerForWrite().ExecContext(m.ctx, query, allArgs...)
+	_, err := m.queryerForWrite().ExecContext(ctx, query, allArgs...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, values, err)
 	}
 
 	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
-		if err := hook.AfterUpdate(m.ctx); err != nil {
+		if err := hook.AfterUpdate(ctx); err != nil {
 			return err
 		}
 	}
@@ -800,7 +803,7 @@ func (m *Model[T]) Update(entity *T) error {
 
 // Delete deletes records matching the current query conditions.
 // WARNING: Without WHERE conditions, this will delete ALL records in the table.
-func (m *Model[T]) Delete() error {
+func (m *Model[T]) Delete(ctx context.Context) error {
 	var sb strings.Builder
 	cteArgs := m.buildWithClause(&sb)
 
@@ -810,7 +813,7 @@ func (m *Model[T]) Delete() error {
 
 	query := sb.String()
 	args := append(cteArgs, m.args...)
-	_, err := m.queryerForWrite().ExecContext(m.ctx, query, args...)
+	_, err := m.queryerForWrite().ExecContext(ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("DELETE", query, m.args, err)
 	}
@@ -818,9 +821,9 @@ func (m *Model[T]) Delete() error {
 }
 
 // Exec executes the query (Raw or Builder) and returns the result.
-func (m *Model[T]) Exec() (sql.Result, error) {
+func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 	if m.rawQuery != "" {
-		return m.queryerForWrite().ExecContext(m.ctx, m.rawQuery, m.rawArgs...)
+		return m.queryerForWrite().ExecContext(ctx, m.rawQuery, m.rawArgs...)
 	}
 	// For builder, we assume Delete or Update was called which executes immediately.
 	// But if user wants to build a custom query?
@@ -829,7 +832,7 @@ func (m *Model[T]) Exec() (sql.Result, error) {
 }
 
 // CreateMany inserts multiple records in a single query.
-func (m *Model[T]) CreateMany(entities []*T) error {
+func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	if len(entities) == 0 {
 		return nil
 	}
@@ -888,7 +891,7 @@ func (m *Model[T]) CreateMany(entities []*T) error {
 	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
 
 	query := sb.String()
-	rows, err := m.queryerForWrite().QueryContext(m.ctx, query, args...)
+	rows, err := m.queryerForWrite().QueryContext(ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("INSERT", query, args, err)
 	}
@@ -918,7 +921,7 @@ func (m *Model[T]) CreateMany(entities []*T) error {
 }
 
 // UpdateMany updates records matching the query with values.
-func (m *Model[T]) UpdateMany(values map[string]any) error {
+func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -955,7 +958,7 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 	args = append(args, m.args...)
 
 	query := sb.String()
-	_, err := m.queryerForWrite().ExecContext(m.ctx, query, args...)
+	_, err := m.queryerForWrite().ExecContext(ctx, query, args...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, args, err)
 	}
@@ -963,8 +966,8 @@ func (m *Model[T]) UpdateMany(values map[string]any) error {
 }
 
 // DeleteMany deletes records matching the query.
-func (m *Model[T]) DeleteMany() error {
-	return m.Delete()
+func (m *Model[T]) DeleteMany(ctx context.Context) error {
+	return m.Delete(ctx)
 }
 
 // loadAccessors calls accessor methods (e.g., GetFullName) on model instances

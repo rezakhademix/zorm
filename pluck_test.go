@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -23,7 +24,7 @@ func TestPluck_QueryBuilding(t *testing.T) {
 	}
 
 	// Verify the method signature is correct by type checking
-	var _ func(string) ([]any, error) = m.Pluck
+	var _ func(context.Context, string) ([]any, error) = m.Pluck
 
 	t.Log("Pluck method exists with correct signature")
 }

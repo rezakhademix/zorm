@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"context"
 	"testing"
 )
 
@@ -11,7 +12,7 @@ func TestSum_QueryBuilding(t *testing.T) {
 
 	// Verify the method signature is correct by type checking
 	// We can't execute without a DB connection, but we can verify the method exists
-	var _ func(string) (float64, error) = m.Sum
+	var _ func(context.Context, string) (float64, error) = m.Sum
 
 	// If we got here, the method signature is correct
 	t.Log("Sum method exists with correct signature")
