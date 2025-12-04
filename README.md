@@ -1,6 +1,9 @@
-# ZORM
+<div align="center">
+  <h1>Z-ORM</h1>
+  <p>One ORM To Query Them All</p>
+</div>
 
-ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern applications. It provides a fluent API for building complex SQL queries, managing relationships, handling transactions, and supporting advanced database features like read/write splitting.
+ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern applications. It provides a fluent API for building complex SQL queries, managing relationships, handling transactions, and supporting advanced database features like main/replica splitting.
 
 ## Table of Contents
 
