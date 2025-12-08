@@ -85,3 +85,65 @@ func TestContextTimeout(t *testing.T) {
 		t.Logf("Got expected error: %v", err)
 	}
 }
+
+type ContextUser struct {
+	ID    int64  `zorm:"column:id;primary;auto"`
+	Name  string `zorm:"column:name"`
+	Posts []ContextPost
+}
+
+func (u ContextUser) PostsRelation() HasMany[ContextPost] {
+	return HasMany[ContextPost]{ForeignKey: "user_id"}
+}
+
+type ContextPost struct {
+	ID     int64  `zorm:"column:id;primary;auto"`
+	UserID int64  `zorm:"column:user_id"`
+	Title  string `zorm:"column:title"`
+}
+
+func TestLoadContext(t *testing.T) {
+	// Setup DB
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Create tables
+	_, err = db.Exec(`CREATE TABLE context_users (id INTEGER PRIMARY KEY, name TEXT)`)
+	if err != nil {
+		t.Fatalf("Failed to create users table: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE context_posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)`)
+	if err != nil {
+		t.Fatalf("Failed to create posts table: %v", err)
+	}
+
+	// Insert data
+	_, err = db.Exec(`INSERT INTO context_users (name) VALUES ('Bob')`)
+	if err != nil {
+		t.Fatalf("Failed to insert user: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO context_posts (user_id, title) VALUES (1, 'Post 1')`)
+	if err != nil {
+		t.Fatalf("Failed to insert post: %v", err)
+	}
+
+	orm := New[ContextUser]().SetDB(db)
+	user, err := orm.Find(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("Failed to find user: %v", err)
+	}
+
+	// Test Load with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = orm.Load(ctx, user, "Posts")
+	if err == nil {
+		t.Error("Expected error from Load with cancelled context, got nil")
+	} else if err != context.Canceled && err.Error() != "context canceled" {
+		t.Logf("Got error: %v", err)
+	}
+}

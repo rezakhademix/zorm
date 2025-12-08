@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -140,29 +141,29 @@ func (MorphMany[T]) RelationType() RelationType { return RelationMorphMany }
 func (MorphMany[T]) NewRelated() any            { return new(T) }
 
 // Load eager loads relations on a single entity.
-func (m *Model[T]) Load(entity *T, relations ...string) error {
+func (m *Model[T]) Load(ctx context.Context, entity *T, relations ...string) error {
 	m.relations = append(m.relations, relations...)
-	return m.loadRelations([]*T{entity})
+	return m.loadRelations(ctx, []*T{entity})
 }
 
 // LoadSlice eager loads relations on a slice of entities.
-func (m *Model[T]) LoadSlice(entities []*T, relations ...string) error {
+func (m *Model[T]) LoadSlice(ctx context.Context, entities []*T, relations ...string) error {
 	m.relations = append(m.relations, relations...)
-	return m.loadRelations(entities)
+	return m.loadRelations(ctx, entities)
 }
 
 // LoadMorph eager loads a polymorphic relation with constraints on a slice.
-func (m *Model[T]) LoadMorph(entities []*T, relation string, typeMap map[string][]string) error {
+func (m *Model[T]) LoadMorph(ctx context.Context, entities []*T, relation string, typeMap map[string][]string) error {
 	if m.morphRelations == nil {
 		m.morphRelations = make(map[string]map[string][]string)
 	}
 	m.relations = append(m.relations, relation)
 	m.morphRelations[relation] = typeMap
-	return m.loadRelations(entities)
+	return m.loadRelations(ctx, entities)
 }
 
 // loadRelations processes the With() clauses and loads data.
-func (m *Model[T]) loadRelations(results []*T) error {
+func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 	if len(m.relations) == 0 || len(results) == 0 {
 		return nil
 	}
@@ -237,16 +238,16 @@ func (m *Model[T]) loadRelations(results []*T) error {
 			switch rel.RelationType() {
 			case RelationHasMany:
 				// Pass group.Subs to loadHasMany to handle recursion
-				if err := m.loadHasMany(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
 					return err
 				}
 			case RelationHasOne:
 				// HasOne uses HasMany logic but assigns single value
-				if err := m.loadHasMany(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
 					return err
 				}
 			case RelationBelongsTo:
-				if err := m.loadBelongsTo(results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadBelongsTo(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
 					return err
 				}
 			case RelationMorphTo:
@@ -255,15 +256,15 @@ func (m *Model[T]) loadRelations(results []*T) error {
 				if m.morphRelations != nil {
 					subMap = m.morphRelations[relName]
 				}
-				if err := m.loadMorphTo(results, relConfig, relName, subMap); err != nil {
+				if err := m.loadMorphTo(ctx, results, relConfig, relName, subMap); err != nil {
 					return err
 				}
 			case RelationMorphOne:
-				if err := m.loadMorphOneOrMany(results, relConfig, relName, group.Cols, group.Subs, true); err != nil {
+				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, true); err != nil {
 					return err
 				}
 			case RelationMorphMany:
-				if err := m.loadMorphOneOrMany(results, relConfig, relName, group.Cols, group.Subs, false); err != nil {
+				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, false); err != nil {
 					return err
 				}
 			}
@@ -273,7 +274,7 @@ func (m *Model[T]) loadRelations(results []*T) error {
 	return nil
 }
 
-func (m *Model[T]) loadMorphTo(results []*T, relConfig any, relName string, typeMap map[string][]string) error {
+func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any, relName string, typeMap map[string][]string) error {
 	// 1. Get Type and ID fields from MorphTo config
 	morphRel, _ := relConfig.(MorphTo[any])
 	typeField := morphRel.Type
@@ -404,7 +405,7 @@ func (m *Model[T]) loadMorphTo(results []*T, relConfig any, relName string, type
 		sb.WriteString(strings.Join(placeholders, ","))
 		sb.WriteString(")")
 
-		rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+		rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
 		if err != nil {
 			return err
 		}
@@ -417,7 +418,7 @@ func (m *Model[T]) loadMorphTo(results []*T, relConfig any, relName string, type
 
 		// Recursive Load
 		if len(subRelations) > 0 && len(relatedResults) > 0 {
-			if err := m.loadRelationsDynamic(relatedResults, modelType, subRelations); err != nil {
+			if err := m.loadRelationsDynamic(ctx, relatedResults, modelType, subRelations); err != nil {
 				return err
 			}
 		}
@@ -445,7 +446,7 @@ func (m *Model[T]) loadMorphTo(results []*T, relConfig any, relName string, type
 	return nil
 }
 
-func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
 	// 1. Get IDs from results
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
@@ -486,14 +487,14 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 	}
 
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(relatedInfo, foreignKey, ids, cols)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols)
 	if err != nil {
 		return err
 	}
 
 	// 4.5 Recursive Loading
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
 			return err
 		}
 	}
@@ -535,7 +536,7 @@ func (m *Model[T]) loadHasMany(results []*T, relConfig any, relName string, cols
 	return nil
 }
 
-func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
 	// 1. Get FKs from results (Parent.ForeignKey)
 	valConfig := reflect.ValueOf(relConfig)
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
@@ -613,14 +614,14 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 	}
 
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(relatedInfo, ownerKey, fks, cols)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols)
 	if err != nil {
 		return err
 	}
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
 			return err
 		}
 	}
@@ -657,7 +658,7 @@ func (m *Model[T]) loadBelongsTo(results []*T, relConfig any, relName string, co
 }
 
 // loadRelationQuery executes a SELECT * FROM table WHERE key IN (ids)
-func (m *Model[T]) loadRelationQuery(relatedInfo *ModelInfo, key string, ids []any, cols string) ([]any, error) {
+func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string) ([]any, error) {
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	if cols != "" {
@@ -680,7 +681,7 @@ func (m *Model[T]) loadRelationQuery(relatedInfo *ModelInfo, key string, ids []a
 	sb.WriteString(strings.Join(placeholders, ","))
 	sb.WriteString(")")
 
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -689,7 +690,7 @@ func (m *Model[T]) loadRelationQuery(relatedInfo *ModelInfo, key string, ids []a
 	return m.scanRowsDynamic(rows, relatedInfo)
 }
 
-func (m *Model[T]) loadMorphOneOrMany(results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
+func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
 	// 1. Get IDs from results
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
@@ -762,7 +763,7 @@ func (m *Model[T]) loadMorphOneOrMany(results []*T, relConfig any, relName strin
 	sb.WriteString(")")
 
 	// Execute
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return err
 	}
@@ -775,7 +776,7 @@ func (m *Model[T]) loadMorphOneOrMany(results []*T, relConfig any, relName strin
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
 			return err
 		}
 	}
@@ -835,7 +836,7 @@ func isZero(v any) bool {
 }
 
 // loadRelationsDynamic is a helper to load relations on a slice of any (which are *R).
-func (m *Model[T]) loadRelationsDynamic(results []any, modelType reflect.Type, relations []string) error {
+func (m *Model[T]) loadRelationsDynamic(ctx context.Context, results []any, modelType reflect.Type, relations []string) error {
 	// Group relations
 	type relGroup struct {
 		Cols string
@@ -896,7 +897,7 @@ func (m *Model[T]) loadRelationsDynamic(results []any, modelType reflect.Type, r
 		if rel, ok := relConfig.(Relation); ok {
 			switch rel.RelationType() {
 			case RelationHasMany:
-				if err := m.loadHasManyDynamic(results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadHasManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
 					return err
 				}
 			}
@@ -905,7 +906,7 @@ func (m *Model[T]) loadRelationsDynamic(results []any, modelType reflect.Type, r
 	return nil
 }
 
-func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
 	modelInfo := ParseModelType(modelType)
 	ids := make([]any, len(results))
 	pkField := modelInfo.PrimaryKey
@@ -953,7 +954,7 @@ func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, rel
 	sb.WriteString(")")
 
 	// Execute
-	rows, err := m.queryer().QueryContext(m.ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return err
 	}
@@ -965,7 +966,7 @@ func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, rel
 	}
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
 			return err
 		}
 	}
@@ -1005,7 +1006,7 @@ func (m *Model[T]) loadHasManyDynamic(results []any, modelType reflect.Type, rel
 
 // Attach inserts rows into the pivot table for a BelongsToMany relation.
 // pivotData: map[any]map[string]any (RelatedID -> {Column: Value})
-func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
+func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -1103,12 +1104,12 @@ func (m *Model[T]) Attach(entity *T, relation string, ids []any, pivotData map[a
 		}
 	}
 
-	_, err := m.queryer().ExecContext(m.ctx, sb.String(), args...)
+	_, err := m.queryer().ExecContext(ctx, sb.String(), args...)
 	return err
 }
 
 // Detach deletes rows from the pivot table.
-func (m *Model[T]) Detach(entity *T, relation string, ids []any) error {
+func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids []any) error {
 	// 1. Get Relation Config (Same as Attach)
 	var t T
 	methodVal := reflect.ValueOf(t).MethodByName(relation)
@@ -1164,14 +1165,14 @@ func (m *Model[T]) Detach(entity *T, relation string, ids []any) error {
 		query += fmt.Sprintf(" AND %s IN (%s)", relatedKey, strings.Join(placeholders, ","))
 	}
 
-	_, err := m.queryer().ExecContext(m.ctx, query, args...)
+	_, err := m.queryer().ExecContext(ctx, query, args...)
 	return err
 }
 
 // Sync synchronizes the association with the given IDs.
 // It attaches missing IDs and detaches IDs that are not in the new list.
 // pivotData: map[any]map[string]any (RelatedID -> {Column: Value})
-func (m *Model[T]) Sync(entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
+func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []any, pivotData map[any]map[string]any) error {
 	// 1. Get Relation Config
 	var t T
 	methodVal := reflect.ValueOf(t).MethodByName(relation)
@@ -1217,7 +1218,7 @@ func (m *Model[T]) Sync(entity *T, relation string, ids []any, pivotData map[any
 
 	// 3. Get Current IDs
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", relatedKey, pivotTable, foreignKey)
-	rows, err := m.queryer().QueryContext(m.ctx, query, parentID)
+	rows, err := m.queryer().QueryContext(ctx, query, parentID)
 	if err != nil {
 		return err
 	}
@@ -1277,13 +1278,13 @@ func (m *Model[T]) Sync(entity *T, relation string, ids []any, pivotData map[any
 
 	// 5. Execute
 	if len(toDetach) > 0 {
-		if err := m.Detach(entity, relation, toDetach); err != nil {
+		if err := m.Detach(ctx, entity, relation, toDetach); err != nil {
 			return err
 		}
 	}
 
 	if len(toAttach) > 0 {
-		if err := m.Attach(entity, relation, toAttach, pivotData); err != nil {
+		if err := m.Attach(ctx, entity, relation, toAttach, pivotData); err != nil {
 			return err
 		}
 	}

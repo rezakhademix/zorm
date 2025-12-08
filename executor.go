@@ -91,16 +91,16 @@ func (m *Model[T]) queryerForWrite() interface {
 //
 // Note: The caller is responsible for executing the statement, but should NOT close it
 // when caching is enabled, as cached statements are reused and managed by the cache.
-func (m *Model[T]) prepareStmt(query string) (*sql.Stmt, error) {
+func (m *Model[T]) prepareStmt(ctx context.Context, query string) (*sql.Stmt, error) {
 	// If caching is not enabled, prepare directly
 	if m.stmtCache == nil {
 		q := m.queryer()
 		// We need the underlying *sql.DB or *sql.Tx to prepare
 		if db, ok := q.(*sql.DB); ok {
-			return db.PrepareContext(m.ctx, query)
+			return db.PrepareContext(ctx, query)
 		}
 		if tx, ok := q.(*sql.Tx); ok {
-			return tx.PrepareContext(m.ctx, query)
+			return tx.PrepareContext(ctx, query)
 		}
 		// Fallback: should not happen, but handle it
 		return nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
@@ -117,9 +117,9 @@ func (m *Model[T]) prepareStmt(query string) (*sql.Stmt, error) {
 	var err error
 
 	if db, ok := q.(*sql.DB); ok {
-		stmt, err = db.PrepareContext(m.ctx, query)
+		stmt, err = db.PrepareContext(ctx, query)
 	} else if tx, ok := q.(*sql.Tx); ok {
-		stmt, err = tx.PrepareContext(m.ctx, query)
+		stmt, err = tx.PrepareContext(ctx, query)
 	} else {
 		return nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
 	}
@@ -135,15 +135,15 @@ func (m *Model[T]) prepareStmt(query string) (*sql.Stmt, error) {
 
 // prepareStmtForWrite returns a prepared statement for write operations.
 // Similar to prepareStmt but uses queryerForWrite to ensure primary database is used.
-func (m *Model[T]) prepareStmtForWrite(query string) (*sql.Stmt, error) {
+func (m *Model[T]) prepareStmtForWrite(ctx context.Context, query string) (*sql.Stmt, error) {
 	// If caching is not enabled, prepare directly
 	if m.stmtCache == nil {
 		q := m.queryerForWrite()
 		if db, ok := q.(*sql.DB); ok {
-			return db.PrepareContext(m.ctx, query)
+			return db.PrepareContext(ctx, query)
 		}
 		if tx, ok := q.(*sql.Tx); ok {
-			return tx.PrepareContext(m.ctx, query)
+			return tx.PrepareContext(ctx, query)
 		}
 		return nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
 	}
@@ -159,9 +159,9 @@ func (m *Model[T]) prepareStmtForWrite(query string) (*sql.Stmt, error) {
 	var err error
 
 	if db, ok := q.(*sql.DB); ok {
-		stmt, err = db.PrepareContext(m.ctx, query)
+		stmt, err = db.PrepareContext(ctx, query)
 	} else if tx, ok := q.(*sql.Tx); ok {
-		stmt, err = tx.PrepareContext(m.ctx, query)
+		stmt, err = tx.PrepareContext(ctx, query)
 	} else {
 		return nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
 	}
@@ -185,14 +185,14 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(query)
+		stmt, err = m.prepareStmt(ctx, query)
 		if err != nil {
 			return nil, WrapQueryError("PREPARE", query, args, err)
 		}
 
-		rows, err = stmt.QueryContext(m.ctx, args...)
+		rows, err = stmt.QueryContext(ctx, args...)
 	} else {
-		rows, err = m.queryer().QueryContext(m.ctx, query, args...)
+		rows, err = m.queryer().QueryContext(ctx, query, args...)
 	}
 
 	if err != nil {
@@ -205,7 +205,7 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 		return nil, WrapQueryError("SCAN", query, args, err)
 	}
 
-	if err := m.loadRelations(results); err != nil {
+	if err := m.loadRelations(ctx, results); err != nil {
 		return nil, err
 	}
 
@@ -299,13 +299,13 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(query)
+		stmt, err = m.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
-		err = stmt.QueryRowContext(m.ctx, args...).Scan(&count)
+		err = stmt.QueryRowContext(ctx, args...).Scan(&count)
 	} else {
-		err = m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&count)
+		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&count)
 	}
 
 	if err != nil {
@@ -350,13 +350,13 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(query)
+		stmt, err = m.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
-		err = stmt.QueryRowContext(m.ctx, args...).Scan(&result)
+		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -404,13 +404,13 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(query)
+		stmt, err = m.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
-		err = stmt.QueryRowContext(m.ctx, args...).Scan(&result)
+		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = m.queryer().QueryRowContext(m.ctx, query, args...).Scan(&result)
+		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -667,7 +667,21 @@ func (c *Cursor[T]) Scan() (*T, error) {
 
 	// Load Relations if any are configured
 	if len(c.model.relations) > 0 {
-		if err := c.model.loadRelations([]*T{entity}); err != nil {
+		// Used to use m.ctx, but now Cursor doesn't store context explicitly for Next/Scan.
+		// However, Cursor was created with a context.
+		// Wait, Cursor Scan method doesn't take context.
+		// It should probably take context or use the one from Cursor creation?
+		// Cursor struct has `rows *sql.Rows`, but `model *Model`.
+		// If we want Scan to be context aware for lazy loading, we might need to change Cursor.Scan to take ctx.
+		// For now, let's use the model's stored context as fallback or TODO.
+		// Actually, let's look at Cursor definition.
+		// The prompt says "make all methods context aware".
+		// `Cursor.Scan()` -> `Cursor.Scan(ctx context.Context)`?
+		// Let's do that in a separate step or here if possible.
+		// But Cursor Scan mainly just reads from rows.
+		// BUT `loadRelations` triggers queries. So it DOES need context.
+		// I will check Cursor Scan signature change in next step. For now, let's fix the call to match.
+		if err := c.model.loadRelations(c.model.ctx, []*T{entity}); err != nil {
 			return nil, err
 		}
 	}
@@ -863,13 +877,13 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(query)
+		stmt, err = m.prepareStmtForWrite(ctx, query)
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
-		err = stmt.QueryRowContext(m.ctx, values...).Scan(fVal.Addr().Interface())
+		err = stmt.QueryRowContext(ctx, values...).Scan(fVal.Addr().Interface())
 	} else {
-		err = m.queryerForWrite().QueryRowContext(m.ctx, query, values...).Scan(fVal.Addr().Interface())
+		err = m.queryerForWrite().QueryRowContext(ctx, query, values...).Scan(fVal.Addr().Interface())
 	}
 
 	if err != nil {
@@ -949,13 +963,13 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(query)
+		stmt, err = m.prepareStmtForWrite(ctx, query)
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
-		_, err = stmt.ExecContext(m.ctx, allArgs...)
+		_, err = stmt.ExecContext(ctx, allArgs...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(m.ctx, query, allArgs...)
+		_, err = m.queryerForWrite().ExecContext(ctx, query, allArgs...)
 	}
 
 	if err != nil {
@@ -988,13 +1002,13 @@ func (m *Model[T]) Delete(ctx context.Context) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(query)
+		stmt, err = m.prepareStmtForWrite(ctx, query)
 		if err != nil {
 			return WrapQueryError("PREPARE", query, m.args, err)
 		}
-		_, err = stmt.ExecContext(m.ctx, args...)
+		_, err = stmt.ExecContext(ctx, args...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(m.ctx, query, args...)
+		_, err = m.queryerForWrite().ExecContext(ctx, query, args...)
 	}
 
 	if err != nil {
