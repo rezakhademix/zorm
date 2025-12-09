@@ -67,11 +67,11 @@ zorm.GlobalDB = db
 
 ```go
 type User struct {
-    ID        int64     `zorm:"column:id;primary;auto"`
-    Name      string    `zorm:"column:name"`
-    Email     string    `zorm:"column:email"`
-    Age       int       `zorm:"column:age"`
-    CreatedAt time.Time `zorm:"column:created_at"`
+    ID        int64
+    Name      string
+    Email     string
+    Age       int
+    CreatedAt time.Time
 }
 ```
 
