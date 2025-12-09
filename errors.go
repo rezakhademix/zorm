@@ -9,17 +9,17 @@ import (
 
 // Sentinel errors for common failure cases
 var (
-	// Query errors
+	// ErrRecordNotFound Query errors
 	// ErrRecordNotFound is returned when a query returns no results
 	ErrRecordNotFound = errors.New("zorm: record not found")
 
-	// Model errors
+	// ErrInvalidModel Model errors
 	// ErrInvalidModel is returned when the model type is invalid
 	ErrInvalidModel = errors.New("zorm: invalid model")
 	// ErrNilPointer is returned when a nil pointer is passed
 	ErrNilPointer = errors.New("zorm: nil pointer")
 
-	// Context errors
+	// ErrNoContext Context errors
 	// ErrNoContext is returned when no context is provided
 	ErrNoContext = errors.New("zorm: no context provided")
 
@@ -31,7 +31,7 @@ var (
 	// ErrInvalidConfig is returned when relation config is invalid
 	ErrInvalidConfig = errors.New("zorm: invalid relation config")
 
-	// Constraint violation errors
+	// ErrDuplicateKey Constraint violation errors
 	// ErrDuplicateKey is returned for unique constraint violations
 	ErrDuplicateKey = errors.New("zorm: duplicate key violation")
 	// ErrForeignKey is returned for foreign key constraint violations
@@ -49,13 +49,13 @@ var (
 	// ErrTimeout is returned when a query or connection times out
 	ErrTimeout = errors.New("zorm: operation timeout")
 
-	// Transaction errors
+	// ErrTransactionDeadlock Transaction errors
 	// ErrTransactionDeadlock is returned when a deadlock is detected
 	ErrTransactionDeadlock = errors.New("zorm: transaction deadlock")
 	// ErrSerializationFailure is returned for serialization failures
 	ErrSerializationFailure = errors.New("zorm: serialization failure")
 
-	// Schema errors
+	// ErrColumnNotFound Schema errors
 	// ErrColumnNotFound is returned when a column doesn't exist
 	ErrColumnNotFound = errors.New("zorm: column not found")
 	// ErrTableNotFound is returned when a table doesn't exist
@@ -63,7 +63,7 @@ var (
 	// ErrInvalidSyntax is returned for SQL syntax errors
 	ErrInvalidSyntax = errors.New("zorm: invalid SQL syntax")
 
-	// Other errors
+	// ErrRequiresRawQuery Other errors
 	// ErrRequiresRawQuery is returned when operation requires raw query
 	ErrRequiresRawQuery = errors.New("zorm: operation requires raw query")
 )
