@@ -660,11 +660,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 MIT License - see LICENSE file for details.
 
 ---
-
-<div align="center">
-  <p>Made with ❤️ by the ZORM team</p>
-  <p>
-    <a href="https://github.com/rezakhademix/zorm">GitHub</a> •
-    <a href="https://github.com/rezakhademix/zorm/issues">Issues</a>
-  </p>
-</div>
