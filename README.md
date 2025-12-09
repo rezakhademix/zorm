@@ -538,27 +538,22 @@ fmt.Println(args)  // [18]
 
 ---
 
-## 🏷️ Struct Tags
+### 2. Define Models
 
-ZORM uses struct tags to map Go fields to database columns:
+Models are standard Go structs. **ZORM uses convention over configuration** - no tags required!
+
+**Convention-based (recommended):**
 
 ```go
 type User struct {
-    ID        int64     `zorm:"column:id;primary;auto"`
-    Name      string    `zorm:"column:name"`
-    Email     string    `zorm:"column:email"`
-    Age       *int      `zorm:"column:age"`           // Nullable
-    CreatedAt time.Time `zorm:"column:created_at"`
-    UpdatedAt time.Time `zorm:"column:updated_at"`
+    ID        int64      // Automatically detected as primary key with auto-increment
+    Name      string     // Maps to "name" column
+    Email     string     // Maps to "email" column
+    Age       int        // Maps to "age" column
+    CreatedAt time.Time  // Maps to "created_at" column
 }
+// Table name: "users" (auto-pluralized snake_case)
 ```
-
-**Tag Options:**
-
-- `column:name` - Database column name
-- `primary` - Primary key
-- `auto` - Auto-increment
-- `-` - Ignore field
 
 ---
 
