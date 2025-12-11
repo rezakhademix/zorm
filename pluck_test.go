@@ -17,7 +17,7 @@ func TestPluck_QueryBuilding(t *testing.T) {
 	testModel.columns = []string{"name"}
 
 	query, _ := testModel.buildSelectQuery()
-	expected := "SELECT name FROM test_models WHERE 1=1  AND (active = ?)"
+	expected := "SELECT name FROM test_models WHERE 1=1  AND active = ?"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
