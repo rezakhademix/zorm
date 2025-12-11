@@ -34,7 +34,7 @@ func TestWithCTE_SubQuery(t *testing.T) {
 	// Note: buildSelectQuery adds "SELECT * FROM test_models" by default if no columns selected,
 	// but here sub has no columns selected so it defaults to *.
 
-	expected := "WITH cte AS (SELECT * FROM test_models WHERE 1=1  AND (age > ?)) SELECT * FROM test_models WHERE 1=1  AND (id IN (SELECT id FROM cte))"
+	expected := "WITH cte AS (SELECT * FROM test_models WHERE 1=1  AND age > ?) SELECT * FROM test_models WHERE 1=1  AND id IN (SELECT id FROM cte)"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)

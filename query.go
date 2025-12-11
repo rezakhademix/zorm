@@ -142,7 +142,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		}
 	}
 
-	m.wheres = append(m.wheres, fmt.Sprintf("%s (%s)", typ, queryStr))
+	m.wheres = append(m.wheres, fmt.Sprintf("%s %s", typ, queryStr))
 	m.args = append(m.args, args...)
 	return m
 }
@@ -193,8 +193,8 @@ func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 	for i := range args {
 		placeholders[i] = "?"
 	}
-	query := fmt.Sprintf("%s IN (%s)", column, strings.Join(placeholders, ","))
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", query))
+	query := fmt.Sprintf("%s IN (%s)", column, strings.Join(placeholders, ", "))
+	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", query))
 	m.args = append(m.args, args...)
 	return m
 }
@@ -555,7 +555,7 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 // Generates: WHERE to_tsvector('english', content) @@ plainto_tsquery('english', ?)
 func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 	clause := fmt.Sprintf("to_tsvector('english', %s) @@ plainto_tsquery('english', ?)", column)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, searchText)
 	return m
 }
@@ -565,7 +565,7 @@ func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 // Generates: WHERE to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)
 func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *Model[T] {
 	clause := fmt.Sprintf("to_tsvector('%s', %s) @@ plainto_tsquery('%s', ?)", config, column, config)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, searchText)
 	return m
 }
@@ -576,7 +576,7 @@ func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *M
 // Generates: WHERE search_vector @@ to_tsquery('english', ?)
 func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 	clause := fmt.Sprintf("%s @@ to_tsquery('english', ?)", tsvectorColumn)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, tsquery)
 	return m
 }
@@ -587,7 +587,7 @@ func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 // Generates: WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', ?)
 func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
 	clause := fmt.Sprintf("to_tsvector('english', %s) @@ phraseto_tsquery('english', ?)", column)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND (%s)", clause))
+	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, phrase)
 	return m
 }

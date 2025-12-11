@@ -10,7 +10,7 @@ func TestWhereFullText(t *testing.T) {
 	m.WhereFullText("content", "search terms")
 
 	query, args := m.buildSelectQuery()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (to_tsvector('english', content) @@ plainto_tsquery('english', ?))"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('english', content) @@ plainto_tsquery('english', ?)"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
@@ -25,7 +25,7 @@ func TestWhereFullTextWithConfig(t *testing.T) {
 	m.WhereFullTextWithConfig("content", "buscar términos", "spanish")
 
 	query, args := m.buildSelectQuery()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?))"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
@@ -40,7 +40,7 @@ func TestWhereTsVector(t *testing.T) {
 	m.WhereTsVector("search_vector", "fat & rat")
 
 	query, args := m.buildSelectQuery()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (search_vector @@ to_tsquery('english', ?))"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND search_vector @@ to_tsquery('english', ?)"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
@@ -55,7 +55,7 @@ func TestWherePhraseSearch(t *testing.T) {
 	m.WherePhraseSearch("title", "fat cat")
 
 	query, args := m.buildSelectQuery()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (to_tsvector('english', title) @@ phraseto_tsquery('english', ?))"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('english', title) @@ phraseto_tsquery('english', ?)"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
@@ -70,7 +70,7 @@ func TestWhereFullText_Combined(t *testing.T) {
 	m.Where("published", true).WhereFullText("content", "postgresql").Limit(10)
 
 	query, args := m.buildSelectQuery()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (published = ?) AND (to_tsvector('english', content) @@ plainto_tsquery('english', ?)) LIMIT 10"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND published = ? AND to_tsvector('english', content) @@ plainto_tsquery('english', ?) LIMIT 10"
 
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)

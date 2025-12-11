@@ -189,7 +189,7 @@ func TestModel_QueryWithResolver(t *testing.T) {
 	m.Where("id", 1).UsePrimary().Limit(10)
 	query, args := m.buildSelectQuery()
 
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (id = ?) LIMIT 10"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND id = ? LIMIT 10"
 	if strings.TrimSpace(query) != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
 	}

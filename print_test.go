@@ -11,7 +11,7 @@ func TestPrint_SimpleSelect(t *testing.T) {
 	m.Where("status", "active").Limit(10)
 
 	sql, args := m.Print()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (status = ?) LIMIT 10"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND status = ? LIMIT 10"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -31,7 +31,7 @@ func TestPrint_ComplexQuery(t *testing.T) {
 		Offset(10)
 
 	sql, args := m.Print()
-	expected := "SELECT id, name FROM test_models WHERE 1=1  AND (age = ?) AND (status = ?) ORDER BY created_at DESC LIMIT 5 OFFSET 10"
+	expected := "SELECT id, name FROM test_models WHERE 1=1  AND age = ? AND status = ? ORDER BY created_at DESC LIMIT 5 OFFSET 10"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -61,7 +61,7 @@ func TestPrint_WithFullText(t *testing.T) {
 	m.WhereFullText("content", "search terms").Limit(20)
 
 	sql, args := m.Print()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND (to_tsvector('english', content) @@ plainto_tsquery('english', ?)) LIMIT 20"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('english', content) @@ plainto_tsquery('english', ?) LIMIT 20"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -108,6 +108,6 @@ func ExampleModel_Print() {
 	fmt.Println(sql)
 	fmt.Println(args)
 	// Output:
-	// SELECT * FROM test_models WHERE 1=1  AND (status = ?) LIMIT 10
+	// SELECT * FROM test_models WHERE 1=1  AND status = ? LIMIT 10
 	// [active]
 }
