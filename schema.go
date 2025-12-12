@@ -39,6 +39,7 @@ type ModelInfo struct {
 	PrimaryKey string
 	Fields     map[string]*FieldInfo // StructFieldName -> FieldInfo
 	Columns    map[string]*FieldInfo // DBColumnName -> FieldInfo
+	Accessors  []int                 // Indices of methods starting with "Get"
 }
 
 // FieldInfo holds data about a single field in the model.
@@ -116,6 +117,18 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 
 	// 3. Parse Fields (including embedded)
 	parseFields(typ, info, []int{})
+
+	// 4. Parse Accessors (Get methods)
+	// We store valid methods for quick access during scanning
+	for i := 0; i < typ.NumMethod(); i++ {
+		method := typ.Method(i)
+		// Accessor convention: Starts with "Get", has 0 arguments, returns 1 value?
+		// Or just any method starting with "Get"?
+		// Existing logic in executor.go check for "Get" prefix and 0 args.
+		if strings.HasPrefix(method.Name, "Get") && method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
+			info.Accessors = append(info.Accessors, i)
+		}
+	}
 
 	modelCache[typ] = info
 	return info

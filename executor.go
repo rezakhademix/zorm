@@ -1206,24 +1206,13 @@ func (m *Model[T]) loadAccessors(results []*T) {
 		return
 	}
 
-	// Find Accessor methods
-	// We look for methods on *T or T that start with "Get" and take no args and return 1 value.
-	typ := reflect.TypeOf(results[0])
-	var accessors []reflect.Method
-
-	for i := 0; i < typ.NumMethod(); i++ {
-		method := typ.Method(i)
-		if strings.HasPrefix(method.Name, "Get") && method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
-			// Exclude "Get" itself or "GetX" where X is a field name?
-			// Laravel uses "get...Attribute".
-			// Requirements: "GetTypeLabel" -> "type_label"
-			accessors = append(accessors, method)
-		}
-	}
-
-	if len(accessors) == 0 {
+	// Use cached accessors from ModelInfo
+	accessorIndices := m.modelInfo.Accessors
+	if len(accessorIndices) == 0 {
 		return
 	}
+
+	typ := reflect.TypeOf(results[0])
 
 	for _, res := range results {
 		val := reflect.ValueOf(res).Elem()
@@ -1232,7 +1221,8 @@ func (m *Model[T]) loadAccessors(results []*T) {
 			attrField.Set(reflect.MakeMap(attrField.Type()))
 		}
 
-		for _, method := range accessors {
+		for _, methodIndex := range accessorIndices {
+			method := typ.Method(methodIndex)
 			// Call method
 			ret := method.Func.Call([]reflect.Value{reflect.ValueOf(res)})
 			key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))

@@ -14,7 +14,7 @@ import (
 // improve performance by reusing prepared statements instead of re-preparing
 // them on every execution.
 type StmtCache struct {
-	mu       sync.RWMutex
+	mu       sync.Mutex
 	capacity int
 	items    map[string]*cacheEntry
 	lruList  *list.List
@@ -46,20 +46,15 @@ func NewStmtCache(capacity int) *StmtCache {
 // Returns nil if the statement is not found in the cache.
 // Accessing a statement updates its position in the LRU list.
 func (c *StmtCache) Get(query string) *sql.Stmt {
-	c.mu.RLock()
-	entry, exists := c.items[query]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if !exists {
-		return nil
+	if entry, exists := c.items[query]; exists {
+		c.lruList.MoveToFront(entry.element)
+		return entry.stmt
 	}
 
-	// Update LRU order - move to front
-	c.mu.Lock()
-	c.lruList.MoveToFront(entry.element)
-	c.mu.Unlock()
-
-	return entry.stmt
+	return nil
 }
 
 // Put stores a prepared statement in the cache for the given SQL query.
@@ -74,7 +69,9 @@ func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
 	// If entry already exists, update it and move to front
 	if entry, exists := c.items[query]; exists {
 		// Close old statement
-		_ = entry.stmt.Close()
+		if entry.stmt != nil {
+			_ = entry.stmt.Close()
+		}
 		// Update with new statement
 		entry.stmt = stmt
 		c.lruList.MoveToFront(entry.element)
@@ -111,7 +108,9 @@ func (c *StmtCache) evictLRU() {
 	entry := c.items[query]
 
 	// Close the statement
-	_ = entry.stmt.Close()
+	if entry.stmt != nil {
+		_ = entry.stmt.Close()
+	}
 
 	// Remove from map
 	delete(c.items, query)
@@ -125,7 +124,9 @@ func (c *StmtCache) Clear() {
 
 	// Close all statements
 	for _, entry := range c.items {
-		_ = entry.stmt.Close()
+		if entry.stmt != nil {
+			_ = entry.stmt.Close()
+		}
 	}
 
 	// Clear the cache
@@ -141,7 +142,9 @@ func (c *StmtCache) Close() error {
 
 	// Close all statements
 	for _, entry := range c.items {
-		_ = entry.stmt.Close()
+		if entry.stmt != nil {
+			_ = entry.stmt.Close()
+		}
 	}
 
 	// Clear the cache
@@ -154,7 +157,7 @@ func (c *StmtCache) Close() error {
 // Len returns the current number of cached statements.
 // This is primarily useful for testing and monitoring.
 func (c *StmtCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return len(c.items)
 }

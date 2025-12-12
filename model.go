@@ -79,6 +79,8 @@ func New[T any]() *Model[T] {
 		relationCallbacks: make(map[string]any),
 		morphRelations:    make(map[string]map[string][]string),
 		forceReplica:      -1, // -1 means auto-select
+		wheres:            make([]string, 0, 4),
+		args:              make([]any, 0, 4),
 	}
 }
 
