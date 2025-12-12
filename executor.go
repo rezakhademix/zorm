@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -464,8 +465,10 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 		return m.rawQuery, m.rawArgs
 	}
 
-	var sb strings.Builder
-	cteArgs := m.buildWithClause(&sb)
+	sb := GetStringBuilder()
+	defer PutStringBuilder(sb)
+
+	cteArgs := m.buildWithClause(sb)
 
 	sb.WriteString("SELECT ")
 
@@ -487,7 +490,7 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	sb.WriteString(" FROM ")
 	sb.WriteString(m.modelInfo.TableName)
 
-	m.buildWhereClause(&sb)
+	m.buildWhereClause(sb)
 
 	if len(m.groupBys) > 0 {
 		sb.WriteString(" GROUP BY ")
@@ -510,14 +513,21 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	}
 
 	if m.limit > 0 {
-		sb.WriteString(fmt.Sprintf(" LIMIT %d", m.limit))
+		sb.WriteString(" LIMIT ")
+		sb.WriteString(strconv.Itoa(m.limit))
 	}
 
 	if m.offset > 0 {
-		sb.WriteString(fmt.Sprintf(" OFFSET %d", m.offset))
+		sb.WriteString(" OFFSET ")
+		sb.WriteString(strconv.Itoa(m.offset))
 	}
 
-	return sb.String(), append(cteArgs, m.args...)
+	// Pre-allocate args slice with correct capacity
+	allArgs := make([]any, 0, len(cteArgs)+len(m.args))
+	allArgs = append(allArgs, cteArgs...)
+	allArgs = append(allArgs, m.args...)
+
+	return sb.String(), allArgs
 }
 
 // buildWithClause constructs the WITH clause for CTEs.
@@ -595,7 +605,12 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 		return nil, err
 	}
 
-	var results []*T
+	// Pre-allocate results slice based on limit or default capacity
+	initialCap := m.limit
+	if initialCap <= 0 {
+		initialCap = 64 // Default capacity for unbounded queries
+	}
+	results := make([]*T, 0, initialCap)
 
 	for rows.Next() {
 		// Create new instance of T
@@ -636,8 +651,9 @@ func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
 // Cursor provides a typed, forward-only iterator over database query results.
 // It wraps sql.Rows and maps each row into the generic model type T.
 type Cursor[T any] struct {
-	rows  *sql.Rows
-	model *Model[T]
+	rows    *sql.Rows
+	model   *Model[T]
+	columns []string // Cached column names to avoid repeated calls
 }
 
 // Next prepares the next result row for reading with the Scan method.
@@ -647,16 +663,20 @@ func (c *Cursor[T]) Next() bool {
 
 // Scan scans the current row into a new entity.
 func (c *Cursor[T]) Scan() (*T, error) {
-	columns, err := c.rows.Columns()
-	if err != nil {
-		return nil, err
+	// Cache columns on first call to avoid repeated lookups
+	if c.columns == nil {
+		var err error
+		c.columns, err = c.rows.Columns()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	entity := new(T)
 	val := reflect.ValueOf(entity).Elem()
 
 	// Use helper to prepare scan destinations
-	dest := c.model.prepareScanDestinations(columns, val)
+	dest := c.model.prepareScanDestinations(c.columns, val)
 
 	if err := c.rows.Scan(dest...); err != nil {
 		return nil, err

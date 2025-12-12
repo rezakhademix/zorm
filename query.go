@@ -74,7 +74,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 				conditions = append(conditions, w)
 			}
 			grouped := "(" + strings.Join(conditions, " ") + ")"
-			m.wheres = append(m.wheres, fmt.Sprintf("%s %s", typ, grouped))
+			m.wheres = append(m.wheres, typ+" "+grouped)
 			m.args = append(m.args, nested.args...)
 		}
 		return m
@@ -83,7 +83,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	// 2. Handle Map
 	if conditionMap, ok := query.(map[string]any); ok {
 		for k, v := range conditionMap {
-			m.wheres = append(m.wheres, fmt.Sprintf("%s %s = ?", typ, k))
+			m.wheres = append(m.wheres, typ+" "+k+" = ?")
 			m.args = append(m.args, v)
 		}
 		return m
@@ -95,14 +95,17 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		val = val.Elem()
 	}
 	if val.Kind() == reflect.Struct {
-		// Use ModelInfo if available and type matches?
-		// Or just iterate fields and use ToSnakeCase?
-		// Let's use ParseModelType to be safe and consistent
-		info := ParseModelType(val.Type())
+		// Performance optimization: reuse ModelInfo if the struct type matches
+		var info *ModelInfo
+		if val.Type() == m.modelInfo.Type {
+			info = m.modelInfo
+		} else {
+			info = ParseModelType(val.Type())
+		}
 		for _, field := range info.Fields {
 			fVal := val.FieldByName(field.Name)
 			if !fVal.IsZero() {
-				m.wheres = append(m.wheres, fmt.Sprintf("%s %s = ?", typ, field.Column))
+				m.wheres = append(m.wheres, typ+" "+field.Column+" = ?")
 				m.args = append(m.args, fVal.Interface())
 			}
 		}
@@ -142,7 +145,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		}
 	}
 
-	m.wheres = append(m.wheres, fmt.Sprintf("%s %s", typ, queryStr))
+	m.wheres = append(m.wheres, typ+" "+queryStr)
 	m.args = append(m.args, args...)
 	return m
 }

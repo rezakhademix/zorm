@@ -10,6 +10,28 @@ import (
 	"unicode"
 )
 
+// sbPool is a sync.Pool for strings.Builder to reduce allocations.
+// Used by query building methods.
+var sbPool = sync.Pool{
+	New: func() interface{} {
+		return &strings.Builder{}
+	},
+}
+
+// GetStringBuilder retrieves a strings.Builder from the pool.
+func GetStringBuilder() *strings.Builder {
+	return sbPool.Get().(*strings.Builder)
+}
+
+// PutStringBuilder returns a strings.Builder to the pool after resetting it.
+func PutStringBuilder(sb *strings.Builder) {
+	sb.Reset()
+	sbPool.Put(sb)
+}
+
+// snakeCaseCache caches ToSnakeCase results to avoid repeated conversions.
+var snakeCaseCache sync.Map
+
 // ModelInfo holds the reflection data for a model struct.
 type ModelInfo struct {
 	Type       reflect.Type
@@ -189,7 +211,13 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 
 // ToSnakeCase converts a string to snake_case.
 // Handles acronyms correctly (e.g., UserID -> user_id, HTTPClient -> http_client).
+// Results are cached to avoid repeated conversions for the same input.
 func ToSnakeCase(s string) string {
+	// Check cache first
+	if cached, ok := snakeCaseCache.Load(s); ok {
+		return cached.(string)
+	}
+
 	var result strings.Builder
 	result.Grow(len(s) + 5) // Pre-allocate some space
 
@@ -242,7 +270,10 @@ func ToSnakeCase(s string) string {
 		}
 		result.WriteRune(unicode.ToLower(r))
 	}
-	return result.String()
+
+	converted := result.String()
+	snakeCaseCache.Store(s, converted)
+	return converted
 }
 
 // fillStruct populates a struct with values from a map using ModelInfo.

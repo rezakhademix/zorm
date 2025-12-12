@@ -502,12 +502,16 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	// 5. Map back to parents
 	relatedMap := make(map[any][]reflect.Value)
 
+	// Look up field info once outside the loop
+	fkFieldInfo, hasFKField := relatedInfo.Columns[foreignKey]
+	if !hasFKField {
+		return fmt.Errorf("foreign key column %s not found in related model", foreignKey)
+	}
+
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
-		if field, ok := relatedInfo.Columns[foreignKey]; ok {
-			fkVal := val.FieldByName(field.Name).Interface()
-			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
-		}
+		fkVal := val.FieldByName(fkFieldInfo.Name).Interface()
+		relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
 	}
 
 	for i, parent := range results {
