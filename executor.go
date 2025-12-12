@@ -574,31 +574,31 @@ func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 	}
 }
 
-// prepareScanDestinations creates scan destinations for sql.Rows.Scan based on column names.
-// It maps database columns to struct fields using the model's column metadata.
-// Columns not found in the struct are ignored to allow SELECT with extra columns.
-// Returns a slice of pointers that can be passed to rows.Scan().
-func (m *Model[T]) prepareScanDestinations(columns []string, val reflect.Value) []any {
-	dest := make([]any, len(columns))
+// mapColumns maps database columns to struct field info.
+// Returns a slice where each element corresponds to the column at that index.
+func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
+	fields := make([]*FieldInfo, len(columns))
+	for i, col := range columns {
+		fields[i] = m.modelInfo.Columns[col]
+	}
+	return fields
+}
 
-	for i, colName := range columns {
-		if fieldInfo, ok := m.modelInfo.Columns[colName]; ok {
-			// Get the field value and take its address for scanning
-			// Both pointer and non-pointer fields use Addr() since sql.Scan needs **Type or *Type
-			fieldVal := val.FieldByName(fieldInfo.Name)
-			dest[i] = fieldVal.Addr().Interface()
+// fillScanDestinations creates scan destinations for sql.Rows.Scan based on pre-calculated field mapping.
+// It reuses the dest slice to avoid allocations per row.
+func (m *Model[T]) fillScanDestinations(fields []*FieldInfo, val reflect.Value, dest []any) {
+	for i, f := range fields {
+		if f != nil {
+			dest[i] = val.FieldByIndex(f.Index).Addr().Interface()
 		} else {
-			// Column not in struct, ignore it
 			var ignore any
 			dest[i] = &ignore
 		}
 	}
-
-	return dest
 }
 
 // scanRows scans sql.Rows into a slice of *T.
-// It uses prepareScanDestinations to map columns to struct fields.
+// It uses pre-calculated field mapping and reused destination slice for performance.
 func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -612,13 +612,17 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 	}
 	results := make([]*T, 0, initialCap)
 
+	// Prepare mapping and destination slice once
+	fields := m.mapColumns(columns)
+	dest := make([]any, len(columns))
+
 	for rows.Next() {
 		// Create new instance of T
 		entity := new(T)
 		val := reflect.ValueOf(entity).Elem()
 
-		// Prepare scan destinations using helper
-		dest := m.prepareScanDestinations(columns, val)
+		// Fill scan destinations
+		m.fillScanDestinations(fields, val, dest)
 
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
@@ -653,7 +657,9 @@ func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
 type Cursor[T any] struct {
 	rows    *sql.Rows
 	model   *Model[T]
-	columns []string // Cached column names to avoid repeated calls
+	columns []string     // Cached column names
+	fields  []*FieldInfo // Cached field mapping
+	dest    []any        // Cached scan destination slice
 }
 
 // Next prepares the next result row for reading with the Scan method.
@@ -663,22 +669,25 @@ func (c *Cursor[T]) Next() bool {
 
 // Scan scans the current row into a new entity.
 func (c *Cursor[T]) Scan() (*T, error) {
-	// Cache columns on first call to avoid repeated lookups
+	// Cache columns and mapping on first call
 	if c.columns == nil {
 		var err error
 		c.columns, err = c.rows.Columns()
 		if err != nil {
 			return nil, err
 		}
+		// Init cache
+		c.fields = c.model.mapColumns(c.columns)
+		c.dest = make([]any, len(c.columns))
 	}
 
 	entity := new(T)
 	val := reflect.ValueOf(entity).Elem()
 
-	// Use helper to prepare scan destinations
-	dest := c.model.prepareScanDestinations(c.columns, val)
+	// Use helper to fill destinations
+	c.model.fillScanDestinations(c.fields, val, c.dest)
 
-	if err := c.rows.Scan(dest...); err != nil {
+	if err := c.rows.Scan(c.dest...); err != nil {
 		return nil, err
 	}
 
@@ -1213,6 +1222,7 @@ func (m *Model[T]) loadAccessors(results []*T) {
 	}
 
 	typ := reflect.TypeOf(results[0])
+	callArgs := make([]reflect.Value, 1)
 
 	for _, res := range results {
 		val := reflect.ValueOf(res).Elem()
@@ -1221,10 +1231,13 @@ func (m *Model[T]) loadAccessors(results []*T) {
 			attrField.Set(reflect.MakeMap(attrField.Type()))
 		}
 
+		// Update receiver for method calls
+		callArgs[0] = reflect.ValueOf(res)
+
 		for _, methodIndex := range accessorIndices {
 			method := typ.Method(methodIndex)
-			// Call method
-			ret := method.Func.Call([]reflect.Value{reflect.ValueOf(res)})
+			// Call method using reused args slice
+			ret := method.Func.Call(callArgs)
 			key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))
 			attrField.SetMapIndex(reflect.ValueOf(key), ret[0])
 		}
