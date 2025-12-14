@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -621,13 +622,38 @@ func (m *Model[T]) UseReplica(index int) *Model[T] {
 //	sql, args := m.Where("status", "active").Limit(10).Print()
 //	fmt.Println(sql, args)
 //
-// Output: "SELECT * FROM users WHERE 1=1 AND (status = ?) LIMIT 10" [active]
+// Output: "SELECT * FROM users WHERE 1=1 AND (status = $1) LIMIT 10" [active]
 func (m *Model[T]) Print() (string, []any) {
+	var query string
+	var args []any
+
 	// If raw query is set, return it
 	if m.rawQuery != "" {
-		return m.rawQuery, m.rawArgs
+		query = m.rawQuery
+		args = m.rawArgs
+	} else {
+		// Otherwise, build the SELECT query
+		query, args = m.buildSelectQuery()
 	}
 
-	// Otherwise, build the SELECT query
-	return m.buildSelectQuery()
+	return rebind(query), args
+}
+
+// rebind replaces ? placeholders with $1, $2, etc.
+func rebind(query string) string {
+	var sb strings.Builder
+	// Pre-allocate assuming similar length
+	sb.Grow(len(query))
+
+	questionMarkCount := 0
+	for _, char := range query {
+		if char == '?' {
+			questionMarkCount++
+			sb.WriteString("$")
+			sb.WriteString(strconv.Itoa(questionMarkCount))
+		} else {
+			sb.WriteRune(char)
+		}
+	}
+	return sb.String()
 }

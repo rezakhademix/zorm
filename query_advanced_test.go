@@ -314,7 +314,7 @@ func TestScope_WithPagination(t *testing.T) {
 
 	query, args := m.Print()
 
-	if !strings.Contains(query, "active = ?") {
+	if !strings.Contains(query, "active = $1") {
 		t.Error("Scope should be applied before Limit")
 	}
 	if !strings.Contains(query, "LIMIT 10") {
@@ -338,10 +338,10 @@ func TestMultipleScopeChaining(t *testing.T) {
 
 	query, args := m.Print()
 
-	if !strings.Contains(query, "active = ?") {
+	if !strings.Contains(query, "active = $1") {
 		t.Error("First scope should be applied")
 	}
-	if !strings.Contains(query, "verified = ?") {
+	if !strings.Contains(query, "verified = $2") {
 		t.Error("Second scope should be applied")
 	}
 	if len(args) != 2 {

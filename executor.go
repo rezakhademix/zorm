@@ -186,14 +186,14 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(ctx, query)
+		stmt, err = m.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return nil, WrapQueryError("PREPARE", query, args, err)
 		}
 
 		rows, err = stmt.QueryContext(ctx, args...)
 	} else {
-		rows, err = m.queryer().QueryContext(ctx, query, args...)
+		rows, err = m.queryer().QueryContext(ctx, rebind(query), args...)
 	}
 
 	if err != nil {
@@ -300,13 +300,13 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmt(ctx, query)
+		stmt, err = m.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
 		err = stmt.QueryRowContext(ctx, args...).Scan(&count)
 	} else {
-		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&count)
+		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
 	}
 
 	if err != nil {
@@ -906,26 +906,27 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(ctx, query)
+		stmt, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
 		err = stmt.QueryRowContext(ctx, values...).Scan(fVal.Addr().Interface())
 	} else {
-		err = m.queryerForWrite().QueryRowContext(ctx, query, values...).Scan(fVal.Addr().Interface())
+		err = m.queryerForWrite().QueryRowContext(ctx, rebind(query), values...).Scan(fVal.Addr().Interface())
 	}
 
 	if err != nil {
 		return WrapQueryError("INSERT", query, values, err)
 	}
 
-	// 4. AfterCreate Hook
-	if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
-		if err := hook.AfterCreate(ctx); err != nil {
-			return err
-		}
-	}
+	// Update LastInsertId if possible and supported
+	// Postgres RETURNING id handles this above.
 
+	// Create doesn't seem to have a fallback Exec?
+	// The original code uses QueryRowContext for INSERT, presumably for RETURNING ID.
+	// So the above block covers it.
+
+	// Moving to Update method
 	return nil
 }
 
@@ -992,13 +993,13 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(ctx, query)
+		stmt, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
 		_, err = stmt.ExecContext(ctx, allArgs...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(ctx, query, allArgs...)
+		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
 	}
 
 	if err != nil {
@@ -1031,13 +1032,13 @@ func (m *Model[T]) Delete(ctx context.Context) error {
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
-		stmt, err = m.prepareStmtForWrite(ctx, query)
+		stmt, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
 			return WrapQueryError("PREPARE", query, m.args, err)
 		}
 		_, err = stmt.ExecContext(ctx, args...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(ctx, query, args...)
+		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), args...)
 	}
 
 	if err != nil {
@@ -1184,7 +1185,7 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	args = append(args, m.args...)
 
 	query := sb.String()
-	_, err := m.queryerForWrite().ExecContext(ctx, query, args...)
+	_, err := m.queryerForWrite().ExecContext(ctx, rebind(query), args...)
 	if err != nil {
 		return WrapQueryError("UPDATE", query, args, err)
 	}

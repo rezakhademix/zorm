@@ -11,7 +11,7 @@ func TestPrint_SimpleSelect(t *testing.T) {
 	m.Where("status", "active").Limit(10)
 
 	sql, args := m.Print()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND status = ? LIMIT 10"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND status = $1 LIMIT 10"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -31,7 +31,7 @@ func TestPrint_ComplexQuery(t *testing.T) {
 		Offset(10)
 
 	sql, args := m.Print()
-	expected := "SELECT id, name FROM test_models WHERE 1=1  AND age = ? AND status = ? ORDER BY created_at DESC LIMIT 5 OFFSET 10"
+	expected := "SELECT id, name FROM test_models WHERE 1=1  AND age = $1 AND status = $2 ORDER BY created_at DESC LIMIT 5 OFFSET 10"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -46,7 +46,7 @@ func TestPrint_RawQuery(t *testing.T) {
 	m.Raw("SELECT * FROM users WHERE email = ?", "test@example.com")
 
 	sql, args := m.Print()
-	expected := "SELECT * FROM users WHERE email = ?"
+	expected := "SELECT * FROM users WHERE email = $1"
 
 	if sql != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -61,7 +61,7 @@ func TestPrint_WithFullText(t *testing.T) {
 	m.WhereFullText("content", "search terms").Limit(20)
 
 	sql, args := m.Print()
-	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('english', content) @@ plainto_tsquery('english', ?) LIMIT 20"
+	expected := "SELECT * FROM test_models WHERE 1=1  AND to_tsvector('english', content) @@ plainto_tsquery('english', $1) LIMIT 20"
 
 	if strings.TrimSpace(sql) != expected {
 		t.Errorf("expected sql %q, got %q", expected, sql)
@@ -83,7 +83,7 @@ func TestPrint_Chaining(t *testing.T) {
 	sql2, args2 := m.Print()
 
 	// First print should have 1 WHERE
-	if !strings.Contains(sql1, "status = ?") {
+	if !strings.Contains(sql1, "status = $1") {
 		t.Error("First print should contain status condition")
 	}
 	if len(args1) != 1 {
@@ -91,7 +91,7 @@ func TestPrint_Chaining(t *testing.T) {
 	}
 
 	// Second print should have both WHEREs
-	if !strings.Contains(sql2, "status = ?") || !strings.Contains(sql2, "age = ?") {
+	if !strings.Contains(sql2, "status = $1") || !strings.Contains(sql2, "age = $2") {
 		t.Error("Second print should contain both conditions")
 	}
 	if len(args2) != 2 {
@@ -108,6 +108,6 @@ func ExampleModel_Print() {
 	fmt.Println(sql)
 	fmt.Println(args)
 	// Output:
-	// SELECT * FROM test_models WHERE 1=1  AND status = ? LIMIT 10
+	// SELECT * FROM test_models WHERE 1=1  AND status = $1 LIMIT 10
 	// [active]
 }

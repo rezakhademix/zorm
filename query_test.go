@@ -41,9 +41,9 @@ func TestRaw(t *testing.T) {
 	m := New[TestModel]().Raw("SELECT * FROM users WHERE id = ?", 123)
 	query, args := m.Print()
 
-	expectedQuery := "SELECT * FROM users WHERE id = ?"
-	if query != expectedQuery {
-		t.Errorf("expected query %q, got %q", expectedQuery, query)
+	expected := "SELECT * FROM users WHERE id = $1"
+	if query != expected {
+		t.Errorf("expected query %q, got %q", expected, query)
 	}
 	if len(args) != 1 || args[0] != 123 {
 		t.Errorf("expected args [123], got %v", args)
@@ -55,7 +55,7 @@ func TestWhere_StringWithValue(t *testing.T) {
 	m := New[TestModel]().Where("name", "John")
 	query, args := m.Print()
 
-	expected := "name = ?"
+	expected := "name = $1"
 	if !strings.Contains(query, expected) {
 		t.Errorf("expected query to contain %q, got %q", expected, query)
 	}
@@ -69,7 +69,7 @@ func TestWhere_StringWithOperator(t *testing.T) {
 	m := New[TestModel]().Where("age >", 18)
 	query, args := m.Print()
 
-	expected := "age > ?"
+	expected := "age > $1"
 	if !strings.Contains(query, expected) {
 		t.Errorf("expected query to contain %q, got %q", expected, query)
 	}
@@ -87,7 +87,15 @@ func TestWhere_MapConditions(t *testing.T) {
 	query, args := m.Print()
 
 	// Should contain both conditions
-	if !strings.Contains(query, "name = ?") || !strings.Contains(query, "age = ?") {
+	// Map iteration order is random, so check for presence of keys and values specifically?
+	// But placeholders imply order. $1 is first arg, $2 is second.
+	// We just check that we have "name = $X" and "age = $Y".
+	hasName1 := strings.Contains(query, "name = $1")
+	hasAge2 := strings.Contains(query, "age = $2")
+	hasName2 := strings.Contains(query, "name = $2")
+	hasAge1 := strings.Contains(query, "age = $1")
+
+	if !(hasName1 && hasAge2) && !(hasName2 && hasAge1) {
 		t.Errorf("expected query to contain both conditions, got %q", query)
 	}
 	if len(args) != 2 {
@@ -104,8 +112,14 @@ func TestWhere_StructConditions(t *testing.T) {
 	query, args := m.Print()
 
 	// Should contain both conditions (non-zero fields)
-	if !strings.Contains(query, "name = ?") {
-		t.Errorf("expected query to contain 'name = ?', got %q", query)
+	// Struct iteration order might vary, so checking both variations
+	hasName1 := strings.Contains(query, "name = $1")
+	hasAge2 := strings.Contains(query, "user_age = $2")
+	hasName2 := strings.Contains(query, "name = $2")
+	hasAge1 := strings.Contains(query, "user_age = $1")
+
+	if !(hasName1 && hasAge2) && !(hasName2 && hasAge1) {
+		t.Errorf("expected query to contain 'name = $X' and 'user_age = $Y', got %q", query)
 	}
 	if len(args) < 1 {
 		t.Errorf("expected at least 1 arg, got %d", len(args))
@@ -146,7 +160,7 @@ func TestWhereIn(t *testing.T) {
 	m := New[TestModel]().WhereIn("id", []any{1, 2, 3})
 	query, args := m.Print()
 
-	expected := "id IN (?, ?, ?)"
+	expected := "id IN ($1, $2, $3)"
 	if !strings.Contains(query, expected) {
 		t.Errorf("expected query to contain %q, got %q", expected, query)
 	}
@@ -208,7 +222,7 @@ func TestHaving(t *testing.T) {
 		Having("COUNT(*) >", 5)
 	query, args := m.Print()
 
-	expected := "HAVING COUNT(*) > ?"
+	expected := "HAVING COUNT(*) > $1"
 	if !strings.Contains(query, expected) {
 		t.Errorf("expected query to contain %q, got %q", expected, query)
 	}
@@ -291,8 +305,8 @@ func TestScope(t *testing.T) {
 	m := New[TestModel]().Scope(activeScope)
 	query, args := m.Print()
 
-	if !strings.Contains(query, "status = ?") {
-		t.Errorf("expected query to contain 'status = ?', got %q", query)
+	if !strings.Contains(query, "status = $1") {
+		t.Errorf("expected query to contain 'status = $1', got %q", query)
 	}
 	if len(args) != 1 || args[0] != "active" {
 		t.Errorf("expected args ['active'], got %v", args)
@@ -426,10 +440,10 @@ func TestMethodChaining(t *testing.T) {
 	if !strings.Contains(query, "id, name") {
 		t.Error("missing SELECT clause")
 	}
-	if !strings.Contains(query, "age > ?") {
+	if !strings.Contains(query, "age > $1") {
 		t.Error("missing age WHERE clause")
 	}
-	if !strings.Contains(query, "status = ?") {
+	if !strings.Contains(query, "status = $2") {
 		t.Error("missing status WHERE clause")
 	}
 	if !strings.Contains(query, "ORDER BY created_at DESC") {
@@ -467,7 +481,7 @@ func TestComplexQuery(t *testing.T) {
 	if !strings.Contains(query, "GROUP BY name") {
 		t.Error("missing GROUP BY clause")
 	}
-	if !strings.Contains(query, "HAVING COUNT(*) > ?") {
+	if !strings.Contains(query, "HAVING COUNT(*) > $3") {
 		t.Error("missing HAVING clause")
 	}
 	if !strings.Contains(query, "ORDER BY count DESC") {
