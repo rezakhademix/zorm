@@ -23,7 +23,7 @@ func TestWithCTE_RawString(t *testing.T) {
 
 func TestWithCTE_SubQuery(t *testing.T) {
 	sub := New[TestModel]()
-	sub.Where("age >", 18)
+	sub.Where("age", ">", 18)
 
 	m := New[TestModel]()
 	m.WithCTE("cte", sub)

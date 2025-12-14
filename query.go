@@ -42,12 +42,30 @@ func (m *Model[T]) Raw(query string, args ...any) *Model[T] {
 // Supports multiple forms:
 //
 //	Where("column", value) -> column = ? (converted to $n at execution)
-//	Where("column >", value) -> column > ?
+//	Where("column", ">", value) -> column > ?
 //	Where(map[string]any{"name": "John", "age": 30}) -> name = ? AND age = ?
 //	Where(&User{Name: "John"}) -> name = ?
 //	Where(func(q *Model[T]) { ... }) -> nested group with parentheses
 func (m *Model[T]) Where(query any, args ...any) *Model[T] {
-	return m.addWhere("AND", query, args...)
+	var (
+		operator string
+		value    any
+	)
+
+	switch len(args) {
+	case 0:
+		return m.addWhere("AND", query)
+	case 1:
+		value = args[0]
+		operator = "="
+		return m.addWhere("AND", fmt.Sprintf("%s %s", query, operator), value)
+	case 2:
+		operator = fmt.Sprint(args[0])
+		value = args[1]
+		return m.addWhere("AND", fmt.Sprintf("%s %s", query, operator), value)
+	default:
+		return m
+	}
 }
 
 // OrWhere adds an OR WHERE clause.
@@ -119,17 +137,13 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		return m
 	}
 
-	// If args provided and no ? and no operator, assume =
 	if len(args) > 0 && !strings.Contains(queryStr, "?") {
 		trimmed := strings.TrimSpace(queryStr)
 		// Check for operator
-		// We split by space to get the last part?
-		// e.g. "age >" -> "age", ">"
-		// "age" -> "age"
 		parts := strings.Fields(trimmed)
 		hasOperator := false
 		if len(parts) > 1 {
-			op := strings.ToUpper(parts[len(parts)-1])
+			op := strings.ToUpper(parts[1])
 			operators := map[string]bool{
 				"=": true, ">": true, "<": true, ">=": true, "<=": true,
 				"LIKE": true, "ILIKE": true, "IS": true, "IN": true, "<>": true, "!=": true,

@@ -66,7 +66,7 @@ func TestWhere_StringWithValue(t *testing.T) {
 
 // TestWhere_StringWithOperator tests Where with operator
 func TestWhere_StringWithOperator(t *testing.T) {
-	m := New[TestModel]().Where("age >", 18)
+	m := New[TestModel]().Where("age", ">", 18)
 	query, args := m.Print()
 
 	expected := "age > $1"
@@ -129,7 +129,7 @@ func TestWhere_StructConditions(t *testing.T) {
 // TestWhere_CallbackNested tests Where with callback for nested conditions
 func TestWhere_CallbackNested(t *testing.T) {
 	m := New[TestModel]().Where(func(q *Model[TestModel]) {
-		q.Where("age >", 18).Where("age <", 65)
+		q.Where("age", ">", 18).Where("age", "<", 65)
 	})
 	query, args := m.Print()
 
@@ -428,7 +428,7 @@ func TestGetArgs(t *testing.T) {
 func TestMethodChaining(t *testing.T) {
 	m := New[TestModel]().
 		Select("id", "name").
-		Where("age >", 18).
+		Where("age", ">", 18).
 		Where("status", "active").
 		OrderBy("created_at", "DESC").
 		Limit(10).
@@ -465,7 +465,7 @@ func TestComplexQuery(t *testing.T) {
 	m := New[TestModel]().
 		Select("name", "COUNT(*) as count").
 		Where(func(q *Model[TestModel]) {
-			q.Where("age >", 18).OrWhere("status", "verified")
+			q.Where("age", ">", 18).OrWhere("status", "verified")
 		}).
 		GroupBy("name").
 		Having("COUNT(*) >", 5).

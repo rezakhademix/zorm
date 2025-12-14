@@ -229,7 +229,7 @@ func (m *Model[T]) First(ctx context.Context) (*T, error) {
 
 // Find finds a record by ID.
 func (m *Model[T]) Find(ctx context.Context, id any) (*T, error) {
-	return m.Where(m.modelInfo.PrimaryKey+" = ?", id).First(ctx)
+	return m.Where(m.modelInfo.PrimaryKey, id).First(ctx)
 }
 
 // FindOrFail finds a record by ID or returns an error.
