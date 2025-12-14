@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>ZORM</h1>
+  <h1>Z-ORM</h1>
   <p><strong>A Type-Safe, Production Ready Go ORM</strong></p>
   <p>One ORM To Query Them All</p>
 </div>
