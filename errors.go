@@ -23,7 +23,7 @@ var (
 	// ErrNoContext is returned when no context is provided
 	ErrNoContext = errors.New("zorm: no context provided")
 
-	// Relation errors
+	// ErrRelationNotFound Relation errors
 	// ErrRelationNotFound is returned when a relation method is not found
 	ErrRelationNotFound = errors.New("zorm: relation not found")
 	// ErrInvalidRelation is returned when relation type is invalid
@@ -41,7 +41,7 @@ var (
 	// ErrNotNullViolation is returned for NOT NULL constraint violations
 	ErrNotNullViolation = errors.New("zorm: not null constraint violation")
 
-	// Connection errors
+	// ErrConnectionFailed Connection errors
 	// ErrConnectionFailed is returned when database connection fails
 	ErrConnectionFailed = errors.New("zorm: connection failed")
 	// ErrConnectionLost is returned when connection is lost during operation
