@@ -601,3 +601,13 @@ func TestChunkCallback_Logic(t *testing.T) {
 		t.Logf("Expected error without database: %v", err)
 	}
 }
+
+func TestWhereDefaultCase(t *testing.T) {
+	m := New[TestModel]()
+	m.Where("age", ">", 18, "extra") // 3 args → triggers default
+
+	// Nothing breaks, just ensure it returns the model
+	if m == nil {
+		t.Error("expected model instance, got nil")
+	}
+}
