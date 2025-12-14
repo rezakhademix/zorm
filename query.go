@@ -41,7 +41,7 @@ func (m *Model[T]) Raw(query string, args ...any) *Model[T] {
 // Where adds a WHERE clause.
 // Supports multiple forms:
 //
-//	Where("column", value) -> column = ?
+//	Where("column", value) -> column = ? (converted to $n at execution)
 //	Where("column >", value) -> column > ?
 //	Where(map[string]any{"name": "John", "age": 30}) -> name = ? AND age = ?
 //	Where(&User{Name: "John"}) -> name = ?
@@ -646,8 +646,14 @@ func rebind(query string) string {
 	sb.Grow(len(query))
 
 	questionMarkCount := 0
+	inQuote := false
+
 	for _, char := range query {
-		if char == '?' {
+		if char == '\'' {
+			inQuote = !inQuote
+		}
+
+		if char == '?' && !inQuote {
 			questionMarkCount++
 			sb.WriteString("$")
 			sb.WriteString(strconv.Itoa(questionMarkCount))

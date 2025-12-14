@@ -405,7 +405,7 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 		sb.WriteString(strings.Join(placeholders, ","))
 		sb.WriteString(")")
 
-		rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
+		rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 		if err != nil {
 			return err
 		}
@@ -685,7 +685,7 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 	sb.WriteString(strings.Join(placeholders, ","))
 	sb.WriteString(")")
 
-	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -767,7 +767,7 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	sb.WriteString(")")
 
 	// Execute
-	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
 		return err
 	}

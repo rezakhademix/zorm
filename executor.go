@@ -246,7 +246,7 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 	m.columns = []string{column}
 
 	query, args := m.buildSelectQuery()
-	rows, err := m.queryer().QueryContext(ctx, query, args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return nil, WrapQueryError("SELECT", query, args, err)
 	}
@@ -437,7 +437,7 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64,
 	sb.WriteString(query)
 	m.buildWhereClause(&sb)
 
-	rows, err := m.queryer().QueryContext(ctx, sb.String(), m.args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), m.args...)
 	if err != nil {
 		return nil, err
 	}
@@ -641,7 +641,7 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 // Useful for large datasets to avoid loading everything into memory.
 func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
 	query, args := m.buildSelectQuery()
-	rows, err := m.queryer().QueryContext(ctx, query, args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return nil, err
 	}

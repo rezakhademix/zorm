@@ -13,17 +13,14 @@ func TestPaginate_Logic(t *testing.T) {
 
 	// Test pagination result structure
 	// We can't actually execute without a DB, but we can test the method is callable
-	var result *PaginationResult[TestModel]
-	_ = result
-
 	// Verify PaginationResult has correct fields
-	if result != nil {
-		_ = result.Data
-		_ = result.Total
-		_ = result.PerPage
-		_ = result.CurrentPage
-		_ = result.LastPage
-	}
+	// We verify that the fields exist and are accessible
+	result := &PaginationResult[TestModel]{}
+	_ = result.Data
+	_ = result.Total
+	_ = result.PerPage
+	_ = result.CurrentPage
+	_ = result.LastPage
 
 	t.Log("Paginate method exists and returns correct type")
 }
