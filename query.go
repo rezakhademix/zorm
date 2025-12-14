@@ -151,6 +151,50 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	return m
 }
 
+// WhereNull adds an AND condition that checks whether the given column is NULL.
+//
+// Example:
+//
+//	Model[User]().WhereNull("deleted_at")
+//	// WHERE deleted_at IS NULL
+func (m *Model[T]) WhereNull(column string) *Model[T] {
+	m.wheres = append(m.wheres, "AND "+column+" IS NULL")
+	return m
+}
+
+// OrWhereNull adds an OR condition that checks whether the given column is NULL.
+//
+// Example:
+//
+//	Model[User]().OrWhereNull("deleted_at")
+//	// OR deleted_at IS NULL
+func (m *Model[T]) OrWhereNull(column string) *Model[T] {
+	m.wheres = append(m.wheres, "OR "+column+" IS NULL")
+	return m
+}
+
+// WhereNotNull adds an AND condition that checks whether the given column is NOT NULL.
+//
+// Example:
+//
+//	Model[User]().WhereNotNull("verified_at")
+//	// WHERE verified_at IS NOT NULL
+func (m *Model[T]) WhereNotNull(column string) *Model[T] {
+	m.wheres = append(m.wheres, "AND "+column+" IS NOT NULL")
+	return m
+}
+
+// OrWhereNotNull adds an OR condition that checks whether the given column is NOT NULL.
+//
+// Example:
+//
+//	Model[User]().OrWhereNotNull("verified_at")
+//	// OR verified_at IS NOT NULL
+func (m *Model[T]) OrWhereNotNull(column string) *Model[T] {
+	m.wheres = append(m.wheres, "OR "+column+" IS NOT NULL")
+	return m
+}
+
 // Chunk processes the results in chunks to save memory.
 func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) error) error {
 	page := 1
