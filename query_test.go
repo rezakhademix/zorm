@@ -602,12 +602,44 @@ func TestChunkCallback_Logic(t *testing.T) {
 	}
 }
 
-func TestWhereDefaultCase(t *testing.T) {
-	m := New[TestModel]()
-	m.Where("age", ">", 18, "extra") // 3 args → triggers default
+// TestWhereNull tests the WhereNull method
+func TestWhereNull(t *testing.T) {
+	m := New[TestModel]().WhereNull("deleted_at")
+	query, _ := m.Print()
 
-	// Nothing breaks, just ensure it returns the model
-	if m == nil {
-		t.Error("expected model instance, got nil")
+	expected := "deleted_at IS NULL"
+	if !strings.Contains(query, expected) {
+		t.Errorf("expected query to contain %q, got %q", expected, query)
+	}
+}
+
+// TestOrWhereNull tests the OrWhereNull method
+func TestOrWhereNull(t *testing.T) {
+	m := New[TestModel]().Where("name", "John").OrWhereNull("deleted_at")
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "OR deleted_at IS NULL") {
+		t.Errorf("expected query to contain 'OR deleted_at IS NULL', got %q", query)
+	}
+}
+
+// TestWhereNotNull tests the WhereNotNull method
+func TestWhereNotNull(t *testing.T) {
+	m := New[TestModel]().WhereNotNull("verified_at")
+	query, _ := m.Print()
+
+	expected := "verified_at IS NOT NULL"
+	if !strings.Contains(query, expected) {
+		t.Errorf("expected query to contain %q, got %q", expected, query)
+	}
+}
+
+// TestOrWhereNotNull tests the OrWhereNotNull method
+func TestOrWhereNotNull(t *testing.T) {
+	m := New[TestModel]().Where("name", "John").OrWhereNotNull("verified_at")
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "OR verified_at IS NOT NULL") {
+		t.Errorf("expected query to contain 'OR verified_at IS NOT NULL', got %q", query)
 	}
 }
