@@ -254,7 +254,6 @@ func (m *Model[T]) Having(query string, args ...any) *Model[T] {
 		for _, op := range operators {
 			if strings.HasSuffix(upper, op) {
 				hasOperator = true
-				break
 			}
 		}
 		if hasOperator {
@@ -641,25 +640,29 @@ func (m *Model[T]) Print() (string, []any) {
 
 // rebind replaces ? placeholders with $1, $2, etc.
 func rebind(query string) string {
-	var sb strings.Builder
-	// Pre-allocate assuming similar length
-	sb.Grow(len(query))
+	sb := GetStringBuilder()
+	defer PutStringBuilder(sb)
+
+	// Pre-allocate assuming similar length plus some extra for placeholders
+	sb.Grow(len(query) + 16)
 
 	questionMarkCount := 0
 	inQuote := false
 
-	for _, char := range query {
-		if char == '\'' {
+	// ... existing loop ...
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+		if c == '\'' {
 			inQuote = !inQuote
 		}
 
-		if char == '?' && !inQuote {
+		if c == '?' && !inQuote {
 			questionMarkCount++
-			sb.WriteString("$")
+			sb.WriteByte('$')
 			sb.WriteString(strconv.Itoa(questionMarkCount))
 		} else {
-			sb.WriteRune(char)
+			sb.WriteByte(c)
 		}
 	}
-	return sb.String()
+	return strings.Clone(sb.String())
 }

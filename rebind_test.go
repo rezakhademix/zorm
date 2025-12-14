@@ -44,3 +44,11 @@ func TestRebind(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkRebind(b *testing.B) {
+	query := "SELECT * FROM users WHERE name = ? AND age > ? AND status = ? AND created_at < ?"
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = rebind(query)
+	}
+}

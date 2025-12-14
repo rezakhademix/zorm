@@ -527,7 +527,7 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	allArgs = append(allArgs, cteArgs...)
 	allArgs = append(allArgs, m.args...)
 
-	return sb.String(), allArgs
+	return strings.Clone(sb.String()), allArgs
 }
 
 // buildWithClause constructs the WITH clause for CTEs.
