@@ -371,32 +371,24 @@ type PaginationResult[T any] struct {
 }
 
 // Paginate executes the query with pagination.
+// If page is less than 1, it defaults to 1.
+// If perPage is less than 1, it defaults to 15.
 func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
-	// 1. Count total
-	// We need to clone the model to count without limit/offset?
-	// Or just count current query ignoring limit/offset (which are not set yet usually).
-	// But if user set OrderBy, Count() might fail in some DBs if strictly enforced? No, usually fine.
-
-	// We need a separate count query.
-	// Ideally, we clone the builder.
-	// For now, let's assume Count() handles it or we do it manually.
-
-	// Simple approach: Count() then Get().
-	// But Count() executes.
-
-	// We need to temporarily remove select columns for count?
-	// m.Count() does `SELECT COUNT(*)`.
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
 
 	total, err := m.Count(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Apply Limit/Offset
 	offset := (page - 1) * perPage
 	m.Limit(perPage).Offset(offset)
 
-	// 3. Get Data
 	data, err := m.Get(ctx)
 	if err != nil {
 		return nil, err
@@ -405,6 +397,10 @@ func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*Pagination
 	lastPage := int(total) / perPage
 	if int(total)%perPage != 0 {
 		lastPage++
+	}
+
+	if lastPage == 0 {
+		lastPage = 1
 	}
 
 	return &PaginationResult[T]{
@@ -419,7 +415,16 @@ func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*Pagination
 // SimplePaginate executes the query with pagination but skips the count query.
 // Use this when you don't need the total count (e.g., "Load More" buttons).
 // This is ~2x faster than Paginate() since it only runs 1 query.
+// If page is less than 1, it defaults to 1.
+// If perPage is less than 1, it defaults to 15.
 func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 15
+	}
+
 	offset := (page - 1) * perPage
 	m.Limit(perPage).Offset(offset)
 
@@ -433,7 +438,7 @@ func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*Pagi
 		Total:       -1, // -1 indicates count was skipped
 		PerPage:     perPage,
 		CurrentPage: page,
-		LastPage:    -1, // Unknown without total
+		LastPage:    -1, // indicates total was skipped
 	}, nil
 }
 
