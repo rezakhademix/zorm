@@ -470,6 +470,9 @@ func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 
 	// 2. Determine foreign key
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		// Default: parent_table_id (e.g., user_id)
@@ -481,12 +484,22 @@ func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
 
+	// Extract Table Override
+	var relTable string
+	if overrider, ok := relConfig.(TableOverrider); ok {
+		relTable = overrider.GetOverrideTable()
+	}
+	tableName := relatedInfo.TableName
+	if relTable != "" {
+		tableName = relTable
+	}
+
 	// 4. Build EXISTS subquery
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("EXISTS (SELECT 1 FROM %s WHERE %s.%s = %s.%s",
-		relatedInfo.TableName,
-		relatedInfo.TableName, foreignKey,
-		m.modelInfo.TableName, m.modelInfo.PrimaryKey,
+		tableName,
+		tableName, foreignKey,
+		m.TableName(), m.modelInfo.PrimaryKey,
 	))
 
 	// 5. Apply additional constraints from callback

@@ -345,3 +345,46 @@ func TestMultipleScopeChaining(t *testing.T) {
 		t.Errorf("expected 2 args, got %d", len(args))
 	}
 }
+
+// Test Models for Relation Table Override
+type WithTableRelated struct {
+	ID       int
+	ParentID int
+}
+
+type WithTableRelation struct {
+	ID int
+}
+
+// Relations
+func (m WithTableRelation) CustomTableRel() *HasMany[WithTableRelated] {
+	return &HasMany[WithTableRelated]{
+		ForeignKey: "ParentID",
+		Table:      "custom_table_name",
+	}
+}
+
+// TestWhereHas_TableOverride tests that WhereHas uses the custom table name
+func TestWhereHas_TableOverride(t *testing.T) {
+	m := New[WithTableRelation]()
+
+	// WhereHas with custom table
+	m.WhereHas("CustomTableRel", nil)
+
+	wheres := m.GetWheres()
+	found := false
+	for _, w := range wheres {
+		if strings.Contains(w, "custom_table_name") {
+			found = true
+			break
+		}
+	}
+
+	// Also check that it generates valid SQL structure
+	// EXISTS (SELECT 1 FROM custom_table_name WHERE custom_table_name.ParentID = with_table_relations.id
+	if !found {
+		t.Errorf("WhereHas should use custom table name 'custom_table_name', got clauses: %v", wheres)
+	}
+
+	t.Log("WhereHas correctly uses custom table name from relation definition")
+}

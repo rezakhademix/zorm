@@ -32,6 +32,9 @@ type Model[T any] struct {
 	tx        *sql.Tx
 	modelInfo *ModelInfo
 
+	// Custom Table Name
+	tableName string
+
 	// Query Builder State
 	columns           []string
 	wheres            []string
@@ -92,6 +95,7 @@ func (m *Model[T]) Clone() *Model[T] {
 		db:        m.db,
 		tx:        m.tx,
 		modelInfo: m.modelInfo,
+		tableName: m.tableName,
 		distinct:  m.distinct,
 		limit:     m.limit,
 		offset:    m.offset,
@@ -165,8 +169,21 @@ func (m *Model[T]) WithContext(ctx context.Context) *Model[T] {
 	return m
 }
 
+// Table sets a custom table name for the query.
+// This overrides the table name derived from the struct type.
+func (m *Model[T]) Table(name string) *Model[T] {
+	m.tableName = name
+	return m
+}
+
 // TableName returns the table name for the model.
+// If a custom table name is set via Table(), it returns that.
+// Otherwise, it returns the table name from the model info.
 func (m *Model[T]) TableName() string {
+	if m.tableName != "" {
+		return m.tableName
+	}
+
 	return m.modelInfo.TableName
 }
 
