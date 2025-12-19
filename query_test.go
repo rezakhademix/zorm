@@ -643,3 +643,13 @@ func TestOrWhereNotNull(t *testing.T) {
 		t.Errorf("expected query to contain 'OR verified_at IS NOT NULL', got %q", query)
 	}
 }
+
+// TestTable_Override tests the Table method for custom table name
+func TestTable_Override(t *testing.T) {
+	m := New[TestModel]().Table("custom_users")
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "FROM custom_users") {
+		t.Errorf("expected query to contain 'FROM custom_users', got %q", query)
+	}
+}

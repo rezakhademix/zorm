@@ -49,18 +49,21 @@ type RelationDefinition struct {
 type HasOne[T any] struct {
 	ForeignKey string
 	LocalKey   string
+	Table      string
 }
 
 // HasMany defines a HasMany relation.
 type HasMany[T any] struct {
 	ForeignKey string
 	LocalKey   string
+	Table      string
 }
 
 // BelongsTo defines a BelongsTo relation.
 type BelongsTo[T any] struct {
 	ForeignKey string
 	OwnerKey   string
+	Table      string
 }
 
 // BelongsToMany defines a BelongsToMany relation.
@@ -70,6 +73,7 @@ type BelongsToMany[T any] struct {
 	RelatedKey string
 	LocalKey   string
 	RelatedPK  string
+	Table      string
 }
 
 // MorphTo defines a polymorphic BelongsTo relation.
@@ -86,14 +90,16 @@ type MorphTo[T any] struct {
 
 // MorphOne defines a polymorphic HasOne relation.
 type MorphOne[T any] struct {
-	Type string // Column name in related table (e.g. imageable_type)
-	ID   string // Column name in related table (e.g. imageable_id)
+	Type  string // Column name in related table (e.g. imageable_type)
+	ID    string // Column name in related table (e.g. imageable_id)
+	Table string
 }
 
 // MorphMany defines a polymorphic HasMany relation.
 type MorphMany[T any] struct {
-	Type string // Column name in related table (e.g. imageable_type)
-	ID   string // Column name in related table (e.g. imageable_id)
+	Type  string // Column name in related table (e.g. imageable_type)
+	ID    string // Column name in related table (e.g. imageable_id)
+	Table string
 }
 
 // Relation interface allows us to handle generics uniformly.
@@ -139,6 +145,17 @@ func (MorphOne[T]) NewRelated() any            { return new(T) }
 
 func (MorphMany[T]) RelationType() RelationType { return RelationMorphMany }
 func (MorphMany[T]) NewRelated() any            { return new(T) }
+
+// TableOverrider interface allows relations to specify a custom table name.
+type TableOverrider interface {
+	GetOverrideTable() string
+}
+
+func (r HasOne[T]) GetOverrideTable() string    { return r.Table }
+func (r HasMany[T]) GetOverrideTable() string   { return r.Table }
+func (r BelongsTo[T]) GetOverrideTable() string { return r.Table }
+func (r MorphOne[T]) GetOverrideTable() string  { return r.Table }
+func (r MorphMany[T]) GetOverrideTable() string { return r.Table }
 
 // Load eager loads relations on a single entity.
 func (m *Model[T]) Load(ctx context.Context, entity *T, relations ...string) error {
@@ -481,13 +498,19 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 
 	// 3. Build Query
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
 	}
 
+	// Extract Table Name
+	relTable := valConfig.FieldByName("Table").String()
+
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols, relTable)
 	if err != nil {
 		return err
 	}
@@ -543,6 +566,9 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
 	// 1. Get FKs from results (Parent.ForeignKey)
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(relName) + "_id"
@@ -617,8 +643,11 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		ownerKey = relatedInfo.PrimaryKey
 	}
 
+	// Extract Table Name
+	relTable := valConfig.FieldByName("Table").String()
+
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable)
 	if err != nil {
 		return err
 	}
@@ -662,7 +691,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 }
 
 // loadRelationQuery executes a SELECT * FROM table WHERE key IN (ids)
-func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string) ([]any, error) {
+func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string, tableName string) ([]any, error) {
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	if cols != "" {
@@ -671,7 +700,11 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 		sb.WriteString("*")
 	}
 	sb.WriteString(" FROM ")
-	sb.WriteString(relatedInfo.TableName)
+	if tableName != "" {
+		sb.WriteString(tableName)
+	} else {
+		sb.WriteString(relatedInfo.TableName)
+	}
 	sb.WriteString(" WHERE ")
 	sb.WriteString(key)
 	sb.WriteString(" IN (")
@@ -729,6 +762,9 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 
 	// 3. Build Query
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	typeColumn := valConfig.FieldByName("Type").String()
 	idColumn := valConfig.FieldByName("ID").String()
 
@@ -740,6 +776,13 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	// We use the struct name of T
 	parentType := m.modelInfo.Type.Name()
 
+	// Extract Table Name
+	relTable := valConfig.FieldByName("Table").String()
+	tableName := relatedInfo.TableName
+	if relTable != "" {
+		tableName = relTable
+	}
+
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	if cols != "" {
@@ -748,7 +791,7 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 		sb.WriteString("*")
 	}
 	sb.WriteString(" FROM ")
-	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(tableName)
 	sb.WriteString(" WHERE ")
 	sb.WriteString(typeColumn)
 	sb.WriteString(" = ? AND ")
@@ -1026,6 +1069,9 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 
 	// Check if it's a BelongsToMany struct
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
 		return WrapRelationError(relation, fmt.Sprintf("%T", t), ErrInvalidRelation)
 	}
@@ -1124,6 +1170,9 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	relConfig := retVals[0].Interface()
 
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	if valConfig.Type().Name() != "BelongsToMany" {
 		// Strict check might fail if package name included? "zorm.BelongsToMany"
 		if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
@@ -1191,6 +1240,9 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	relConfig := retVals[0].Interface()
 
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	if !strings.Contains(valConfig.Type().String(), "BelongsToMany") {
 		return fmt.Errorf("relation %s is not BelongsToMany", relation)
 	}
