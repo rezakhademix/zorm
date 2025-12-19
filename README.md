@@ -1,3 +1,7 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/rezakhademix/zorm.svg)](https://pkg.go.dev/github.com/rezakhademix/zorm) [![Go Report Card](https://goreportcard.com/badge/github.com/rezakhademix/zorm)](https://goreportcard.com/report/github.com/rezakhademix/zorm) [![codecov](https://codecov.io/gh/rezakhademix/zorm/graph/badge.svg?token=BDWNVIC670)](https://codecov.io/gh/rezakhademix/zorm) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+
+
 <div align="center">
   <h1>Z-ORM</h1>
   <p><strong>A Type-Safe, Production Ready Go ORM</strong></p>
