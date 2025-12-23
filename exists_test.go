@@ -2,7 +2,10 @@ package zorm
 
 import (
 	"context"
+	"database/sql"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // TestExists_Signature verifies that Exists method exists and returns the correct type.
@@ -46,5 +49,57 @@ func TestExists_QueryLogic(t *testing.T) {
 	expected := "SELECT 1 FROM test_models WHERE 1=1  AND id = ? LIMIT 1"
 	if query != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
+	}
+}
+
+// TestExists_Execution verifies Exists works against a real DB (sqlite in-memory).
+func TestExists_Execution(t *testing.T) {
+	// Initialize in-memory DB
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Create table
+	_, err = db.Exec(`
+		CREATE TABLE test_models (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			user_age INTEGER,
+			embedded_field TEXT
+		)
+	`)
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	// Insert data
+	_, err = db.Exec(`INSERT INTO test_models (id, name, user_age) VALUES (1, 'Alice', 30)`)
+	if err != nil {
+		t.Fatalf("failed to insert data: %v", err)
+	}
+
+	// Setup zorm global DB (or use instance)
+	// We'll use a specific instance to avoid messing with global state if other tests run in parallel
+	m := New[TestModel]()
+	m.SetDB(db)
+
+	// Test case 1: Record exists
+	exists, err := m.Where("id", 1).Exists(context.Background())
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if !exists {
+		t.Error("expected exists to be true for id 1")
+	}
+
+	// Test case 2: Record does not exist
+	exists, err = New[TestModel]().SetDB(db).Where("id", 999).Exists(context.Background())
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if exists {
+		t.Error("expected exists to be false for id 999")
 	}
 }
