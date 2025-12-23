@@ -316,6 +316,60 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// Exists checks if any record matches the query conditions.
+// It uses "SELECT 1 FROM table WHERE conditions LIMIT 1" for efficiency.
+func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
+	// Backup limit/offset/order
+	limit, offset := m.limit, m.offset
+	orderBys := m.orderBys
+
+	// Set limit 1 and reset offset/order for efficiency
+	m.limit = 1
+	m.offset = 0
+	m.orderBys = nil
+
+	tableName := m.TableName()
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
+	sb.WriteString("SELECT 1 FROM ")
+	sb.WriteString(tableName)
+
+	m.buildWhereClause(&sb)
+	sb.WriteString(" LIMIT 1")
+
+	query := sb.String()
+	args := append(cteArgs, m.args...)
+
+	// Restore state
+	m.limit, m.offset = limit, offset
+	m.orderBys = orderBys
+
+	var exists int
+	var err error
+
+	// Use prepared statement if caching is enabled
+	if m.stmtCache != nil {
+		var stmt *sql.Stmt
+		stmt, err = m.prepareStmt(ctx, rebind(query))
+		if err != nil {
+			return false, WrapQueryError("PREPARE", query, args, err)
+		}
+		err = stmt.QueryRowContext(ctx, args...).Scan(&exists)
+	} else {
+		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&exists)
+	}
+
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, WrapQueryError("EXISTS", query, args, err)
+	}
+
+	return true, nil
+}
+
 // Sum calculates the sum of a column.
 // Returns 0 if no rows match or the sum is null.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
