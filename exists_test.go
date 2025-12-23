@@ -103,3 +103,78 @@ func TestExists_Execution(t *testing.T) {
 		t.Error("expected exists to be false for id 999")
 	}
 }
+
+// TestExists_StmtCache verifies Exists works with statement caching enabled.
+func TestExists_StmtCache(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE test_models (id INTEGER PRIMARY KEY)")
+	if err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	_, err = db.Exec("INSERT INTO test_models (id) VALUES (1)")
+	if err != nil {
+		t.Fatalf("failed to insert data: %v", err)
+	}
+
+	// Create model with stmt cache
+	cache := NewStmtCache(10)
+	defer cache.Close()
+
+	m := New[TestModel]().SetDB(db).WithStmtCache(cache)
+
+	// First run (cache miss -> prepare -> exec)
+	exists, err := m.Where("id", 1).Exists(context.Background())
+	if err != nil {
+		t.Errorf("expected no error on first run, got %v", err)
+	}
+	if !exists {
+		t.Error("expected exists to be true")
+	}
+
+	// Verify it's in cache (though we can't inspect cache easily without locking, we trust the code path if no error)
+
+	// Second run (cache hit -> exec)
+	exists, err = m.Where("id", 1).Exists(context.Background())
+	if err != nil {
+		t.Errorf("expected no error on second run, got %v", err)
+	}
+	if !exists {
+		t.Error("expected exists to be true")
+	}
+}
+
+// TestExists_Error verifies proper error handling.
+func TestExists_Error(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	// Close early to trigger execution error
+	db.Close()
+
+	m := New[TestModel]().SetDB(db)
+
+	_, err = m.Where("id", 1).Exists(context.Background())
+	if err == nil {
+		t.Error("expected error due to closed db, got nil")
+	}
+
+	// Test with cache enabled and closed DB (covers Prepare error path)
+	// Re-open DB to get a fresh closed state properly or just reuse broken one if safe?
+	// The DB is already closed, so reuse is fine for generating errors.
+
+	cache := NewStmtCache(10)
+	defer cache.Close()
+	mWithCache := New[TestModel]().SetDB(db).WithStmtCache(cache)
+
+	_, err = mWithCache.Where("id", 1).Exists(context.Background())
+	if err == nil {
+		t.Error("expected error with cache enabled due to closed db, got nil")
+	}
+}
