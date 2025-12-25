@@ -9,8 +9,16 @@ import (
 )
 
 // Select specifies which columns to select.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) Select(columns ...string) *Model[T] {
-	m.columns = append(m.columns, columns...)
+	for _, col := range columns {
+		if err := ValidateColumnName(col); err != nil {
+			// In strict mode, we could return an error
+			// For now, skip invalid columns to maintain API compatibility
+			continue
+		}
+		m.columns = append(m.columns, col)
+	}
 	return m
 }
 
@@ -245,31 +253,56 @@ func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) erro
 }
 
 // WhereIn adds a WHERE IN clause.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	if len(args) == 0 {
 		// Optimization: 1=0 to return nothing
 		m.wheres = append(m.wheres, "AND 1=0")
 		return m
 	}
-	placeholders := make([]string, len(args))
+	// Optimized placeholder building using strings.Builder
+	var sb strings.Builder
+	sb.WriteString(column)
+	sb.WriteString(" IN (")
 	for i := range args {
-		placeholders[i] = "?"
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('?')
 	}
-	query := fmt.Sprintf("%s IN (%s)", column, strings.Join(placeholders, ", "))
-	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", query))
+	sb.WriteByte(')')
+	m.wheres = append(m.wheres, "AND "+sb.String())
 	m.args = append(m.args, args...)
 	return m
 }
 
 // OrderBy adds an ORDER BY clause.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
-	m.orderBys = append(m.orderBys, fmt.Sprintf("%s %s", column, direction))
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
+	// Validate direction is only ASC or DESC
+	dir := strings.ToUpper(strings.TrimSpace(direction))
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC" // Default to ASC if invalid
+	}
+	m.orderBys = append(m.orderBys, fmt.Sprintf("%s %s", column, dir))
 	return m
 }
 
 // GroupBy adds a GROUP BY clause.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
-	m.groupBys = append(m.groupBys, columns...)
+	for _, col := range columns {
+		if err := ValidateColumnName(col); err != nil {
+			continue // Skip invalid column names
+		}
+		m.groupBys = append(m.groupBys, col)
+	}
 	return m
 }
 

@@ -866,25 +866,34 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 // scanRowsDynamic scans rows into a slice of pointers to structs defined by modelInfo.
 // This is used for loading relations with different model types than T.
 // It dynamically creates instances based on the provided ModelInfo.
+// Optimized to cache field mapping and reuse destination slices.
 func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
 
-	var results []any
+	// Pre-calculate field mapping once (similar to scanRows)
+	fields := make([]*FieldInfo, len(columns))
+	for i, colName := range columns {
+		fields[i] = modelInfo.Columns[colName]
+	}
+
+	// Pre-allocate results with reasonable capacity
+	results := make([]any, 0, 64)
+
+	// Reusable destination slice - content will be overwritten each row
+	dest := make([]any, len(columns))
 
 	for rows.Next() {
 		// Create new instance of the struct type
 		val := reflect.New(modelInfo.Type) // *User
 		elem := val.Elem()                 // User
 
-		// Prepare destinations - need inline version since this uses different modelInfo
-		dest := make([]any, len(columns))
-		for i, colName := range columns {
-			if fieldInfo, ok := modelInfo.Columns[colName]; ok {
-				fieldVal := elem.FieldByName(fieldInfo.Name)
-				dest[i] = fieldVal.Addr().Interface()
+		// Fill scan destinations using cached field mapping
+		for i, f := range fields {
+			if f != nil {
+				dest[i] = elem.FieldByIndex(f.Index).Addr().Interface()
 			} else {
 				var ignore any
 				dest[i] = &ignore
@@ -897,8 +906,6 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 
 		results = append(results, val.Interface())
 	}
-
-	// Load Accessors
 
 	return results, rows.Err()
 }
@@ -1162,7 +1169,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" (")
 	sb.WriteString(strings.Join(columns, ", "))
 	sb.WriteString(") VALUES ")
@@ -1241,7 +1248,7 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	cteArgs := m.buildWithClause(&sb)
 
 	sb.WriteString("UPDATE ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 
