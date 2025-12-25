@@ -483,14 +483,57 @@ func (m *Model[T]) WhereHas(relation string, callback any) *Model[T] {
 func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 	// 1. Get relation configuration
 	var t T
-	methodVal := reflect.ValueOf(t).MethodByName(relation)
+	modelType := reflect.TypeOf(t)
+	ptrType := reflect.PointerTo(modelType)
+
+	// Try finding method on ptrType or modelType
+	method, ok := ptrType.MethodByName(relation)
+	if !ok {
+		method, ok = modelType.MethodByName(relation)
+		if !ok {
+			// Try with "Relation" suffix
+			method, ok = ptrType.MethodByName(relation + "Relation")
+			if !ok {
+				method, ok = modelType.MethodByName(relation + "Relation")
+				if !ok {
+					return m // Relation method not found
+				}
+			}
+		}
+	}
+
+	// For whereHasInternal, we need to call the method.
+	// We use the zero value of the model.
+	res0 := reflect.ValueOf(t)
+	// If method is on pointer and res0 is not, we might need a pointer.
+	// But reflect.Value.MethodByName handles this if we use a pointer value.
+	ptrValue := reflect.New(modelType)
+	var methodVal reflect.Value
+	if method.Type.NumIn() > 0 && method.Type.In(0).Kind() == reflect.Pointer {
+		methodVal = ptrValue.MethodByName(method.Name)
+	} else {
+		methodVal = res0.MethodByName(method.Name)
+	}
+
 	if !methodVal.IsValid() {
-		// Silently skip if relation method doesn't exist
-		// Could log or return error in strict mode
+		// Fallback: try calling via method.Func with receiver
+		if method.Type.NumIn() > 0 {
+			if method.Type.In(0).Kind() == reflect.Pointer {
+				retVals := method.Func.Call([]reflect.Value{ptrValue})
+				return m.applyWhereHas(retVals, subQuery)
+			} else {
+				retVals := method.Func.Call([]reflect.Value{res0})
+				return m.applyWhereHas(retVals, subQuery)
+			}
+		}
 		return m
 	}
 
 	retVals := methodVal.Call(nil)
+	return m.applyWhereHas(retVals, subQuery)
+}
+
+func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T] {
 	if len(retVals) == 0 {
 		return m
 	}
@@ -537,8 +580,25 @@ func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 
 	// 5. Apply additional constraints from callback
 	if subQuery != nil {
-		if wheres, args := extractQueryConstraints(subQuery); len(wheres) > 0 {
-			for _, w := range wheres {
+		var constraints []string
+		var args []any
+
+		// Check if it's a function
+		fnVal := reflect.ValueOf(subQuery)
+		if fnVal.Kind() == reflect.Func {
+			// Create a new model for the related type
+			relatedModel := rel.NewModel(m.db, m.ctx)
+			if relatedModel != nil {
+				fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
+				// Extract constraints from the populated model
+				constraints, args = extractQueryConstraints(relatedModel)
+			}
+		} else {
+			constraints, args = extractQueryConstraints(subQuery)
+		}
+
+		if len(constraints) > 0 {
+			for _, w := range constraints {
 				sb.WriteString(" ")
 				sb.WriteString(w)
 			}

@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -478,7 +479,7 @@ func IsConnectionError(err error) bool {
 
 // IsTimeout checks if the error is a timeout error.
 func IsTimeout(err error) bool {
-	return errors.Is(err, ErrTimeout)
+	return errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // IsSchemaError checks if the error is a schema-related error.

@@ -150,3 +150,24 @@ func TestModel_Transaction(t *testing.T) {
 		t.Error("expected rollback")
 	}
 }
+
+func TestModel_WithTx(t *testing.T) {
+	// Use existing mock logic
+	db, _ := sql.Open("mock", "")
+
+	m := New[struct{}]()
+	m.SetDB(db)
+
+	innerTx, _ := db.Begin()
+	ctx := context.Background()
+	zTx := &Tx{Tx: innerTx, ctx: ctx}
+
+	m.WithTx(zTx)
+
+	if m.tx != zTx.Tx {
+		t.Error("WithTx failed to set transaction")
+	}
+	if m.ctx != zTx.ctx {
+		t.Error("WithTx failed to set context")
+	}
+}

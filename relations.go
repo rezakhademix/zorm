@@ -2,6 +2,7 @@ package zorm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"strings"
@@ -106,19 +107,44 @@ type MorphMany[T any] struct {
 type Relation interface {
 	RelationType() RelationType
 	NewRelated() any
+	NewModel(db *sql.DB, ctx context.Context) any
 }
 
 func (HasOne[T]) RelationType() RelationType { return RelationHasOne }
 func (HasOne[T]) NewRelated() any            { return new(T) }
+func (HasOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 func (HasMany[T]) RelationType() RelationType { return RelationHasMany }
 func (HasMany[T]) NewRelated() any            { return new(T) }
+func (HasMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 func (BelongsTo[T]) RelationType() RelationType { return RelationBelongsTo }
 func (BelongsTo[T]) NewRelated() any            { return new(T) }
+func (BelongsTo[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 func (BelongsToMany[T]) RelationType() RelationType { return RelationBelongsToMany }
 func (BelongsToMany[T]) NewRelated() any            { return new(T) }
+func (BelongsToMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 const (
 	// RelationMorphTo represents a polymorphic inverse relationship where the
@@ -137,14 +163,27 @@ const (
 	RelationMorphMany RelationType = "MorphMany"
 )
 
-func (MorphTo[T]) RelationType() RelationType { return RelationMorphTo }
-func (MorphTo[T]) NewRelated() any            { return nil } // Dynamic
+func (MorphTo[T]) RelationType() RelationType                   { return RelationMorphTo }
+func (MorphTo[T]) NewRelated() any                              { return nil } // Dynamic
+func (MorphTo[T]) NewModel(db *sql.DB, ctx context.Context) any { return nil }
 
 func (MorphOne[T]) RelationType() RelationType { return RelationMorphOne }
 func (MorphOne[T]) NewRelated() any            { return new(T) }
+func (MorphOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 func (MorphMany[T]) RelationType() RelationType { return RelationMorphMany }
 func (MorphMany[T]) NewRelated() any            { return new(T) }
+func (MorphMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+	m := New[T]()
+	m.db = db
+	m.ctx = ctx
+	return m
+}
 
 // TableOverrider interface allows relations to specify a custom table name.
 type TableOverrider interface {
@@ -282,6 +321,10 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 				}
 			case RelationMorphMany:
 				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, false); err != nil {
+					return err
+				}
+			case RelationBelongsToMany:
+				if err := m.loadBelongsToMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
 					return err
 				}
 			}
@@ -555,6 +598,191 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 					}
 				}
 
+				relField.Set(slice)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+	// 1. Get Relation Config
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
+
+	pivotTable := valConfig.FieldByName("PivotTable").String()
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	relatedKey := valConfig.FieldByName("RelatedKey").String()
+	localKey := valConfig.FieldByName("LocalKey").String()
+	relatedPK := valConfig.FieldByName("RelatedPK").String()
+
+	if pivotTable == "" {
+		return fmt.Errorf("BelongsToMany requires PivotTable")
+	}
+
+	// 2. Get IDs from results
+	ids := make([]any, len(results))
+	pkField := m.modelInfo.PrimaryKey
+
+	// Determine Local Key
+	localKeyField := pkField
+	if localKey != "" {
+		if field, ok := m.modelInfo.Columns[localKey]; ok {
+			localKeyField = field.Name
+		} else {
+			localKeyField = localKey // Assume it's a struct field name
+		}
+	} else {
+		if field, ok := m.modelInfo.Columns[pkField]; ok {
+			localKeyField = field.Name
+		}
+	}
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		fVal := val.FieldByName(localKeyField)
+		if fVal.IsValid() {
+			ids[i] = fVal.Interface()
+		} else {
+			ids[i] = nil
+		}
+	}
+
+	// Default keys
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+	if relatedKey == "" {
+		// We need to know the related model type name
+		// We can get it from relConfig (BelongsToMany[R])
+		rel, _ := relConfig.(Relation)
+		relatedPtr := rel.NewRelated()
+		relatedType := reflect.TypeOf(relatedPtr).Elem()
+		relatedKey = ToSnakeCase(relatedType.Name()) + "_id"
+	}
+
+	// 3. Query Pivot Table to get Related IDs
+	// SELECT foreign_key, related_key FROM pivot_table WHERE foreign_key IN (...)
+	var pivotSb strings.Builder
+	pivotSb.WriteString("SELECT ")
+	pivotSb.WriteString(foreignKey)
+	pivotSb.WriteString(", ")
+	pivotSb.WriteString(relatedKey)
+	pivotSb.WriteString(" FROM ")
+	pivotSb.WriteString(pivotTable)
+	pivotSb.WriteString(" WHERE ")
+	pivotSb.WriteString(foreignKey)
+	pivotSb.WriteString(" IN (")
+
+	args := make([]any, len(ids))
+	placeholders := make([]string, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	pivotSb.WriteString(strings.Join(placeholders, ","))
+	pivotSb.WriteString(")")
+
+	rows, err := m.queryer().QueryContext(ctx, rebind(pivotSb.String()), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// Map: ForeignID -> []RelatedID
+	pivotMap := make(map[any][]any)
+	allRelatedIDs := make([]any, 0)
+	relatedIDSet := make(map[any]bool)
+
+	for rows.Next() {
+		var fID, rID any
+		if err := rows.Scan(&fID, &rID); err != nil {
+			return err
+		}
+		pivotMap[fID] = append(pivotMap[fID], rID)
+		if !relatedIDSet[rID] {
+			relatedIDSet[rID] = true
+			allRelatedIDs = append(allRelatedIDs, rID)
+		}
+	}
+
+	if len(allRelatedIDs) == 0 {
+		return nil
+	}
+
+	// 4. Query Related Model
+	rel, _ := relConfig.(Relation)
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	// Determine JOIN Key in Related Model (usually PK)
+	joinKey := relatedPK
+	if joinKey == "" {
+		joinKey = relatedInfo.PrimaryKey
+	}
+
+	// Extract Table Name if overriden
+	relTable := valConfig.FieldByName("Table").String()
+
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable)
+	if err != nil {
+		return err
+	}
+
+	// 5. Recursive Load
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	// 6. Map back to parents
+	// Map: RelatedID -> RelatedInstance
+	relatedIdxMap := make(map[any]reflect.Value)
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		rID := val.FieldByName(relatedInfo.Columns[joinKey].Name).Interface()
+		relatedIdxMap[rID] = reflect.ValueOf(res)
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+
+		// Find in pivotMap using compareIDs for robustness
+		var children []reflect.Value
+		for fID, rIDs := range pivotMap {
+			if compareIDs(fID, parentID) {
+				for _, rID := range rIDs {
+					// Find in relatedIdxMap using compareIDs
+					for relID, child := range relatedIdxMap {
+						if compareIDs(relID, rID) {
+							children = append(children, child)
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+
+		if len(children) > 0 {
+			relField := parentVal.FieldByName(relName)
+			if relField.IsValid() && relField.CanSet() {
+				sliceType := relField.Type()
+				slice := reflect.MakeSlice(sliceType, 0, len(children))
+
+				for _, child := range children {
+					if sliceType.Elem().Kind() == reflect.Pointer {
+						slice = reflect.Append(slice, child)
+					} else {
+						slice = reflect.Append(slice, child.Elem())
+					}
+				}
 				relField.Set(slice)
 			}
 		}
@@ -929,7 +1157,14 @@ func (m *Model[T]) loadRelationsDynamic(ctx context.Context, results []any, mode
 		if !ok {
 			method, ok = modelType.MethodByName(relName)
 			if !ok {
-				return fmt.Errorf("relation method %s not found on %v", relName, modelType)
+				// Try with "Relation" suffix
+				method, ok = ptrType.MethodByName(relName + "Relation")
+				if !ok {
+					method, ok = modelType.MethodByName(relName + "Relation")
+					if !ok {
+						return fmt.Errorf("relation method %s not found on %v", relName, modelType)
+					}
+				}
 			}
 		}
 
