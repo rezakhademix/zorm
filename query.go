@@ -110,6 +110,9 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	// 2. Handle Map
 	if conditionMap, ok := query.(map[string]any); ok {
 		for k, v := range conditionMap {
+			if err := ValidateColumnName(k); err != nil {
+				continue
+			}
 			m.wheres = append(m.wheres, typ+" "+k+" = ?")
 			m.args = append(m.args, v)
 		}
@@ -132,8 +135,11 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		for _, field := range info.Fields {
 			fVal := val.FieldByName(field.Name)
 			if !fVal.IsZero() {
+				if err := ValidateColumnName(field.Column); err != nil {
+					continue
+				}
 				m.wheres = append(m.wheres, typ+" "+field.Column+" = ?")
-				m.args = append(m.args, fVal.Interface())
+				m.args = append(m.args, val.FieldByIndex(field.Index).Interface())
 			}
 		}
 		return m
