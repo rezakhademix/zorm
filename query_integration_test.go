@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -143,5 +144,47 @@ func TestQuery_WhereHas_Execution(t *testing.T) {
 
 	if len(users) != 0 {
 		t.Errorf("expected 0 users with Post 'Other', got %d", len(users))
+	}
+}
+func TestQuery_Security(t *testing.T) {
+	db := setupQueryDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	// Malicious key in UpdateMany
+	err := New[QUser]().SetDB(db).UpdateMany(ctx, map[string]any{
+		"name = 'hacked'; --": "malicious",
+	})
+	if err == nil {
+		t.Error("expected error for malicious key in UpdateMany")
+	}
+}
+
+func TestQuery_CreateMany_Batching(t *testing.T) {
+	db := setupQueryDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	// Create 505 users to trigger chunking (batchSize=500)
+	users := make([]*QUser, 505)
+	for i := 0; i < 505; i++ {
+		users[i] = &QUser{Name: fmt.Sprintf("User %d", i), Email: fmt.Sprintf("u%d@example.com", i)}
+	}
+
+	err := New[QUser]().SetDB(db).CreateMany(ctx, users)
+	if err != nil {
+		t.Fatalf("CreateMany batching failed: %v", err)
+	}
+
+	// Verify count
+	var count int64
+	_ = db.QueryRow("SELECT COUNT(*) FROM q_users").Scan(&count)
+	if count != 510 { // 5 initial + 505 new
+		t.Errorf("expected 510 users total, got %d", count)
+	}
+
+	// Verify ID hydration of last item
+	if users[504].ID == 0 {
+		t.Error("expected last user ID to be hydrated")
 	}
 }

@@ -581,7 +581,7 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	allArgs = append(allArgs, cteArgs...)
 	allArgs = append(allArgs, m.args...)
 
-	return strings.Clone(sb.String()), allArgs
+	return sb.String(), allArgs
 }
 
 // buildWithClause constructs the WITH clause for CTEs.
@@ -932,16 +932,16 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	val := reflect.ValueOf(entity).Elem()
 
 	for _, field := range m.modelInfo.Fields {
+		fVal := val.FieldByIndex(field.Index)
 		// Skip auto-increment primary key if zero
 		if field.IsPrimary && field.IsAuto {
-			fVal := val.FieldByName(field.Name)
 			if fVal.IsZero() {
 				continue
 			}
 		}
 
 		columns = append(columns, field.Column)
-		values = append(values, val.FieldByName(field.Name).Interface())
+		values = append(values, fVal.Interface())
 		placeholders = append(placeholders, "?")
 	}
 
@@ -958,7 +958,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		return fmt.Errorf("primary key field %s not found in model", m.modelInfo.PrimaryKey)
 	}
 
-	fVal := val.FieldByName(pkField.Name)
+	fVal := val.FieldByIndex(pkField.Index)
 	if !fVal.CanSet() {
 		return fmt.Errorf("cannot set primary key field %s", pkField.Name)
 	}
@@ -1027,7 +1027,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			continue
 		}
 		sets = append(sets, fmt.Sprintf("%s = ?", field.Column))
-		values = append(values, val.FieldByName(field.Name).Interface())
+		values = append(values, val.FieldByIndex(field.Index).Interface())
 	}
 
 	var sb strings.Builder
@@ -1041,7 +1041,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// If entity is passed, update that entity.
 	// So add WHERE id = entity.ID
 
-	pkVal := val.FieldByName(m.modelInfo.Columns[m.modelInfo.PrimaryKey].Name).Interface()
+	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	pkVal := val.FieldByIndex(pkField.Index).Interface()
 	sb.WriteString(fmt.Sprintf(" WHERE %s = ?", m.modelInfo.PrimaryKey))
 	values = append(values, pkVal)
 
@@ -1137,18 +1138,18 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	// We skip AutoIncrement PK if zero.
 
 	// Prepare columns list
-	var fieldsToInsert []string // Field names in struct
+	var fieldsToInsert [][]int // Field indices in struct
 
 	val0 := reflect.ValueOf(entities[0]).Elem()
 	for _, field := range m.modelInfo.Fields {
+		fVal := val0.FieldByIndex(field.Index)
 		if field.IsPrimary && field.IsAuto {
-			fVal := val0.FieldByName(field.Name)
 			if fVal.IsZero() {
 				continue
 			}
 		}
 		columns = append(columns, field.Column)
-		fieldsToInsert = append(fieldsToInsert, field.Name)
+		fieldsToInsert = append(fieldsToInsert, field.Index)
 		placeholders = append(placeholders, "?")
 	}
 
@@ -1167,6 +1168,54 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	// Given the ambiguity, I'm inserting the snippet as provided in the diff,
 	// which already conforms to the m.TableName() usage for the new part.
 
+	// Determine chunk size - Postgres supports up to 65535 placeholders,
+	// but common practice is to use smaller batches for performance/locks.
+	chunkSize := 500
+	if len(entities) <= chunkSize {
+		return m.createBatch(ctx, entities, columns, fieldsToInsert, placeholders)
+	}
+
+	// Use a transaction for multiple chunks to ensure atomicity
+	var tx *sql.Tx
+	var err error
+	if m.tx == nil {
+		tx, err = m.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+	}
+
+	// Execute in chunks
+	for i := 0; i < len(entities); i += chunkSize {
+		end := i + chunkSize
+		if end > len(entities) {
+			end = len(entities)
+		}
+
+		batch := entities[i:end]
+		// Create a clone with the transaction for this batch
+		batchModel := m.Clone()
+		if tx != nil {
+			batchModel.tx = tx
+		}
+
+		if err := batchModel.createBatch(ctx, batch, columns, fieldsToInsert, placeholders); err != nil {
+			return err
+		}
+	}
+
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// createBatch performs a single batch insert query.
+func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []string, fieldsToInsert [][]int, placeholders []string) error {
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(m.TableName())
@@ -1184,13 +1233,12 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		sb.WriteString(rowPlaceholder)
 
 		val := reflect.ValueOf(entity).Elem()
-		for _, fieldName := range fieldsToInsert {
-			args = append(args, val.FieldByName(fieldName).Interface())
+		for _, fieldIndex := range fieldsToInsert {
+			args = append(args, val.FieldByIndex(fieldIndex).Interface())
 		}
 	}
 
 	// RETURNING ID?
-	// Postgres supports returning IDs for multiple rows.
 	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
 
 	query := sb.String()
@@ -1201,26 +1249,25 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	defer rows.Close()
 
 	// Scan IDs back
-	i := 0
+	idx := 0
 	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 
 	for rows.Next() {
-		if i >= len(entities) {
+		if idx >= len(entities) {
 			break
 		}
-		entity := entities[i]
+		entity := entities[idx]
 		val := reflect.ValueOf(entity).Elem()
-		fVal := val.FieldByName(pkField.Name)
+		fVal := val.FieldByIndex(pkField.Index)
 
 		if fVal.CanSet() {
 			if err := rows.Scan(fVal.Addr().Interface()); err != nil {
 				return err
 			}
 		}
-		i++
+		idx++
 	}
-
-	return nil
+	return rows.Err()
 }
 
 // UpdateMany updates records matching the query with values.
@@ -1240,6 +1287,9 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	var setArgs []any
 
 	for k, v := range values {
+		if err := ValidateColumnName(k); err != nil {
+			return err
+		}
 		sets = append(sets, fmt.Sprintf("%s = ?", k))
 		setArgs = append(setArgs, v)
 	}
@@ -1302,14 +1352,15 @@ func (m *Model[T]) loadAccessors(results []*T) {
 	callArgs := make([]reflect.Value, 1)
 
 	for _, res := range results {
-		val := reflect.ValueOf(res).Elem()
-		attrField := val.FieldByName("Attributes")
+		resVal := reflect.ValueOf(res)
+		elem := resVal.Elem()
+		attrField := elem.FieldByName("Attributes")
 		if attrField.IsNil() {
 			attrField.Set(reflect.MakeMap(attrField.Type()))
 		}
 
 		// Update receiver for method calls
-		callArgs[0] = reflect.ValueOf(res)
+		callArgs[0] = resVal
 
 		for _, methodIndex := range accessorIndices {
 			method := typ.Method(methodIndex)
