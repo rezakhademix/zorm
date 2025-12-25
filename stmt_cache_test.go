@@ -37,3 +37,19 @@ func TestStmtCache_Concurrency(t *testing.T) {
 		t.Errorf("Cache capacity exceeded: got %d, expected <= 10", cache.Len())
 	}
 }
+
+func TestStmtCache_Clear(t *testing.T) {
+	cache := NewStmtCache(5)
+	cache.Put("Q1", nil)
+	cache.Put("Q2", nil)
+
+	if cache.Len() != 2 {
+		t.Errorf("expected length 2, got %d", cache.Len())
+	}
+
+	cache.Clear()
+
+	if cache.Len() != 0 {
+		t.Errorf("expected length 0 after Clear, got %d", cache.Len())
+	}
+}

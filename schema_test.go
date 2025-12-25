@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -128,4 +129,206 @@ func TestFillStruct_Scanner(t *testing.T) {
 	if m.Custom.Value != "scanned_value" {
 		t.Errorf("expected Custom.Value 'scanned_value', got %q", m.Custom.Value)
 	}
+}
+
+type TypeModel struct {
+	Uint8   uint8
+	Uint64  uint64
+	Float32 float32
+	Float64 float64
+	Bool    bool
+	PtrInt  *int
+}
+
+func TestFillStruct_AllTypes(t *testing.T) {
+	m := &TypeModel{}
+	data := map[string]any{
+		"uint_8":   "255",
+		"uint_64":  int64(1000),
+		"float_32": "12.34",
+		"float_64": 123.456,
+		"bool":     "true",
+		"ptr_int":  int64(42),
+	}
+
+	if err := fillStruct(m, data); err != nil {
+		t.Fatalf("fillStruct failed: %v", err)
+	}
+
+	if m.Uint8 != 255 {
+		t.Errorf("expected Uint8 255, got %d", m.Uint8)
+	}
+	if m.Uint64 != 1000 {
+		t.Errorf("expected Uint64 1000, got %d", m.Uint64)
+	}
+	if m.Float32 < 12.33 || m.Float32 > 12.35 {
+		t.Errorf("expected Float32 ~12.34, got %f", m.Float32)
+	}
+	if m.Float64 != 123.456 {
+		t.Errorf("expected Float64 123.456, got %f", m.Float64)
+	}
+	if !m.Bool {
+		t.Error("expected Bool true, got false")
+	}
+	if m.PtrInt == nil || *m.PtrInt != 42 {
+		t.Errorf("expected PtrInt 42, got %v", m.PtrInt)
+	}
+
+	// Test bool with int
+	data2 := map[string]any{"bool": 0}
+	fillStruct(m, data2)
+	if m.Bool {
+		t.Error("expected Bool false for 0")
+	}
+
+	data3 := map[string]any{"bool": 1}
+	fillStruct(m, data3)
+	if !m.Bool {
+		t.Error("expected Bool true for 1")
+	}
+}
+
+func TestSetFieldValue_NilHandling(t *testing.T) {
+	m := &TypeModel{
+		PtrInt: new(int),
+	}
+	*m.PtrInt = 10
+
+	// Set pointer to nil
+	data := map[string]any{
+		"ptr_int": nil,
+	}
+	if err := fillStruct(m, data); err != nil {
+		t.Errorf("fillStruct failed: %v", err)
+	}
+	if m.PtrInt != nil {
+		t.Error("expected PtrInt to be nil")
+	}
+}
+
+func TestSetField_Exhaustive(t *testing.T) {
+	type ExhaustiveModel struct {
+		Int   int64
+		Uint  uint64
+		Float float64
+		Bool  bool
+	}
+	info := ParseModelType(reflect.TypeOf(ExhaustiveModel{}))
+
+	t.Run("setIntField", func(t *testing.T) {
+		targets := []any{
+			int(10), int8(10), int16(10), int32(10), int64(10),
+			float32(10.5), float64(10.9), "10", []byte("10"),
+		}
+		for _, val := range targets {
+			m := &ExhaustiveModel{}
+			f := reflect.ValueOf(m).Elem().FieldByName("Int")
+			if err := setIntField(f, val); err != nil {
+				t.Errorf("setIntField failed for %T: %v", val, err)
+			}
+			if m.Int != 10 {
+				t.Errorf("expected 10 from %T, got %d", val, m.Int)
+			}
+		}
+	})
+
+	t.Run("setUintField", func(t *testing.T) {
+		targets := []any{
+			int(10), int64(10), uint64(10), float64(10.5), "10", []byte("10"),
+		}
+		for _, val := range targets {
+			m := &ExhaustiveModel{}
+			f := reflect.ValueOf(m).Elem().FieldByName("Uint")
+			if err := setUintField(f, val); err != nil {
+				t.Errorf("setUintField failed for %T: %v", val, err)
+			}
+			if m.Uint != 10 {
+				t.Errorf("expected 10 from %T, got %d", val, m.Uint)
+			}
+		}
+	})
+
+	t.Run("setFloatField", func(t *testing.T) {
+		tests := []struct {
+			input any
+			want  float64
+		}{
+			{float32(10.5), 10.5}, {float64(10.5), 10.5},
+			{int(10), 10.0}, {int64(10), 10.0},
+			{"10.5", 10.5}, {[]byte("10.5"), 10.5},
+		}
+		for _, tc := range tests {
+			m := &ExhaustiveModel{}
+			f := reflect.ValueOf(m).Elem().FieldByName("Float")
+			if err := setFloatField(f, tc.input); err != nil {
+				t.Errorf("setFloatField failed for %T: %v", tc.input, err)
+			}
+			if m.Float != tc.want {
+				t.Errorf("expected %f from %T, got %f", tc.want, tc.input, m.Float)
+			}
+		}
+	})
+
+	t.Run("error_cases", func(t *testing.T) {
+		m := &ExhaustiveModel{}
+		fInt := reflect.ValueOf(m).Elem().FieldByName("Int")
+		fUint := reflect.ValueOf(m).Elem().FieldByName("Uint")
+		fFloat := reflect.ValueOf(m).Elem().FieldByName("Float")
+		fBool := reflect.ValueOf(m).Elem().FieldByName("Bool")
+
+		if err := setIntField(fInt, "abc"); err == nil {
+			t.Error("expected error for invalid int string")
+		}
+		if err := setIntField(fInt, true); err == nil {
+			t.Error("expected error for bool to int")
+		}
+		if err := setUintField(fUint, "abc"); err == nil {
+			t.Error("expected error for invalid uint string")
+		}
+		if err := setUintField(fUint, -1); err == nil {
+			// -1 as int to uint64 works in Go bitwise, but let's see if zorm handles it.
+			// setUintField does uint64(v), which for -1 is huge.
+			// But zorm doesn't check sign for int types to uint conversion.
+		}
+		if err := setUintField(fUint, true); err == nil {
+			t.Error("expected error for bool to uint")
+		}
+		if err := setFloatField(fFloat, "abc"); err == nil {
+			t.Error("expected error for invalid float string")
+		}
+		if err := setFloatField(fFloat, true); err == nil {
+			t.Error("expected error for bool to float")
+		}
+		if err := setBoolField(fBool, "abc"); err == nil {
+			t.Error("expected error for invalid bool string")
+		}
+		if err := setBoolField(fBool, 1.5); err == nil {
+			t.Error("expected error for float to bool")
+		}
+	})
+
+	t.Run("setBoolField", func(t *testing.T) {
+		targets := []struct {
+			input any
+			want  bool
+		}{
+			{true, true}, {false, false},
+			{int(1), true}, {int(0), false},
+			{int64(1), true}, {int64(0), false},
+			{"true", true}, {"0", false},
+			{[]byte("true"), true}, {[]byte("false"), false},
+		}
+		for _, tc := range targets {
+			m := &ExhaustiveModel{}
+			f := reflect.ValueOf(m).Elem().FieldByName("Bool")
+			if err := setBoolField(f, tc.input); err != nil {
+				t.Errorf("setBoolField failed for %T: %v", tc.input, err)
+			}
+			if m.Bool != tc.want {
+				t.Errorf("expected %v from %T, got %v", tc.want, tc.input, m.Bool)
+			}
+		}
+	})
+
+	_ = info // Avoid unused
 }

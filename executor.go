@@ -789,9 +789,9 @@ func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any,
 	}
 
 	// Build query from attributes
-	q := m
+	q := m.Clone()
 	for k, v := range attributes {
-		q = q.Where(k+" = ?", v)
+		q = q.Where(k, v)
 	}
 
 	result, err := q.First(ctx)
@@ -828,9 +828,9 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 	}
 
 	// Build query from attributes
-	q := m
+	q := m.Clone()
 	for k, v := range attributes {
-		q = q.Where(k+" = ?", v)
+		q = q.Where(k, v)
 	}
 
 	result, err := q.First(ctx)
