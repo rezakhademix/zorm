@@ -85,17 +85,6 @@ func (u User) PrimaryKey() string {
 }
 ```
 
-#### Using Tags (Optional)
-
-```go
-type User struct {
-    ID        int64  `zorm:"primary;auto"`
-    UserName  string `zorm:"column:user_name"`
-    Email     string
-    Internal  string `zorm:"-"` // Ignored
-}
-```
-
 ### 3. Basic CRUD
 
 ```go
