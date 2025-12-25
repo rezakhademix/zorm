@@ -55,18 +55,6 @@ db, err := zorm.ConnectPostgres(
 zorm.GlobalDB = db
 ```
 
-#### SQLite
-
-```go
-import (
-    "database/sql"
-    _ "github.com/mattn/go-sqlite3"
-)
-
-db, _ := sql.Open("sqlite3", "./database.db")
-zorm.GlobalDB = db
-```
-
 ### 2. Define Models
 
 Models are standard Go structs. **ZORM uses convention over configuration** - no tags required!
