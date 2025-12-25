@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// contextKey is a custom type for context keys to avoid collisions
+type contextKey string
+
 // =============================================================================
 // NEW TESTS
 // =============================================================================
@@ -113,7 +116,7 @@ func TestClone_DoesNotModifyOriginal(t *testing.T) {
 
 // TestClone_CopiesContext verifies context is preserved
 func TestClone_CopiesContext(t *testing.T) {
-	ctx := context.WithValue(context.Background(), "key", "value")
+	ctx := context.WithValue(context.Background(), contextKey("key"), "value")
 	original := New[TestModel]().WithContext(ctx)
 
 	clone := original.Clone()
@@ -201,7 +204,7 @@ func TestClone_PreservesStmtCache(t *testing.T) {
 // TestWithContext_SetsContext verifies WithContext sets the context
 func TestWithContext_SetsContext(t *testing.T) {
 	m := New[TestModel]()
-	ctx := context.WithValue(context.Background(), "key", "value")
+	ctx := context.WithValue(context.Background(), contextKey("key"), "value")
 
 	m.WithContext(ctx)
 
@@ -558,8 +561,9 @@ func TestMethodChaining_AllConfigMethods(t *testing.T) {
 		SetDB(nil).
 		WithStmtCache(cache)
 
+	// Verify non-nil before accessing fields
 	if m == nil {
-		t.Error("Chained methods should return non-nil model")
+		t.Fatal("Chained methods should return non-nil model")
 	}
 
 	if m.TableName() != "custom_table" {
