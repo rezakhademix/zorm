@@ -32,6 +32,96 @@ func PutStringBuilder(sb *strings.Builder) {
 // snakeCaseCache caches ToSnakeCase results to avoid repeated conversions.
 var snakeCaseCache sync.Map
 
+// ErrInvalidColumnName is returned when a column name contains invalid characters.
+var ErrInvalidColumnName = fmt.Errorf("zorm: invalid column name")
+
+// ValidateColumnName checks if a column name is safe to use in SQL queries.
+// It allows alphanumeric characters, underscores, dots (for qualified names like table.column),
+// and spaces (for expressions like "column ASC").
+// Returns an error if the column name contains potentially dangerous characters.
+func ValidateColumnName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: empty column name", ErrInvalidColumnName)
+	}
+
+	// Check each character
+	for i, c := range name {
+		// Allow: letters, digits, underscore, dot, space
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == ' ' {
+			continue
+		}
+		// Allow: common comparison operators only at specific positions
+		// These are allowed for expressions like "column >" or "column ="
+		if c == '>' || c == '<' || c == '=' || c == '!' {
+			continue
+		}
+		// Allow: asterisk for SELECT * or table.*
+		if c == '*' {
+			continue
+		}
+		// Allow: parentheses for function calls like COUNT(*)
+		if c == '(' || c == ')' {
+			continue
+		}
+		// Allow: comma for multiple columns
+		if c == ',' {
+			continue
+		}
+		// Allow: single quotes for string literals (but check for SQL injection patterns)
+		if c == '\'' {
+			// Check for dangerous patterns like '; DROP or '--
+			remaining := name[i:]
+			lowerRemaining := strings.ToLower(remaining)
+			if strings.Contains(lowerRemaining, "drop") ||
+				strings.Contains(lowerRemaining, "delete") ||
+				strings.Contains(lowerRemaining, "insert") ||
+				strings.Contains(lowerRemaining, "update") ||
+				strings.Contains(lowerRemaining, "truncate") ||
+				strings.Contains(lowerRemaining, "--") ||
+				strings.Contains(lowerRemaining, ";") {
+				return fmt.Errorf("%w: potentially dangerous SQL pattern detected in '%s'", ErrInvalidColumnName, name)
+			}
+			continue
+		}
+		return fmt.Errorf("%w: invalid character '%c' in column name '%s'", ErrInvalidColumnName, c, name)
+	}
+
+	// Additional check for common SQL injection patterns
+	lower := strings.ToLower(name)
+	dangerousPatterns := []string{
+		"--",        // SQL comment
+		";",         // Statement terminator
+		"/*",        // Block comment start
+		"*/",        // Block comment end
+		"xp_",       // Extended stored procedures
+		"sp_",       // System stored procedures
+		"0x",        // Hex encoding
+		"char(",     // Character function often used in injection
+		"nchar(",    // Unicode character function
+		"varchar(",  // Often used in injection
+		"nvarchar(", // Often used in injection
+		"exec(",     // Execute
+		"execute(",  // Execute
+		"union",     // UNION injection
+	}
+
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(lower, pattern) {
+			return fmt.Errorf("%w: dangerous SQL pattern '%s' detected in '%s'", ErrInvalidColumnName, pattern, name)
+		}
+	}
+
+	return nil
+}
+
+// MustValidateColumnName validates a column name and panics if invalid.
+// Use this for internal validation where invalid column names indicate programming errors.
+func MustValidateColumnName(name string) {
+	if err := ValidateColumnName(name); err != nil {
+		panic(err)
+	}
+}
+
 // ModelInfo holds the reflection data for a model struct.
 type ModelInfo struct {
 	Type       reflect.Type

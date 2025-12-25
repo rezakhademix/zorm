@@ -14,7 +14,7 @@ import (
 // improve performance by reusing prepared statements instead of re-preparing
 // them on every execution.
 type StmtCache struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	capacity int
 	items    map[string]*cacheEntry
 	lruList  *list.List
@@ -157,7 +157,7 @@ func (c *StmtCache) Close() error {
 // Len returns the current number of cached statements.
 // This is primarily useful for testing and monitoring.
 func (c *StmtCache) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return len(c.items)
 }

@@ -154,8 +154,13 @@ func (m *Model[T]) Clone() *Model[T] {
 	newModel.morphRelations = make(map[string]map[string][]string)
 	if m.morphRelations != nil {
 		for k, v := range m.morphRelations {
-			newMap := make(map[string][]string)
-			maps.Copy(newMap, v)
+			newMap := make(map[string][]string, len(v))
+			for mk, mv := range v {
+				// Deep copy the slice
+				newSlice := make([]string, len(mv))
+				copy(newSlice, mv)
+				newMap[mk] = newSlice
+			}
 			newModel.morphRelations[k] = newMap
 		}
 	}
