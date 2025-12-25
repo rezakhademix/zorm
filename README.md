@@ -1,7 +1,5 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/rezakhademix/zorm.svg)](https://pkg.go.dev/github.com/rezakhademix/zorm) [![Go Report Card](https://goreportcard.com/badge/github.com/rezakhademix/zorm)](https://goreportcard.com/report/github.com/rezakhademix/zorm) [![codecov](https://codecov.io/gh/rezakhademix/zorm/graph/badge.svg?token=BDWNVIC670)](https://codecov.io/gh/rezakhademix/zorm) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-
-
 <div align="center">
   <h1>Z-ORM</h1>
   <p><strong>A Type-Safe, Production Ready Go ORM</strong></p>
@@ -23,6 +21,8 @@ ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern
 - **💾 Database Splitting**: Automatic read/write split with replica support
 - **🔐 Context Support**: All operations respect `context.Context` for cancellation & timeout
 - **📝 Debugging**: `Print()` method to inspect generated SQL without executing
+- **🪝 Lifecycle Hooks**: BeforeCreate, BeforeUpdate, AfterUpdate hooks
+- **🔁 Accessors**: Computed attributes via getter methods
 
 ## 📦 Installation
 
@@ -69,13 +69,42 @@ zorm.GlobalDB = db
 
 ### 2. Define Models
 
+Models are standard Go structs. **ZORM uses convention over configuration** - no tags required!
+
 ```go
 type User struct {
-    ID        int64
-    Name      string
+    ID        int64      // Automatically detected as primary key with auto-increment
+    Name      string     // Maps to "name" column
+    Email     string     // Maps to "email" column
+    Age       int        // Maps to "age" column
+    CreatedAt time.Time  // Maps to "created_at" column
+    UpdatedAt time.Time  // Maps to "updated_at" (auto-updated)
+}
+// Table name: "users" (auto-pluralized snake_case)
+```
+
+#### Custom Table Name & Primary Key
+
+```go
+// Custom table name
+func (u User) TableName() string {
+    return "app_users"
+}
+
+// Custom primary key
+func (u User) PrimaryKey() string {
+    return "user_id"
+}
+```
+
+#### Using Tags (Optional)
+
+```go
+type User struct {
+    ID        int64  `zorm:"primary;auto"`
+    UserName  string `zorm:"column:user_name"`
     Email     string
-    Age       int
-    CreatedAt time.Time
+    Internal  string `zorm:"-"` // Ignored
 }
 ```
 
@@ -87,310 +116,431 @@ ctx := context.Background()
 // Create
 user := &User{Name: "John", Email: "john@example.com"}
 err := zorm.New[User]().Create(ctx, user)
+fmt.Println(user.ID) // Auto-populated after insert
 
-// Read
+// Read - Single
 user, err := zorm.New[User]().Find(ctx, 1)
+user, err := zorm.New[User]().Where("email", "john@example.com").First(ctx)
+
+// Read - Multiple
 users, err := zorm.New[User]().Where("age >", 18).Get(ctx)
 
 // Update
 user.Name = "Jane"
-err = zorm.New[User]().Update(ctx, user)
+err = zorm.New[User]().Update(ctx, user) // updated_at auto-set
 
 // Delete
-err = zorm.New[User]().Delete(ctx, user)
+err = zorm.New[User]().Where("id", 1).Delete(ctx)
 ```
 
 ---
 
-## 📚 Complete Feature Guide
+## 📚 Complete API Reference
 
-### Query Builder
+### Query Methods
 
-#### Select & Distinct
+| Method                | Description                           | Returns          |
+| --------------------- | ------------------------------------- | ---------------- |
+| `Get(ctx)`            | Execute query and return all results  | `[]*T, error`    |
+| `First(ctx)`          | Execute query and return first result | `*T, error`      |
+| `Find(ctx, id)`       | Find record by primary key            | `*T, error`      |
+| `FindOrFail(ctx, id)` | Find record or return error           | `*T, error`      |
+| `Exists(ctx)`         | Check if any record matches           | `bool, error`    |
+| `Count(ctx)`          | Count matching records                | `int64, error`   |
+| `Sum(ctx, column)`    | Sum of column values                  | `float64, error` |
+| `Avg(ctx, column)`    | Average of column values              | `float64, error` |
+| `Pluck(ctx, column)`  | Get single column values              | `[]any, error`   |
+
+### Write Methods
+
+| Method                               | Description                            |
+| ------------------------------------ | -------------------------------------- |
+| `Create(ctx, entity)`                | Insert single record                   |
+| `CreateMany(ctx, entities)`          | Insert multiple records                |
+| `Update(ctx, entity)`                | Update single record by primary key    |
+| `UpdateMany(ctx, values)`            | Update multiple records matching query |
+| `Delete(ctx)`                        | Delete records matching query          |
+| `DeleteMany(ctx)`                    | Alias for Delete                       |
+| `FirstOrCreate(ctx, attrs, values)`  | Find first or create new               |
+| `UpdateOrCreate(ctx, attrs, values)` | Update existing or create new          |
+
+### Query Builder Methods
+
+| Method                         | Description               |
+| ------------------------------ | ------------------------- |
+| `Select(columns...)`           | Specify columns to select |
+| `Distinct()`                   | Add DISTINCT to query     |
+| `DistinctBy(columns...)`       | PostgreSQL DISTINCT ON    |
+| `Where(query, args...)`        | Add WHERE condition       |
+| `OrWhere(query, args...)`      | Add OR WHERE condition    |
+| `WhereIn(column, values)`      | WHERE column IN (...)     |
+| `WhereNull(column)`            | WHERE column IS NULL      |
+| `WhereNotNull(column)`         | WHERE column IS NOT NULL  |
+| `OrWhereNull(column)`          | OR column IS NULL         |
+| `OrWhereNotNull(column)`       | OR column IS NOT NULL     |
+| `WhereHas(relation, callback)` | WHERE EXISTS subquery     |
+| `OrderBy(column, direction)`   | Add ORDER BY              |
+| `Latest(column?)`              | ORDER BY column DESC      |
+| `Oldest(column?)`              | ORDER BY column ASC       |
+| `GroupBy(columns...)`          | Add GROUP BY              |
+| `Having(query, args...)`       | Add HAVING                |
+| `Limit(n)`                     | Set LIMIT                 |
+| `Offset(n)`                    | Set OFFSET                |
+| `Lock(mode)`                   | Add FOR UPDATE/SHARE      |
+
+### Utility Methods
+
+| Method                 | Description                 |
+| ---------------------- | --------------------------- |
+| `Clone()`              | Deep copy the query builder |
+| `Table(name)`          | Override table name         |
+| `TableName()`          | Get current table name      |
+| `SetDB(db)`            | Set custom DB connection    |
+| `WithTx(tx)`           | Use transaction             |
+| `WithContext(ctx)`     | Set context                 |
+| `WithStmtCache(cache)` | Enable statement caching    |
+| `Scope(fn)`            | Apply reusable query logic  |
+| `Print()`              | Get SQL without executing   |
+| `Raw(sql, args...)`    | Set raw SQL query           |
+| `Exec(ctx)`            | Execute raw query           |
+
+---
+
+## 🔍 Query Builder Details
+
+### Where Conditions
 
 ```go
-// Select specific columns
-users, _ := zorm.New[User]().Select("id", "name", "email").Get(ctx)
-
-// Distinct
-users, _ := zorm.New[User]().Distinct().Get(ctx)
-
-// Distinct On (PostgreSQL)
-users, _ := zorm.New[User]().DistinctBy("email").Get(ctx)
-```
-
-#### Where Conditions
-
-**Basic**
-
-```go
+// Equality
 zorm.New[User]().Where("name", "John").Get(ctx)
+
+// Operators
 zorm.New[User]().Where("age >", 18).Get(ctx)
 zorm.New[User]().Where("email LIKE", "%@example.com").Get(ctx)
-```
+zorm.New[User]().Where("status !=", "inactive").Get(ctx)
 
-**Map**
-
-```go
+// Map (multiple AND conditions)
 zorm.New[User]().Where(map[string]any{
     "name": "John",
     "age":  25,
 }).Get(ctx)
-```
 
-**Struct**
-
-```go
+// Struct (non-zero fields)
 zorm.New[User]().Where(&User{Name: "John", Age: 25}).Get(ctx)
-```
 
-**Nested/Grouped**
-
-```go
+// Nested/Grouped conditions
 zorm.New[User]().Where(func(q *zorm.Model[User]) {
     q.Where("role", "admin").OrWhere("role", "manager")
-}).Get(ctx)
-// Generates: WHERE (role = 'admin' OR role = 'manager')
-```
+}).Where("active", true).Get(ctx)
+// WHERE (role = 'admin' OR role = 'manager') AND active = true
 
-**Where In**
+// NULL checks
+zorm.New[User]().WhereNull("deleted_at").Get(ctx)
+zorm.New[User]().WhereNotNull("verified_at").Get(ctx)
 
-```go
+// IN clause
 zorm.New[User]().WhereIn("id", []any{1, 2, 3}).Get(ctx)
-```
 
-**Or Where**
-
-```go
+// OR conditions
 zorm.New[User]().Where("age >", 18).OrWhere("verified", true).Get(ctx)
 ```
 
-#### Ordering & Pagination
+### Exists Check
 
 ```go
-// Order By
-zorm.New[User]().OrderBy("created_at", "DESC").Get(ctx)
-
-// Helpers
-zorm.New[User]().Latest().Get(ctx)        // created_at DESC
-zorm.New[User]().Oldest().Get(ctx)        // created_at ASC
-zorm.New[User]().Latest("updated_at").Get(ctx)
-
-// Limit & Offset
-zorm.New[User]().Limit(10).Offset(20).Get(ctx)
-
-// Pagination (with total count)
-result, _ := zorm.New[User]().Paginate(ctx, 1, 15)
-fmt.Println(result.Data, result.Total, result.LastPage)
-
-// Simple Pagination (no count query, 2x faster)
-result, _ := zorm.New[User]().SimplePaginate(ctx, 1, 15)
+// Check if any matching record exists (efficient - uses SELECT 1 LIMIT 1)
+exists, err := zorm.New[User]().Where("email", "john@example.com").Exists(ctx)
+if exists {
+    fmt.Println("User exists!")
+}
 ```
 
-#### Grouping & Aggregates
+### Pluck (Single Column)
 
 ```go
-// Group By
-zorm.New[User]().GroupBy("role").Get(ctx)
-
-// Advanced Grouping (PostgreSQL)
-zorm.New[User]().GroupByRollup("region", "city").Get(ctx)
-zorm.New[User]().GroupByCube("year", "month").Get(ctx)
-zorm.New[User]().GroupByGroupingSets([]string{"region"}, []string{"city"}).Get(ctx)
-
-// Having
-zorm.New[User]().
-    GroupBy("role").
-    Having("COUNT(*) >", 5).
-    Get(ctx)
-
-// Aggregates
-count, _ := zorm.New[User]().Count(ctx)
-sum, _ := zorm.New[User]().Sum(ctx, "amount")
-avg, _ := zorm.New[User]().Avg(ctx, "age")
+// Get just the email column from all users
+emails, err := zorm.New[User]().Where("active", true).Pluck(ctx, "email")
+for _, email := range emails {
+    fmt.Println(email)
+}
 ```
 
-#### Chunking
+### Cursor (Memory-Efficient Iteration)
 
-Process large datasets efficiently without loading everything into memory.
+For large datasets, use `Cursor` to iterate row by row without loading everything into memory:
 
 ```go
-err := zorm.New[User]().Chunk(ctx, 100, func(users []*User) error {
-    for _, user := range users {
-        // Process each user
-        fmt.Println(user.Name)
+cursor, err := zorm.New[User]().Where("active", true).Cursor(ctx)
+if err != nil {
+    return err
+}
+defer cursor.Close()
+
+for cursor.Next() {
+    user, err := cursor.Scan()
+    if err != nil {
+        return err
     }
-    return nil
-})
+    // Process user one at a time
+    fmt.Println(user.Name)
+}
+```
+
+### FirstOrCreate & UpdateOrCreate
+
+```go
+// Find first matching record, or create if not found
+user, err := zorm.New[User]().FirstOrCreate(ctx,
+    map[string]any{"email": "john@example.com"},  // Search attributes
+    map[string]any{"name": "John", "age": 25},    // Values for creation
+)
+
+// Find and update, or create if not found
+user, err := zorm.New[User]().UpdateOrCreate(ctx,
+    map[string]any{"email": "john@example.com"},  // Search attributes
+    map[string]any{"name": "John Updated"},       // Values to set
+)
+```
+
+### Pagination
+
+```go
+// Full pagination (with total count - 2 queries)
+result, err := zorm.New[User]().Paginate(ctx, 1, 15)
+fmt.Println(result.Data)        // []*User
+fmt.Println(result.Total)       // Total record count
+fmt.Println(result.CurrentPage) // 1
+fmt.Println(result.LastPage)    // Calculated last page
+fmt.Println(result.PerPage)     // 15
+
+// Simple pagination (no count - 1 query, faster)
+result, err := zorm.New[User]().SimplePaginate(ctx, 1, 15)
+// result.Total will be -1 (skipped)
+```
+
+### Clone (Reuse Queries Safely)
+
+```go
+baseQuery := zorm.New[User]().Where("active", true)
+
+// Clone prevents modifying original
+admins, _ := baseQuery.Clone().Where("role", "admin").Get(ctx)
+users, _ := baseQuery.Clone().Limit(10).Get(ctx)
+
+// Original is unchanged
+all, _ := baseQuery.Get(ctx)
+```
+
+### Custom Table Name
+
+```go
+// Override table name for this query
+users, _ := zorm.New[User]().Table("archived_users").Get(ctx)
 ```
 
 ---
 
-### Advanced Querying
+## 🪝 Lifecycle Hooks
 
-#### Raw Queries
+ZORM supports lifecycle hooks that are automatically called during CRUD operations.
 
-Execute raw SQL when the query builder isn't enough.
+### Available Hooks
 
-```go
-// Raw select
-users, _ := zorm.New[User]().Raw("SELECT * FROM users WHERE age > ?", 18).Get(ctx)
+| Hook                | When Called   |
+| ------------------- | ------------- |
+| `BeforeCreate(ctx)` | Before INSERT |
+| `BeforeUpdate(ctx)` | Before UPDATE |
+| `AfterUpdate(ctx)`  | After UPDATE  |
 
-// Raw execution (INSERT, UPDATE, DELETE)
-_, err := zorm.New[User]().
-    Raw("UPDATE users SET verified = ? WHERE email LIKE ?", true, "%@company.com").
-    Exec(ctx)
-```
-
-#### Common Table Expressions (CTEs)
-
-```go
-users, _ := zorm.New[User]().
-    WithCTE("active_users", "SELECT * FROM users WHERE active = true").
-    Raw("SELECT * FROM active_users WHERE age > 18").
-    Get(ctx)
-```
-
-#### Full-Text Search (PostgreSQL)
-
-```go
-// Standard full-text search
-articles, _ := zorm.New[Article]().
-    WhereFullText("content", "database OR sql").
-    Get(ctx)
-
-// With custom text search configuration
-articles, _ := zorm.New[Article]().
-    WhereFullTextWithConfig("content", "base de datos", "spanish").
-    Get(ctx)
-
-// Using pre-computed tsvector column
-articles, _ := zorm.New[Article]().
-    WhereTsVector("search_vector", "golang & performance").
-    Get(ctx)
-
-// Phrase search
-articles, _ := zorm.New[Article]().
-    WherePhraseSearch("title", "getting started").
-    Get(ctx)
-```
-
-#### Locking (FOR UPDATE)
-
-```go
-// Lock rows for update
-user, _ := zorm.New[User]().
-    Where("id", 1).
-    Lock("UPDATE").
-    First(ctx)
-
-// Share lock
-user, _ := zorm.New[User]().
-    Where("id", 1).
-    Lock("SHARE").
-    First(ctx)
-```
-
-#### Where Has (Query Relations)
-
-```go
-// Get users who have posts
-users, _ := zorm.New[User]().
-    WhereHas("Posts", func(q *zorm.Model[Post]) {
-        q.Where("published", true)
-    }).
-    Get(ctx)
-```
-
----
-
-### Relationships
-
-#### Defining Relations
+### Implementing Hooks
 
 ```go
 type User struct {
-    ID    int64
-    Name  string
-    Posts []*Post  // Loaded via eager loading
+    ID        int64
+    Name      string
+    Email     string
+    CreatedAt time.Time
+    UpdatedAt time.Time
 }
 
-// HasMany Relation
+// BeforeCreate is called before inserting a new record
+func (u *User) BeforeCreate(ctx context.Context) error {
+    // Validate
+    if u.Email == "" {
+        return errors.New("email is required")
+    }
+
+    // Set defaults
+    u.CreatedAt = time.Now()
+
+    // Normalize data
+    u.Email = strings.ToLower(u.Email)
+
+    return nil
+}
+
+// BeforeUpdate is called before updating a record
+func (u *User) BeforeUpdate(ctx context.Context) error {
+    // Validate
+    if u.Name == "" {
+        return errors.New("name cannot be empty")
+    }
+
+    // updated_at is set automatically by ZORM
+
+    return nil
+}
+
+// AfterUpdate is called after a successful update
+func (u *User) AfterUpdate(ctx context.Context) error {
+    // Log, send notifications, update cache, etc.
+    log.Printf("User %d updated", u.ID)
+    return nil
+}
+```
+
+### Hook Execution Flow
+
+```go
+// Create flow:
+// 1. BeforeCreate(ctx) called
+// 2. INSERT executed
+// 3. ID populated
+
+user := &User{Name: "John", Email: "JOHN@EXAMPLE.COM"}
+err := zorm.New[User]().Create(ctx, user)
+// BeforeCreate lowercases email to "john@example.com"
+
+// Update flow:
+// 1. updated_at set automatically
+// 2. BeforeUpdate(ctx) called
+// 3. UPDATE executed
+// 4. AfterUpdate(ctx) called
+
+user.Name = "Jane"
+err = zorm.New[User]().Update(ctx, user)
+```
+
+---
+
+## 🎨 Accessors (Computed Attributes)
+
+Define getter methods to compute virtual attributes. Methods starting with `Get` are automatically called after scanning.
+
+```go
+type User struct {
+    ID         int64
+    FirstName  string
+    LastName   string
+    Attributes map[string]any `zorm:"-"` // Will hold computed values
+}
+
+// Accessor: GetFullName -> attributes["full_name"]
+func (u *User) GetFullName() string {
+    return u.FirstName + " " + u.LastName
+}
+
+// Accessor: GetInitials -> attributes["initials"]
+func (u *User) GetInitials() string {
+    return string(u.FirstName[0]) + string(u.LastName[0])
+}
+
+// Usage
+user, _ := zorm.New[User]().Find(ctx, 1)
+fmt.Println(user.Attributes["full_name"])  // "John Doe"
+fmt.Println(user.Attributes["initials"])   // "JD"
+```
+
+---
+
+## 🔗 Relationships
+
+### Defining Relations
+
+```go
+type User struct {
+    ID      int64
+    Name    string
+    Posts   []*Post  // HasMany
+    Profile *Profile // HasOne
+}
+
+// HasMany: User has many Posts
 func (u User) Posts() zorm.HasMany[Post] {
-    return zorm.HasMany[Post]{ForeignKey: "user_id"}
+    return zorm.HasMany[Post]{
+        ForeignKey: "user_id",  // Column in posts table
+        LocalKey:   "id",       // Optional, defaults to primary key
+    }
+}
+
+// HasOne: User has one Profile
+func (u User) Profile() zorm.HasOne[Profile] {
+    return zorm.HasOne[Profile]{
+        ForeignKey: "user_id",
+    }
 }
 
 type Post struct {
     ID     int64
     UserID int64
     Title  string
-    Author *User  // Loaded via eager loading
+    Author *User    // BelongsTo
 }
 
-// BelongsTo Relation
+// BelongsTo: Post belongs to User
 func (p Post) Author() zorm.BelongsTo[User] {
-    return zorm.BelongsTo[User]{ForeignKey: "user_id"}
+    return zorm.BelongsTo[User]{
+        ForeignKey: "user_id",  // Column in posts table
+        OwnerKey:   "id",       // Optional, defaults to primary key
+    }
 }
 ```
 
-#### Eager Loading
+### Custom Table Names in Relations
+
+```go
+func (u User) Posts() zorm.HasMany[Post] {
+    return zorm.HasMany[Post]{
+        ForeignKey: "user_id",
+        Table:      "blog_posts",  // Use custom table name
+    }
+}
+```
+
+### Eager Loading
 
 ```go
 // Load single relation
 users, _ := zorm.New[User]().With("Posts").Get(ctx)
 
-// Load nested relation
+// Load multiple relations
+users, _ := zorm.New[User]().With("Posts", "Profile").Get(ctx)
+
+// Load nested relations
 users, _ := zorm.New[User]().With("Posts.Comments").Get(ctx)
 
-// Load multiple relations
-users, _ := zorm.New[User]().
-    With("Posts").
-    With("Profile").
-    Get(ctx)
-
 // Load with constraints
-users, _ := zorm.New[User]().
-    WithCallback("Posts", func(q *zorm.Model[Post]) {
-        q.Where("published", true).
-          OrderBy("created_at", "DESC").
-          Limit(5)
-    }).
-    Get(ctx)
+users, _ := zorm.New[User]().WithCallback("Posts", func(q *zorm.Model[Post]) {
+    q.Where("published", true).
+      OrderBy("created_at", "DESC").
+      Limit(5)
+}).Get(ctx)
 ```
 
-#### Polymorphic Relations
+### Lazy Loading
 
 ```go
-// MorphTo
-type Image struct {
-    ID            int64
-    ImageableType string
-    ImageableID   int64
-    URL           string
-    Imageable     any  // Can be User or Post
-}
+user, _ := zorm.New[User]().Find(ctx, 1)
 
-func (i Image) Imageable() zorm.MorphTo[any] {
-    return zorm.MorphTo[any]{
-        Type: "ImageableType",
-        ID:   "ImageableID",
-        TypeMap: map[string]any{
-            "users": User{},
-            "posts": Post{},
-        },
-    }
-}
+// Load relation on existing entity
+err := zorm.New[User]().Load(ctx, user, "Posts")
 
-// Loading polymorphic relations
-images, _ := zorm.New[Image]().
-    WithMorph("Imageable", map[string][]string{
-        "users": {"Profile"},  // Load User's Profile
-        "posts": {},           // Just load Post
-    }).
-    Get(ctx)
+// Load on slice
+users, _ := zorm.New[User]().Get(ctx)
+err := zorm.New[User]().LoadSlice(ctx, users, "Posts", "Profile")
 ```
 
-#### Many-to-Many Relations
+### Many-to-Many Relations
 
 ```go
 type User struct {
@@ -400,63 +550,191 @@ type User struct {
 
 func (u User) Roles() zorm.BelongsToMany[Role] {
     return zorm.BelongsToMany[Role]{
-        PivotTable: "role_user",
-        ForeignKey: "user_id",
-        RelatedKey: "role_id",
+        PivotTable: "role_user",   // Join table
+        ForeignKey: "user_id",     // FK in pivot table
+        RelatedKey: "role_id",     // Related FK in pivot table
+    }
+}
+```
+
+### Polymorphic Relations
+
+```go
+type Image struct {
+    ID            int64
+    URL           string
+    ImageableType string  // "users" or "posts"
+    ImageableID   int64
+}
+
+// MorphOne: User has one Image
+func (u User) Avatar() zorm.MorphOne[Image] {
+    return zorm.MorphOne[Image]{
+        Type: "ImageableType",  // Type column
+        ID:   "ImageableID",    // ID column
     }
 }
 
-// Attach roles to user
-user, _ := zorm.New[User]().Find(ctx, 1)
-zorm.New[User]().Attach(ctx, user, "Roles", []any{1, 2, 3}, nil)
-
-// Detach roles
-zorm.New[User]().Detach(ctx, user, "Roles", []any{2})
-
-// Sync roles (replace all)
-zorm.New[User]().Sync(ctx, user, "Roles", []any{1, 3}, nil)
-
-// With pivot data
-pivotData := map[any]map[string]any{
-    1: {"assigned_at": time.Now()},
+// MorphMany: Post has many Images
+func (p Post) Images() zorm.MorphMany[Image] {
+    return zorm.MorphMany[Image]{
+        Type: "ImageableType",
+        ID:   "ImageableID",
+    }
 }
-zorm.New[User]().Attach(ctx, user, "Roles", []any{1}, pivotData)
+
+// Loading with type constraints
+images, _ := zorm.New[Image]().WithMorph("Imageable", map[string][]string{
+    "users": {"Profile"},  // When type=users, also load Profile
+    "posts": {},           // When type=posts, just load Post
+}).Get(ctx)
 ```
 
 ---
 
-### Transactions
+## 🔐 Transactions
 
 ```go
+// Function-based transaction
 err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
-    // Create user
-    u := &User{Name: "John"}
-    if err := zorm.New[User]().WithTx(tx).Create(ctx, u); err != nil {
+    user := &User{Name: "John"}
+    if err := zorm.New[User]().WithTx(tx).Create(ctx, user); err != nil {
         return err // Rollback
     }
 
-    // Create post
-    p := &Post{UserID: u.ID, Title: "First Post"}
-    if err := zorm.New[Post]().WithTx(tx).Create(ctx, p); err != nil {
+    post := &Post{UserID: user.ID, Title: "First Post"}
+    if err := zorm.New[Post]().WithTx(tx).Create(ctx, post); err != nil {
         return err // Rollback
     }
 
     return nil // Commit
 })
 
-// Or using Model.Transaction
-err = zorm.New[User]().Transaction(ctx, func(m *zorm.Model[User]) error {
-    return m.Create(ctx, &User{Name: "Jane"})
+// Model-based transaction
+err = zorm.New[User]().Transaction(ctx, func(tx *zorm.Tx) error {
+    return zorm.New[User]().WithTx(tx).Create(ctx, &User{Name: "Jane"})
 })
+```
+
+Transaction features:
+
+- Auto-rollback on error return
+- Auto-rollback on panic (re-panics after rollback)
+- Auto-commit on nil return
+
+---
+
+## ⚠️ Error Handling
+
+ZORM provides comprehensive error handling with categorized errors.
+
+### Sentinel Errors
+
+```go
+import "github.com/rezakhademix/zorm"
+
+// Query errors
+zorm.ErrRecordNotFound     // No matching record
+
+// Model errors
+zorm.ErrInvalidModel       // Invalid model type
+zorm.ErrNilPointer         // Nil pointer passed
+
+// Relation errors
+zorm.ErrRelationNotFound   // Relation method not found
+zorm.ErrInvalidRelation    // Invalid relation type
+
+// Constraint violations
+zorm.ErrDuplicateKey       // Unique constraint violation
+zorm.ErrForeignKey         // Foreign key constraint violation
+zorm.ErrNotNullViolation   // NOT NULL constraint violation
+zorm.ErrCheckViolation     // CHECK constraint violation
+
+// Connection errors
+zorm.ErrConnectionFailed   // Connection refused
+zorm.ErrConnectionLost     // Connection lost during operation
+zorm.ErrTimeout            // Operation timeout
+
+// Transaction errors
+zorm.ErrTransactionDeadlock    // Deadlock detected
+zorm.ErrSerializationFailure  // Serialization failure
+
+// Schema errors
+zorm.ErrColumnNotFound     // Column doesn't exist
+zorm.ErrTableNotFound      // Table doesn't exist
+zorm.ErrInvalidSyntax      // SQL syntax error
+```
+
+### Error Helper Functions
+
+```go
+user, err := zorm.New[User]().Find(ctx, 999)
+
+// Check specific error types
+if zorm.IsNotFound(err) {
+    // Handle not found
+}
+
+if zorm.IsDuplicateKey(err) {
+    // Handle duplicate
+}
+
+if zorm.IsConstraintViolation(err) {
+    // Any constraint violation
+}
+
+if zorm.IsConnectionError(err) {
+    // Connection failed or lost
+}
+
+if zorm.IsTimeout(err) {
+    // Operation timed out
+}
+
+if zorm.IsDeadlock(err) {
+    // Transaction deadlock - retry
+}
+
+if zorm.IsSchemaError(err) {
+    // Missing column, table, or syntax error
+}
+```
+
+### QueryError Details
+
+```go
+user, err := zorm.New[User]().Create(ctx, &User{Email: "duplicate@example.com"})
+if err != nil {
+    if qe := zorm.GetQueryError(err); qe != nil {
+        fmt.Println(qe.Query)      // The SQL that failed
+        fmt.Println(qe.Args)       // Query arguments
+        fmt.Println(qe.Operation)  // "INSERT", "SELECT", etc.
+        fmt.Println(qe.Table)      // Table name (if detected)
+        fmt.Println(qe.Constraint) // Constraint name (if detected)
+    }
+}
 ```
 
 ---
 
-### Advanced Features
+## 🚀 Advanced Features
 
-#### Read/Write Splitting
+### Statement Caching
 
-Automatically route read queries to replicas and write queries to primary.
+Improve performance by reusing prepared statements:
+
+```go
+cache := zorm.NewStmtCache(100)  // Cache up to 100 statements
+defer cache.Close()
+
+model := zorm.New[User]().WithStmtCache(cache)
+
+// Statements are prepared once and reused
+users, _ := model.Clone().Where("age >", 18).Get(ctx)
+users, _ := model.Clone().Where("age >", 25).Get(ctx)  // Reuses prepared statement
+```
+
+### Read/Write Splitting
 
 ```go
 // Configure resolver
@@ -466,97 +744,134 @@ zorm.ConfigureDBResolver(
     zorm.WithLoadBalancer(zorm.RoundRobinLB),
 )
 
-// Usage is transparent
-users, _ := zorm.New[User]().Get(ctx)      // Reads from replica
-err := zorm.New[User]().Create(ctx, user)  // Writes to primary
+// Automatic routing
+users, _ := zorm.New[User]().Get(ctx)          // Reads from replica
+err := zorm.New[User]().Create(ctx, user)      // Writes to primary
 
-// Force primary for next read
+// Force primary for consistency
 users, _ := zorm.New[User]().UsePrimary().Get(ctx)
 
 // Force specific replica
 users, _ := zorm.New[User]().UseReplica(0).Get(ctx)
 ```
 
-#### Statement Caching
-
-Improve performance by reusing prepared statements.
+### Common Table Expressions (CTEs)
 
 ```go
-cache := zorm.NewStmtCache(100)
-defer cache.Close()
-
-// Use cache for this model
-model := zorm.New[User]().WithStmtCache(cache)
-
-// All queries will reuse prepared statements
-users, _ := model.Where("age >", 18).Get(ctx)
-users, _ := model.Where("age >", 25).Get(ctx)  // Reuses statement
-```
-
-#### Context Support
-
-All operations respect `context.Context` for cancellation and timeouts.
-
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-users, err := zorm.New[User]().Get(ctx)
-if err != nil {
-    // Handle timeout or cancellation
-}
-```
-
-#### Custom Scopes
-
-Reusable query logic.
-
-```go
-func ActiveUsers(q *zorm.Model[User]) *zorm.Model[User] {
-    return q.Where("active", true).Where("deleted_at IS NULL", nil)
-}
-
-func Verified(q *zorm.Model[User]) *zorm.Model[User] {
-    return q.Where("verified", true)
-}
-
-// Use scopes
+// String CTE
 users, _ := zorm.New[User]().
-    Scope(ActiveUsers).
-    Scope(Verified).
+    WithCTE("active_users", "SELECT * FROM users WHERE active = true").
+    Raw("SELECT * FROM active_users WHERE age > 18").
+    Get(ctx)
+
+// Subquery CTE
+subQuery := zorm.New[User]().Where("active", true)
+users, _ := zorm.New[User]().
+    WithCTE("active_users", subQuery).
+    Raw("SELECT * FROM active_users").
     Get(ctx)
 ```
 
-#### Query Debugging
+### Full-Text Search (PostgreSQL)
 
 ```go
-// Print SQL without executing
+// Basic full-text search
+articles, _ := zorm.New[Article]().
+    WhereFullText("content", "database sql").Get(ctx)
+
+// With language config
+articles, _ := zorm.New[Article]().
+    WhereFullTextWithConfig("content", "base de datos", "spanish").Get(ctx)
+
+// Pre-computed tsvector column (fastest)
+articles, _ := zorm.New[Article]().
+    WhereTsVector("search_vector", "golang & performance").Get(ctx)
+
+// Phrase search (word order matters)
+articles, _ := zorm.New[Article]().
+    WherePhraseSearch("title", "getting started").Get(ctx)
+```
+
+### Row Locking
+
+```go
+// Lock for update (exclusive)
+user, _ := zorm.New[User]().Where("id", 1).Lock("UPDATE").First(ctx)
+
+// Shared lock
+user, _ := zorm.New[User]().Where("id", 1).Lock("SHARE").First(ctx)
+
+// PostgreSQL-specific
+user, _ := zorm.New[User]().Where("id", 1).Lock("NO KEY UPDATE").First(ctx)
+```
+
+### Advanced Grouping
+
+```go
+// ROLLUP
+zorm.New[Order]().
+    Select("region", "city", "SUM(amount)").
+    GroupByRollup("region", "city").Get(ctx)
+
+// CUBE
+zorm.New[Order]().
+    Select("year", "month", "SUM(amount)").
+    GroupByCube("year", "month").Get(ctx)
+
+// GROUPING SETS
+zorm.New[Order]().
+    GroupByGroupingSets(
+        []string{"region"},
+        []string{"city"},
+        []string{},  // Grand total
+    ).Get(ctx)
+```
+
+### Chunking Large Datasets
+
+```go
+err := zorm.New[User]().Chunk(ctx, 1000, func(users []*User) error {
+    for _, user := range users {
+        // Process each user
+    }
+    return nil  // Return error to stop chunking
+})
+```
+
+### Scopes (Reusable Query Logic)
+
+```go
+func Active(q *zorm.Model[User]) *zorm.Model[User] {
+    return q.Where("active", true).WhereNull("deleted_at")
+}
+
+func Verified(q *zorm.Model[User]) *zorm.Model[User] {
+    return q.WhereNotNull("verified_at")
+}
+
+func RecentlyActive(q *zorm.Model[User]) *zorm.Model[User] {
+    return q.Where("last_login >", time.Now().AddDate(0, -1, 0))
+}
+
+// Chain scopes
+users, _ := zorm.New[User]().
+    Scope(Active).
+    Scope(Verified).
+    Scope(RecentlyActive).
+    Get(ctx)
+```
+
+### Query Debugging
+
+```go
 sql, args := zorm.New[User]().
     Where("age >", 18).
+    OrderBy("name", "ASC").
     Limit(10).
     Print()
 
-fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND (age > ?) LIMIT 10
+fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > $1 ORDER BY name ASC LIMIT 10
 fmt.Println(args)  // [18]
-```
-
----
-
-### 2. Define Models
-
-Models are standard Go structs. **ZORM uses convention over configuration** - no tags required!
-
-**Convention-based (recommended):**
-
-```go
-type User struct {
-    ID        int64      // Automatically detected as primary key with auto-increment
-    Name      string     // Maps to "name" column
-    Email     string     // Maps to "email" column
-    Age       int        // Maps to "age" column
-    CreatedAt time.Time  // Maps to "created_at" column
-}
-// Table name: "users" (auto-pluralized snake_case)
 ```
 
 ---
@@ -566,24 +881,27 @@ type User struct {
 ### 1. Always Use Context
 
 ```go
-ctx := context.Background()
-users, err := zorm.New[User]().Get(ctx)  // ✅ Good
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+users, err := zorm.New[User]().Get(ctx)
 ```
 
-### 2. Reuse Model Instances with Clone
+### 2. Use Clone for Query Reuse
 
 ```go
 baseQuery := zorm.New[User]().Where("active", true)
 
-admin := baseQuery.Clone().Where("role", "admin").Get(ctx)
-users := baseQuery.Clone().Limit(10).Get(ctx)
+// Clone before modifying
+admins, _ := baseQuery.Clone().Where("role", "admin").Get(ctx)
+recent, _ := baseQuery.Clone().Latest().Limit(10).Get(ctx)
 ```
 
-### 3. Use Transactions for Multiple Operations
+### 3. Use Transactions for Multi-Step Operations
 
 ```go
 zorm.Transaction(ctx, func(tx *zorm.Tx) error {
-    // Multiple operations...
+    // All operations use same transaction
     return nil
 })
 ```
@@ -593,64 +911,121 @@ zorm.Transaction(ctx, func(tx *zorm.Tx) error {
 ```go
 cache := zorm.NewStmtCache(100)
 defer cache.Close()
-model := zorm.New[User]().WithStmtCache(cache)
 ```
 
-### 5. Use Chunk for Large Datasets
+### 5. Use Cursor for Large Datasets
 
 ```go
-zorm.New[User]().Chunk(ctx, 1000, func(users []*User) error {
-    // Process batch
-    return nil
-})
+cursor, _ := zorm.New[User]().Cursor(ctx)
+defer cursor.Close()
+for cursor.Next() {
+    user, _ := cursor.Scan()
+    // Process one at a time
+}
+```
+
+### 6. Handle Errors Properly
+
+```go
+user, err := zorm.New[User]().Find(ctx, id)
+if zorm.IsNotFound(err) {
+    return nil, ErrUserNotFound
+}
+if err != nil {
+    return nil, fmt.Errorf("finding user: %w", err)
+}
 ```
 
 ---
 
-## 📖 Examples
-
-### Complex Query Example
+## 📖 Complete Example
 
 ```go
-// Get top 10 verified users who have published posts,
-// ordered by last login, with their 5 most recent posts
-users, err := zorm.New[User]().
-    Select("id", "name", "email", "last_login").
-    Where("verified", true).
-    WhereHas("Posts", func(q *zorm.Model[Post]) {
-        q.Where("status", "published")
-    }).
-    WithCallback("Posts", func(q *zorm.Model[Post]) {
-        q.Where("status", "published").
-          OrderBy("created_at", "DESC").
-          Limit(5)
-    }).
-    OrderBy("last_login", "DESC").
-    Limit(10).
-    Get(ctx)
-```
+package main
 
-### Batch Operations
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
 
-```go
-// Create many
-users := []*User{
-    {Name: "Alice"},
-    {Name: "Bob"},
+    "github.com/rezakhademix/zorm"
+)
+
+type User struct {
+    ID        int64
+    Name      string
+    Email     string
+    Age       int
+    Active    bool
+    CreatedAt time.Time
+    UpdatedAt time.Time
+    Posts     []*Post
 }
-err := zorm.New[User]().CreateMany(ctx, users)
 
-// Update many
-err = zorm.New[User]().
-    Where("last_login <", time.Now().AddDate(0, -6, 0)).
-    UpdateMany(ctx, map[string]any{
-        "active": false,
-    })
+func (u *User) BeforeCreate(ctx context.Context) error {
+    u.CreatedAt = time.Now()
+    u.Active = true
+    return nil
+}
 
-// Delete many
-err = zorm.New[User]().
-    Where("active", false).
-    DeleteMany(ctx)
+func (u User) Posts() zorm.HasMany[Post] {
+    return zorm.HasMany[Post]{ForeignKey: "user_id"}
+}
+
+type Post struct {
+    ID        int64
+    UserID    int64
+    Title     string
+    Published bool
+}
+
+func main() {
+    ctx := context.Background()
+
+    // Connect
+    db, err := zorm.ConnectPostgres("postgres://...", nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    zorm.GlobalDB = db
+
+    // Create with hook
+    user := &User{Name: "John", Email: "john@example.com", Age: 25}
+    if err := zorm.New[User]().Create(ctx, user); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Created user %d\n", user.ID)
+
+    // Query with relations
+    users, err := zorm.New[User]().
+        Where("age >", 18).
+        Where("active", true).
+        WithCallback("Posts", func(q *zorm.Model[Post]) {
+            q.Where("published", true).Limit(5)
+        }).
+        OrderBy("created_at", "DESC").
+        Limit(10).
+        Get(ctx)
+
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    for _, u := range users {
+        fmt.Printf("%s has %d published posts\n", u.Name, len(u.Posts))
+    }
+
+    // FirstOrCreate
+    user, err = zorm.New[User]().FirstOrCreate(ctx,
+        map[string]any{"email": "jane@example.com"},
+        map[string]any{"name": "Jane", "age": 30},
+    )
+
+    // Pagination
+    result, _ := zorm.New[User]().Paginate(ctx, 1, 15)
+    fmt.Printf("Page 1 of %d, Total: %d\n", result.LastPage, result.Total)
+}
 ```
 
 ---
@@ -662,5 +1037,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## 📄 License
 
 MIT License - see LICENSE file for details.
-
----
