@@ -34,7 +34,7 @@ go get github.com/rezakhademix/zorm
 
 ### 1. Connect to Database
 
-#### PostgreSQL (Recommended)
+#### PostgreSQL
 
 ```go
 import (
