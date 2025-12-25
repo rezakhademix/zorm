@@ -653,3 +653,356 @@ func TestTable_Override(t *testing.T) {
 		t.Errorf("expected query to contain 'FROM custom_users', got %q", query)
 	}
 }
+
+// =============================================================================
+// SQL INJECTION PREVENTION TESTS
+// =============================================================================
+
+// TestSelect_ValidatesColumns verifies Select validates column names
+func TestSelect_ValidatesColumns(t *testing.T) {
+	tests := []struct {
+		name     string
+		columns  []string
+		expected int // Expected number of columns in query
+	}{
+		{"valid columns", []string{"id", "name", "email"}, 3},
+		{"with asterisk", []string{"*"}, 1},
+		{"with table prefix", []string{"users.id", "users.name"}, 2},
+		{"skip injection attempt", []string{"id", "name; DROP TABLE users--"}, 1},
+		{"skip union attempt", []string{"id", "id UNION SELECT * FROM passwords"}, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New[TestModel]().Select(tt.columns...)
+			if len(m.columns) != tt.expected {
+				t.Errorf("expected %d columns, got %d", tt.expected, len(m.columns))
+			}
+		})
+	}
+}
+
+// TestOrderBy_ValidatesDirection verifies OrderBy validates direction
+func TestOrderBy_ValidatesDirection(t *testing.T) {
+	tests := []struct {
+		direction string
+		expected  string
+	}{
+		{"ASC", "ASC"},
+		{"DESC", "DESC"},
+		{"asc", "ASC"},
+		{"desc", "DESC"},
+		{"invalid", "ASC"}, // Should default to ASC
+		{"DROP", "ASC"},    // Injection attempt - should default to ASC
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.direction, func(t *testing.T) {
+			m := New[TestModel]().OrderBy("name", tt.direction)
+			query, _ := m.Print()
+
+			if !strings.Contains(query, "ORDER BY name "+tt.expected) {
+				t.Errorf("expected direction %q, got query %q", tt.expected, query)
+			}
+		})
+	}
+}
+
+// TestWhereIn_ValidatesColumn verifies WhereIn validates column name
+func TestWhereIn_ValidatesColumn(t *testing.T) {
+	// Valid column
+	m1 := New[TestModel]().WhereIn("id", []any{1, 2, 3})
+	query1, _ := m1.Print()
+	if !strings.Contains(query1, "id IN") {
+		t.Error("Valid column should generate IN clause")
+	}
+
+	// Invalid column - should be skipped
+	m2 := New[TestModel]().WhereIn("id; DROP TABLE users", []any{1, 2, 3})
+	query2, _ := m2.Print()
+	if strings.Contains(query2, "DROP") {
+		t.Error("Injection attempt should be blocked")
+	}
+}
+
+// TestGroupBy_ValidatesColumns verifies GroupBy validates column names
+func TestGroupBy_ValidatesColumns(t *testing.T) {
+	m := New[TestModel]().GroupBy("status", "role; DROP TABLE users--")
+
+	// Only valid column should be added
+	if len(m.groupBys) != 1 {
+		t.Errorf("expected 1 valid group by column, got %d", len(m.groupBys))
+	}
+}
+
+// =============================================================================
+// REBIND TESTS
+// =============================================================================
+
+// TestRebind_ConvertsPlaceholders verifies ? placeholders are converted to $n
+func TestRebind_ConvertsPlaceholders(t *testing.T) {
+	m := New[TestModel]().Raw("SELECT * FROM users WHERE id = ? AND name = ?", 1, "John")
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "$1") {
+		t.Error("First placeholder should be converted to $1")
+	}
+	if !strings.Contains(query, "$2") {
+		t.Error("Second placeholder should be converted to $2")
+	}
+	if strings.Contains(query, "?") {
+		t.Error("No ? placeholders should remain")
+	}
+}
+
+// TestRebind_MultipleQueries verifies rebind handles multiple queries correctly
+func TestRebind_MultipleQueries(t *testing.T) {
+	m := New[TestModel]().Raw("SELECT * FROM users WHERE a = ? AND b = ? AND c = ?", 1, 2, 3)
+	query, args := m.Print()
+
+	if !strings.Contains(query, "$1") || !strings.Contains(query, "$2") || !strings.Contains(query, "$3") {
+		t.Error("All placeholders should be converted")
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+// =============================================================================
+// PRINT METHOD TESTS
+// =============================================================================
+
+// TestPrint_ReturnsQueryAndArgs verifies Print returns correct query and args
+func TestPrint_ReturnsQueryAndArgs(t *testing.T) {
+	m := New[TestModel]().Where("active", true).Limit(10)
+	query, args := m.Print()
+
+	if query == "" {
+		t.Error("Print should return non-empty query")
+	}
+	if len(args) == 0 {
+		t.Error("Print should return args")
+	}
+	if !strings.Contains(query, "FROM test_models") {
+		t.Errorf("Query should contain table name, got %q", query)
+	}
+}
+
+// TestPrint_RawQueryMode verifies Print works with raw queries
+func TestPrint_RawQueryMode(t *testing.T) {
+	m := New[TestModel]().Raw("SELECT 1")
+	query, _ := m.Print()
+
+	if query != "SELECT 1" {
+		t.Errorf("expected 'SELECT 1', got %q", query)
+	}
+}
+
+// =============================================================================
+// PAGINATION RESULT TESTS
+// =============================================================================
+
+// TestPaginationResult_Fields verifies PaginationResult struct fields
+func TestPaginationResult_Structure_Query(t *testing.T) {
+	result := &PaginationResult[TestModel]{
+		Data:        []*TestModel{},
+		Total:       100,
+		PerPage:     10,
+		CurrentPage: 1,
+		LastPage:    10,
+	}
+
+	if result.Total != 100 {
+		t.Errorf("Total should be 100, got %d", result.Total)
+	}
+	if result.LastPage != 10 {
+		t.Errorf("LastPage should be 10, got %d", result.LastPage)
+	}
+}
+
+// =============================================================================
+// RELATION METHODS TESTS
+// =============================================================================
+
+// TestWith_AddsRelations verifies With adds relations
+func TestWith_AddsRelations(t *testing.T) {
+	m := New[TestModel]().With("Posts", "Comments", "Profile")
+
+	if len(m.relations) != 3 {
+		t.Errorf("expected 3 relations, got %d", len(m.relations))
+	}
+}
+
+// TestWith_NestedRelations verifies With handles nested relations
+func TestWith_NestedRelations(t *testing.T) {
+	m := New[TestModel]().With("Posts.Comments.Author")
+
+	if len(m.relations) != 1 {
+		t.Errorf("expected 1 relation, got %d", len(m.relations))
+	}
+	if m.relations[0] != "Posts.Comments.Author" {
+		t.Errorf("expected 'Posts.Comments.Author', got %q", m.relations[0])
+	}
+}
+
+// TestWithCallback_AddsCallback verifies WithCallback sets callback
+func TestWithCallback_AddsCallback(t *testing.T) {
+	callback := func(q *Model[TestModel]) {
+		q.Where("published", true)
+	}
+	m := New[TestModel]().WithCallback("Posts", callback)
+
+	if len(m.relations) != 1 {
+		t.Errorf("expected 1 relation, got %d", len(m.relations))
+	}
+	if m.relationCallbacks["Posts"] == nil {
+		t.Error("callback should be set for Posts")
+	}
+}
+
+// TestWithMorph_SetsTypeMap verifies WithMorph sets type map
+func TestWithMorph_SetsTypeMap(t *testing.T) {
+	typeMap := map[string][]string{
+		"users": {"Profile"},
+		"posts": {"Author"},
+	}
+	m := New[TestModel]().WithMorph("Imageable", typeMap)
+
+	if m.morphRelations["Imageable"] == nil {
+		t.Error("morphRelations should be set for Imageable")
+	}
+	if len(m.morphRelations["Imageable"]["users"]) != 1 {
+		t.Error("users should have 1 relation")
+	}
+}
+
+// =============================================================================
+// CTE TESTS
+// =============================================================================
+
+// TestWithCTE_StringQuery verifies WithCTE with string query
+func TestWithCTE_StringQuery(t *testing.T) {
+	m := New[TestModel]().WithCTE("active_users", "SELECT * FROM users WHERE active = true")
+
+	if len(m.ctes) != 1 {
+		t.Errorf("expected 1 CTE, got %d", len(m.ctes))
+	}
+	if m.ctes[0].Name != "active_users" {
+		t.Errorf("CTE name should be 'active_users', got %q", m.ctes[0].Name)
+	}
+}
+
+// TestWithCTE_MultipleCTEs verifies multiple CTEs can be added
+func TestWithCTE_MultipleCTEs(t *testing.T) {
+	m := New[TestModel]().
+		WithCTE("cte1", "SELECT 1").
+		WithCTE("cte2", "SELECT 2")
+
+	if len(m.ctes) != 2 {
+		t.Errorf("expected 2 CTEs, got %d", len(m.ctes))
+	}
+}
+
+// =============================================================================
+// SCOPE TESTS
+// =============================================================================
+
+// TestScope_AppliesFunction verifies Scope applies function
+func TestScope_AppliesFunction(t *testing.T) {
+	activeScope := func(m *Model[TestModel]) *Model[TestModel] {
+		return m.Where("active", true)
+	}
+
+	verifiedScope := func(m *Model[TestModel]) *Model[TestModel] {
+		return m.WhereNotNull("verified_at")
+	}
+
+	m := New[TestModel]().Scope(activeScope).Scope(verifiedScope)
+	query, args := m.Print()
+
+	if len(args) < 1 {
+		t.Error("Should have at least 1 arg from active scope")
+	}
+	if !strings.Contains(query, "verified_at IS NOT NULL") {
+		t.Error("Query should contain verified_at condition")
+	}
+}
+
+// TestScope_Chainable verifies multiple scopes can be chained
+func TestScope_Chainable(t *testing.T) {
+	scope1 := func(m *Model[TestModel]) *Model[TestModel] {
+		return m.Where("a", 1)
+	}
+	scope2 := func(m *Model[TestModel]) *Model[TestModel] {
+		return m.Where("b", 2)
+	}
+	scope3 := func(m *Model[TestModel]) *Model[TestModel] {
+		return m.Where("c", 3)
+	}
+
+	m := New[TestModel]().Scope(scope1).Scope(scope2).Scope(scope3)
+	_, args := m.Print()
+
+	if len(args) != 3 {
+		t.Errorf("expected 3 args from 3 scopes, got %d", len(args))
+	}
+}
+
+// =============================================================================
+// LOCK TESTS
+// =============================================================================
+
+// TestLock_Modes verifies different lock modes
+func TestLock_Modes(t *testing.T) {
+	tests := []struct {
+		mode     string
+		expected string
+	}{
+		{"UPDATE", "FOR UPDATE"},
+		{"SHARE", "FOR SHARE"},
+		{"NO KEY UPDATE", "FOR NO KEY UPDATE"},
+		{"KEY SHARE", "FOR KEY SHARE"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			m := New[TestModel]().Lock(tt.mode)
+			query, _ := m.Print()
+
+			if !strings.Contains(query, tt.expected) {
+				t.Errorf("expected %q in query, got %q", tt.expected, query)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// USEPRIMARY / USEREPLICA TESTS
+// =============================================================================
+
+// TestUsePrimary_SetsForcePrimary verifies UsePrimary sets flag
+func TestUsePrimary_SetsForcePrimary(t *testing.T) {
+	m := New[TestModel]().UsePrimary()
+
+	if !m.forcePrimary {
+		t.Error("forcePrimary should be true")
+	}
+}
+
+// TestUseReplica_SetsForceReplica verifies UseReplica sets index
+func TestUseReplica_SetsForceReplica(t *testing.T) {
+	m := New[TestModel]().UseReplica(2)
+
+	if m.forceReplica != 2 {
+		t.Errorf("forceReplica should be 2, got %d", m.forceReplica)
+	}
+}
+
+// TestUseReplica_ResetsUsePrimary verifies UseReplica resets forcePrimary
+func TestUseReplica_ResetsUsePrimary(t *testing.T) {
+	m := New[TestModel]().UsePrimary().UseReplica(0)
+
+	if m.forcePrimary {
+		t.Error("forcePrimary should be false after UseReplica")
+	}
+}
