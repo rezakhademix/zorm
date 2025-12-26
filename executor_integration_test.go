@@ -100,7 +100,7 @@ func TestExecutor_Cursor(t *testing.T) {
 
 	count := 0
 	for cursor.Next() {
-		item, err := cursor.Scan()
+		item, err := cursor.Scan(ctx)
 		if err != nil {
 			t.Fatalf("Scan failed: %v", err)
 		}
