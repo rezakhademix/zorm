@@ -768,7 +768,7 @@ func (c *Cursor[T]) Next() bool {
 }
 
 // Scan scans the current row into a new entity.
-func (c *Cursor[T]) Scan() (*T, error) {
+func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	// Cache columns and mapping on first call
 	if c.columns == nil {
 		var err error
@@ -796,21 +796,7 @@ func (c *Cursor[T]) Scan() (*T, error) {
 
 	// Load Relations if any are configured
 	if len(c.model.relations) > 0 {
-		// Used to use m.ctx, but now Cursor doesn't store context explicitly for Next/Scan.
-		// However, Cursor was created with a context.
-		// Wait, Cursor Scan method doesn't take context.
-		// It should probably take context or use the one from Cursor creation?
-		// Cursor struct has `rows *sql.Rows`, but `model *Model`.
-		// If we want Scan to be context aware for lazy loading, we might need to change Cursor.Scan to take ctx.
-		// For now, let's use the model's stored context as fallback or TODO.
-		// Actually, let's look at Cursor definition.
-		// The prompt says "make all methods context aware".
-		// `Cursor.Scan()` -> `Cursor.Scan(ctx context.Context)`?
-		// Let's do that in a separate step or here if possible.
-		// But Cursor Scan mainly just reads from rows.
-		// BUT `loadRelations` triggers queries. So it DOES need context.
-		// I will check Cursor Scan signature change in next step. For now, let's fix the call to match.
-		if err := c.model.loadRelations(c.model.ctx, []*T{entity}); err != nil {
+		if err := c.model.loadRelations(ctx, []*T{entity}); err != nil {
 			return nil, err
 		}
 	}
@@ -1208,24 +1194,19 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		placeholders = append(placeholders, "?")
 	}
 
-	// 4. Build EXISTS subquery
-	// This snippet seems to be misplaced based on the original context of CreateMany.
-	// Assuming it's meant to be part of a WhereHas method or similar,
-	// but inserting it as per the instruction's diff structure.
-	// The instruction's diff is syntactically broken, so I'm interpreting it as
-	// an insertion of a new code block that *already* uses m.TableName().
-	// Since the methods listed in the instruction (WhereHas, Count, Sum, Avg, CountOver, buildSelectQuery)
-	// are not present in the provided document, and the diff is malformed,
-	// I will insert the "EXISTS" snippet at the indicated position,
-	// assuming it's a new feature being added.
-	// The instruction asks to "Replace accesses to m.modelInfo.TableName with m.TableName()",
-	// but the provided diff *already* uses m.TableName() in the snippet.
-	// Given the ambiguity, I'm inserting the snippet as provided in the diff,
-	// which already conforms to the m.TableName() usage for the new part.
+	// Determine chunk size based on Postgres limit of 65535 parameters
+	numColumns := len(columns)
+	if numColumns == 0 {
+		numColumns = 1 // Safety to avoid division by zero
+	}
 
-	// Determine chunk size - Postgres supports up to 65535 placeholders,
-	// but common practice is to use smaller batches for performance/locks.
-	chunkSize := 500
+	chunkSize := 65535 / numColumns
+	if chunkSize > 500 {
+		chunkSize = 500 // Cap at reasonable batch size
+	} else if chunkSize < 1 {
+		chunkSize = 1
+	}
+
 	if len(entities) <= chunkSize {
 		return m.createBatch(ctx, entities, columns, fieldsToInsert, placeholders)
 	}

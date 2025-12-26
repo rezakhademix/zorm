@@ -100,7 +100,7 @@ user, err := zorm.New[User]().Find(ctx, 1)
 user, err := zorm.New[User]().Where("email", "john@example.com").First(ctx)
 
 // Read - Multiple
-users, err := zorm.New[User]().Where("age >", 18).Get(ctx)
+users, err := zorm.New[User]().Where("age", ">", 18).Get(ctx)
 
 // Update
 user.Name = "Jane"
@@ -192,9 +192,9 @@ err = zorm.New[User]().Where("id", 1).Delete(ctx)
 zorm.New[User]().Where("name", "John").Get(ctx)
 
 // Operators
-zorm.New[User]().Where("age >", 18).Get(ctx)
-zorm.New[User]().Where("email LIKE", "%@example.com").Get(ctx)
-zorm.New[User]().Where("status !=", "inactive").Get(ctx)
+zorm.New[User]().Where("age", ">", 18).Get(ctx)
+zorm.New[User]().Where("email", "LIKE", "%@example.com").Get(ctx)
+zorm.New[User]().Where("status", "!=", "inactive").Get(ctx)
 
 // Map (multiple AND conditions)
 zorm.New[User]().Where(map[string]any{
@@ -219,7 +219,7 @@ zorm.New[User]().WhereNotNull("verified_at").Get(ctx)
 zorm.New[User]().WhereIn("id", []any{1, 2, 3}).Get(ctx)
 
 // OR conditions
-zorm.New[User]().Where("age >", 18).OrWhere("verified", true).Get(ctx)
+zorm.New[User]().Where("age", ">", 18).OrWhere("verified", true).Get(ctx)
 ```
 
 ### Exists Check
@@ -254,7 +254,7 @@ if err != nil {
 defer cursor.Close()
 
 for cursor.Next() {
-    user, err := cursor.Scan()
+    user, err := cursor.Scan(ctx)
     if err != nil {
         return err
     }
@@ -707,8 +707,8 @@ defer cache.Close()
 model := zorm.New[User]().WithStmtCache(cache)
 
 // Statements are prepared once and reused
-users, _ := model.Clone().Where("age >", 18).Get(ctx)
-users, _ := model.Clone().Where("age >", 25).Get(ctx)  // Reuses prepared statement
+users, _ := model.Clone().Where("age", ">", 18).Get(ctx)
+users, _ := model.Clone().Where("age", ">", 25).Get(ctx)  // Reuses prepared statement
 ```
 
 ### Read/Write Splitting
