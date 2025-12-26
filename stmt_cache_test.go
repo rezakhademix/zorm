@@ -26,7 +26,10 @@ func TestStmtCache_Concurrency(t *testing.T) {
 			// But StmtCache logic is generic regarding *sql.Stmt content.
 
 			cache.Put(query, nil)
-			_ = cache.Get(query)
+			_, release := cache.Get(query)
+			if release != nil {
+				release()
+			}
 
 		}(i)
 	}
