@@ -444,10 +444,6 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 		relatedInfo := ParseModelType(modelType)
 		pk := relatedInfo.PrimaryKey
 
-		// We need a dummy config to pass to loadHasManyDynamic
-		// It expects a Relation config with ForeignKey field.
-		// We can create a struct on the fly? No.
-
 		// Let's duplicate the query logic here, it's safer.
 
 		var sb strings.Builder
@@ -1298,7 +1294,10 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	var t T
 	methodVal := reflect.ValueOf(t).MethodByName(relation)
 	if !methodVal.IsValid() {
-		return fmt.Errorf("relation method %s not found", relation)
+		methodVal = reflect.ValueOf(t).MethodByName(relation + "Relation")
+		if !methodVal.IsValid() {
+			return fmt.Errorf("relation method %s not found", relation)
+		}
 	}
 	retVals := methodVal.Call(nil)
 	relConfig := retVals[0].Interface()
@@ -1400,7 +1399,10 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	var t T
 	methodVal := reflect.ValueOf(t).MethodByName(relation)
 	if !methodVal.IsValid() {
-		return fmt.Errorf("relation method %s not found", relation)
+		methodVal = reflect.ValueOf(t).MethodByName(relation + "Relation")
+		if !methodVal.IsValid() {
+			return fmt.Errorf("relation method %s not found", relation)
+		}
 	}
 	retVals := methodVal.Call(nil)
 	relConfig := retVals[0].Interface()
