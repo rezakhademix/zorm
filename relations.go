@@ -270,15 +270,16 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 	}
 
 	for relName, group := range groups {
-		// Find the method on T
+		// Find the method on T using cached index
 		var t T
-		methodVal := reflect.ValueOf(t).MethodByName(relName)
-		if !methodVal.IsValid() {
-			// Try with "Relation" suffix to avoid name conflict with field
-			methodVal = reflect.ValueOf(t).MethodByName(relName + "Relation")
-			if !methodVal.IsValid() {
-				return WrapRelationError(relName, fmt.Sprintf("%T", t), ErrRelationNotFound)
-			}
+		var methodVal reflect.Value
+
+		if idx, ok := m.modelInfo.RelationMethods[relName]; ok {
+			methodVal = reflect.ValueOf(t).Method(idx)
+		} else if idx, ok := m.modelInfo.RelationMethods[relName+"Relation"]; ok {
+			methodVal = reflect.ValueOf(t).Method(idx)
+		} else {
+			return WrapRelationError(relName, fmt.Sprintf("%T", t), ErrRelationNotFound)
 		}
 
 		// Call the method to get the relation config

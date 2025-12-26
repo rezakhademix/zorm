@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"database/sql"
 	"sync"
+	"sync/atomic"
 )
 
 // StmtCache provides a thread-safe LRU cache for prepared statements.
@@ -14,7 +15,7 @@ import (
 // improve performance by reusing prepared statements instead of re-preparing
 // them on every execution.
 type StmtCache struct {
-	mu       sync.RWMutex
+	mu       sync.Mutex
 	capacity int
 	items    map[string]*cacheEntry
 	lruList  *list.List
@@ -22,8 +23,11 @@ type StmtCache struct {
 
 // cacheEntry represents a cached prepared statement with its LRU tracking element.
 type cacheEntry struct {
-	stmt    *sql.Stmt
-	element *list.Element
+	stmt     *sql.Stmt
+	element  *list.Element
+	refCount int32
+	evicted  bool
+	query    string
 }
 
 // NewStmtCache creates a new statement cache with the specified capacity.
@@ -43,39 +47,38 @@ func NewStmtCache(capacity int) *StmtCache {
 }
 
 // Get retrieves a cached prepared statement for the given SQL query.
-// Returns nil if the statement is not found in the cache.
-// Accessing a statement updates its position in the LRU list.
-func (c *StmtCache) Get(query string) *sql.Stmt {
+// Returns the statement and a release function. The caller MUST call the release function
+// when finished using the statement.
+// Returns nil, nil if the statement is not found in the cache.
+func (c *StmtCache) Get(query string) (*sql.Stmt, func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if entry, exists := c.items[query]; exists {
 		c.lruList.MoveToFront(entry.element)
-		return entry.stmt
+		atomic.AddInt32(&entry.refCount, 1)
+		return entry.stmt, func() {
+			c.release(entry)
+		}
 	}
 
-	return nil
+	return nil, nil
 }
 
 // Put stores a prepared statement in the cache for the given SQL query.
 // If the cache is at capacity, the least recently used statement will be
-// closed and evicted before adding the new statement.
+// evicted (and closed when no longer in use) before adding the new statement.
 //
 // If a statement with the same query already exists, it will be replaced.
 func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If entry already exists, update it and move to front
+	// If entry already exists, update it?
+	// It's tricky to update an existing entry safely if it's in use.
+	// We should evict the old one and add new one.
 	if entry, exists := c.items[query]; exists {
-		// Close old statement
-		if entry.stmt != nil {
-			_ = entry.stmt.Close()
-		}
-		// Update with new statement
-		entry.stmt = stmt
-		c.lruList.MoveToFront(entry.element)
-		return
+		c.evictEntry(entry)
 	}
 
 	// Evict LRU entry if at capacity
@@ -83,81 +86,78 @@ func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
 		c.evictLRU()
 	}
 
-	// Add new entry
-	element := c.lruList.PushFront(query)
-	c.items[query] = &cacheEntry{
-		stmt:    stmt,
-		element: element,
+	entry := &cacheEntry{
+		stmt:     stmt,
+		query:    query,
+		refCount: 0,
+		evicted:  false,
 	}
+	element := c.lruList.PushFront(entry)
+	entry.element = element
+	c.items[query] = entry
 }
 
-// evictLRU removes and closes the least recently used statement from the cache.
-// This method is not thread-safe and should only be called while holding the write lock.
+// evictLRU removes the least recently used statement from the cache.
 func (c *StmtCache) evictLRU() {
-	// Get the least recently used entry (back of list)
 	element := c.lruList.Back()
 	if element == nil {
 		return
 	}
+	entry := element.Value.(*cacheEntry)
+	c.evictEntry(entry)
+}
 
-	// Remove from list
-	c.lruList.Remove(element)
+// evictEntry removes an entry from the map and list, marking it as evicted.
+func (c *StmtCache) evictEntry(entry *cacheEntry) {
+	c.lruList.Remove(entry.element)
+	delete(c.items, entry.query)
+	entry.evicted = true
 
-	// Get query and entry
-	query := element.Value.(string)
-	entry := c.items[query]
-
-	// Close the statement
-	if entry.stmt != nil {
+	// If no one is using it, close immediately
+	if atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
 		_ = entry.stmt.Close()
 	}
+}
 
-	// Remove from map
-	delete(c.items, query)
+// release decrements the ref count and closes if evicted and unused.
+func (c *StmtCache) release(entry *cacheEntry) {
+	newCount := atomic.AddInt32(&entry.refCount, -1)
+	if newCount == 0 {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		// Double check under lock (though evicted/refCount logic is mostly safe, closing should be consistent)
+		// If it was evicted while we used it, we must close it now.
+		if entry.evicted && atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
+			_ = entry.stmt.Close()
+		}
+	}
 }
 
 // Clear closes all cached statements and clears the cache.
-// This is useful when you want to reset the cache without destroying it.
 func (c *StmtCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close all statements
 	for _, entry := range c.items {
-		if entry.stmt != nil {
+		entry.evicted = true
+		if atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
 			_ = entry.stmt.Close()
 		}
 	}
 
-	// Clear the cache
 	c.items = make(map[string]*cacheEntry)
 	c.lruList.Init()
 }
 
 // Close closes all cached statements and releases all resources.
-// After calling Close, the cache should not be used anymore.
 func (c *StmtCache) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Close all statements
-	for _, entry := range c.items {
-		if entry.stmt != nil {
-			_ = entry.stmt.Close()
-		}
-	}
-
-	// Clear the cache
-	c.items = nil
-	c.lruList = nil
-
+	c.Clear()
 	return nil
 }
 
 // Len returns the current number of cached statements.
-// This is primarily useful for testing and monitoring.
 func (c *StmtCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return len(c.items)
 }

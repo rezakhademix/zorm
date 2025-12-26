@@ -36,78 +36,38 @@ var snakeCaseCache sync.Map
 var ErrInvalidColumnName = fmt.Errorf("zorm: invalid column name")
 
 // ValidateColumnName checks if a column name is safe to use in SQL queries.
-// It allows alphanumeric characters, underscores, dots (for qualified names like table.column),
-// and spaces (for expressions like "column ASC").
-// Returns an error if the column name contains potentially dangerous characters.
+// It uses a strict whitelist approach to prevent SQL injection.
+// Allowed characters: alphanumeric, underscore, dot, asterisk, space, parens, comma.
+// Dangerous characters like quotes, semicolons, and comments are rejected.
 func ValidateColumnName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty column name", ErrInvalidColumnName)
 	}
 
-	// Check each character
-	for i, c := range name {
-		// Allow: letters, digits, underscore, dot, space
-		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == ' ' {
+	for _, c := range name {
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == '*' || c == ' ' || c == '(' || c == ')' || c == ',' {
 			continue
 		}
-		// Allow: common comparison operators only at specific positions
-		// These are allowed for expressions like "column >" or "column ="
-		if c == '>' || c == '<' || c == '=' || c == '!' {
-			continue
-		}
-		// Allow: asterisk for SELECT * or table.*
-		if c == '*' {
-			continue
-		}
-		// Allow: parentheses for function calls like COUNT(*)
-		if c == '(' || c == ')' {
-			continue
-		}
-		// Allow: comma for multiple columns
-		if c == ',' {
-			continue
-		}
-		// Allow: single quotes for string literals (but check for SQL injection patterns)
-		if c == '\'' {
-			// Check for dangerous patterns like '; DROP or '--
-			remaining := name[i:]
-			lowerRemaining := strings.ToLower(remaining)
-			if strings.Contains(lowerRemaining, "drop") ||
-				strings.Contains(lowerRemaining, "delete") ||
-				strings.Contains(lowerRemaining, "insert") ||
-				strings.Contains(lowerRemaining, "update") ||
-				strings.Contains(lowerRemaining, "truncate") ||
-				strings.Contains(lowerRemaining, "--") ||
-				strings.Contains(lowerRemaining, ";") {
-				return fmt.Errorf("%w: potentially dangerous SQL pattern detected in '%s'", ErrInvalidColumnName, name)
-			}
-			continue
-		}
+		// Deny everything else
 		return fmt.Errorf("%w: invalid character '%c' in column name '%s'", ErrInvalidColumnName, c, name)
 	}
 
-	// Additional check for common SQL injection patterns
+	// Check for dangerous keywords that might be allowed by the whitelist
+	// We check for whole words to avoid false positives (e.g. "update_at")
 	lower := strings.ToLower(name)
-	dangerousPatterns := []string{
-		"--",        // SQL comment
-		";",         // Statement terminator
-		"/*",        // Block comment start
-		"*/",        // Block comment end
-		"xp_",       // Extended stored procedures
-		"sp_",       // System stored procedures
-		"0x",        // Hex encoding
-		"char(",     // Character function often used in injection
-		"nchar(",    // Unicode character function
-		"varchar(",  // Often used in injection
-		"nvarchar(", // Often used in injection
-		"exec(",     // Execute
-		"execute(",  // Execute
-		"union",     // UNION injection
+	dangerousKeywords := []string{
+		"union", "select", "insert", "update", "delete", "drop", "truncate", "alter", "exec", "execute",
+		"xp_", "sp_", "0x",
 	}
 
-	for _, pattern := range dangerousPatterns {
-		if strings.Contains(lower, pattern) {
-			return fmt.Errorf("%w: dangerous SQL pattern '%s' detected in '%s'", ErrInvalidColumnName, pattern, name)
+	for _, keyword := range dangerousKeywords {
+		// Check for word boundaries using space (simplest approach given allowed chars)
+		// This catches "id UNION SELECT" but allows "union_member"
+		if strings.Contains(lower, " "+keyword+" ") ||
+			strings.HasPrefix(lower, keyword+" ") ||
+			strings.HasSuffix(lower, " "+keyword) ||
+			lower == keyword {
+			return fmt.Errorf("%w: dangerous keyword '%s' detected in '%s'", ErrInvalidColumnName, keyword, name)
 		}
 	}
 
@@ -124,12 +84,13 @@ func MustValidateColumnName(name string) {
 
 // ModelInfo holds the reflection data for a model struct.
 type ModelInfo struct {
-	Type       reflect.Type
-	TableName  string
-	PrimaryKey string
-	Fields     map[string]*FieldInfo // StructFieldName -> FieldInfo
-	Columns    map[string]*FieldInfo // DBColumnName -> FieldInfo
-	Accessors  []int                 // Indices of methods starting with "Get"
+	Type            reflect.Type
+	TableName       string
+	PrimaryKey      string
+	Fields          map[string]*FieldInfo // StructFieldName -> FieldInfo
+	Columns         map[string]*FieldInfo // DBColumnName -> FieldInfo
+	Accessors       []int                 // Indices of methods starting with "Get"
+	RelationMethods map[string]int        // MethodName -> Index
 }
 
 // FieldInfo holds data about a single field in the model.
@@ -182,9 +143,10 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 	}
 
 	info := &ModelInfo{
-		Type:    typ,
-		Fields:  make(map[string]*FieldInfo),
-		Columns: make(map[string]*FieldInfo),
+		Type:            typ,
+		Fields:          make(map[string]*FieldInfo),
+		Columns:         make(map[string]*FieldInfo),
+		RelationMethods: make(map[string]int),
 	}
 
 	// 1. Determine Table Name
@@ -208,15 +170,24 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 	// 3. Parse Fields (including embedded)
 	parseFields(typ, info, []int{})
 
-	// 4. Parse Accessors (Get methods)
-	// We store valid methods for quick access during scanning
+	// 4. Parse Accessors (Get methods) and Relation Methods
+	// We store valid methods for quick access during scanning and relation loading
+	relationType := reflect.TypeOf((*Relation)(nil)).Elem()
+
 	for i := 0; i < typ.NumMethod(); i++ {
 		method := typ.Method(i)
-		// Accessor convention: Starts with "Get", has 0 arguments, returns 1 value?
-		// Or just any method starting with "Get"?
-		// Existing logic in executor.go check for "Get" prefix and 0 args.
+
+		// Accessor convention: Starts with "Get", has 0 arguments, returns 1 value
 		if strings.HasPrefix(method.Name, "Get") && method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
 			info.Accessors = append(info.Accessors, i)
+		}
+
+		// Relation Method detection
+		// Must return 1 value that implements Relation interface
+		if method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
+			if method.Type.Out(0).Implements(relationType) {
+				info.RelationMethods[method.Name] = i
+			}
 		}
 	}
 
@@ -321,8 +292,9 @@ func ToSnakeCase(s string) string {
 		return cached.(string)
 	}
 
-	var result strings.Builder
-	result.Grow(len(s) + 5) // Pre-allocate some space
+	sb := GetStringBuilder()
+	defer PutStringBuilder(sb)
+	sb.Grow(len(s) + 5) // Pre-allocate some space
 
 	for i, r := range s {
 		if i > 0 {
@@ -332,49 +304,34 @@ func ToSnakeCase(s string) string {
 				prev := rune(s[i-1])
 				// If previous was lower, we definitely need underscore (e.g. aB -> a_b)
 				if unicode.IsLower(prev) {
-					result.WriteByte('_')
+					sb.WriteByte('_')
 				} else if unicode.IsUpper(prev) {
 					// If previous was upper, we might need underscore if next is lower
 					// e.g. HTTPClient -> HTTP_Client (at 'C')
-					// But wait, HTTPClient -> http_client
-					// H T T P C lient
-					// i=0 H
-					// i=1 T (prev=H). No _
-					// ...
-					// i=4 C (prev=P). No _ ?
-					// i=5 l (prev=C).
-					// If we have ID, I D.
-					// UserID -> user_id.
-					// U s e r I D
-					// r I -> r_i
-					// I D -> id
-					// HTTPClient -> http_client
-					// P C -> p_c ? No.
 					// We want http_client.
 					// So if current is upper, and next is lower, and previous is upper -> underscore before current.
-					// e.g. P(prev) C(curr) l(next) -> P_Cl
 					if i+1 < len(s) {
 						next := rune(s[i+1])
 						if unicode.IsLower(next) {
-							result.WriteByte('_')
+							sb.WriteByte('_')
 						}
 					}
 				} else if unicode.IsDigit(prev) {
 					// 1A -> 1_a
-					result.WriteByte('_')
+					sb.WriteByte('_')
 				}
 			} else if unicode.IsDigit(r) {
 				// a1 -> a_1
 				prev := rune(s[i-1])
 				if !unicode.IsDigit(prev) {
-					result.WriteByte('_')
+					sb.WriteByte('_')
 				}
 			}
 		}
-		result.WriteRune(unicode.ToLower(r))
+		sb.WriteRune(unicode.ToLower(r))
 	}
 
-	converted := result.String()
+	converted := sb.String()
 	snakeCaseCache.Store(s, converted)
 	return converted
 }
