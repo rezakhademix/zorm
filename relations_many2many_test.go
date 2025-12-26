@@ -77,6 +77,9 @@ func TestRelations_Detach(t *testing.T) {
 
 	// Verify remaining is Admin(1)
 	err = db.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1 AND role_id = 1").Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if count != 1 {
 		t.Errorf("expected 1 association for role 1, got %d", count)
 	}
@@ -102,6 +105,9 @@ func TestRelations_DetachAll(t *testing.T) {
 	// Verify
 	var count int
 	err = db.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1").Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if count != 0 {
 		t.Errorf("expected 0 associations, got %d", count)
 	}
