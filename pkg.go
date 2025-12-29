@@ -7,8 +7,14 @@ import (
 
 // compareIDs compares two ID values, handling type conversions (int vs int64, etc.)
 func compareIDs(a, b any) bool {
+	// Fast path: direct equality check (handles same type comparisons)
 	if a == b {
 		return true
+	}
+
+	// Handle nil cases early
+	if a == nil || b == nil {
+		return a == b
 	}
 
 	aVal := reflect.ValueOf(a)
@@ -32,23 +38,62 @@ func compareIDs(a, b any) bool {
 		return false
 	}
 
+	aKind := aVal.Kind()
+	bKind := bVal.Kind()
+
+	// Handle Arrays (UUIDs are [16]byte arrays)
+	// This is MUCH faster than string comparison for uuid.UUID
+	if aKind == reflect.Array && bKind == reflect.Array {
+		if aVal.Type() == bVal.Type() && aVal.Len() == bVal.Len() {
+			// Byte-by-byte comparison for arrays (like UUID)
+			for i := 0; i < aVal.Len(); i++ {
+				if aVal.Index(i).Interface() != bVal.Index(i).Interface() {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
 	// Handle Integers
-	if isInteger(aVal.Kind()) && isInteger(bVal.Kind()) {
+	if isInteger(aKind) && isInteger(bKind) {
 		return aVal.Int() == bVal.Int()
 	}
 
 	// Handle Unsigned Integers
-	if isUint(aVal.Kind()) && isUint(bVal.Kind()) {
+	if isUint(aKind) && isUint(bKind) {
 		return aVal.Uint() == bVal.Uint()
 	}
 
+	// Handle mixed signed/unsigned (for completeness)
+	if isInteger(aKind) && isUint(bKind) {
+		aInt := aVal.Int()
+		if aInt < 0 {
+			return false
+		}
+		return uint64(aInt) == bVal.Uint()
+	}
+	if isUint(aKind) && isInteger(bKind) {
+		bInt := bVal.Int()
+		if bInt < 0 {
+			return false
+		}
+		return aVal.Uint() == uint64(bInt)
+	}
+
 	// Handle Floats
-	if isFloat(aVal.Kind()) && isFloat(bVal.Kind()) {
+	if isFloat(aKind) && isFloat(bKind) {
 		return aVal.Float() == bVal.Float()
 	}
 
-	// Fallback to string comparison
-	return fmt.Sprintf("%v", aVal.Interface()) == fmt.Sprintf("%v", bVal.Interface())
+	// Handle Strings (fast path for string UUIDs)
+	if aKind == reflect.String && bKind == reflect.String {
+		return aVal.String() == bVal.String()
+	}
+
+	// Fallback to string comparison (slower, but handles edge cases)
+	// This allocates memory for string conversion
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
 
 func isInteger(k reflect.Kind) bool {
