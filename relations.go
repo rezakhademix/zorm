@@ -795,6 +795,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		valConfig = valConfig.Elem()
 	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	ownerKey := valConfig.FieldByName("OwnerKey").String()
+
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(relName) + "_id"
 	}
@@ -805,12 +807,12 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
 
-		// Find FK field in Parent
+		// Find FK field in Parent (this should be "branch_id" field on User)
 		var fieldName string
 		if field, ok := m.modelInfo.Columns[foreignKey]; ok {
 			fieldName = field.Name
 		} else {
-			// Fallback to CamelCase
+			// Fallback to CamelCase conversion
 			parts := strings.Split(foreignKey, "_")
 			for j, p := range parts {
 				if p == "id" {
@@ -844,8 +846,20 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			continue
 		}
 
-		fks = append(fks, fkVal)
-		fkMap[fkVal] = append(fkMap[fkVal], i)
+		// Check if this FK value is already in the list
+		found := false
+		for existingFK := range fkMap {
+			if compareIDs(existingFK, fkVal) {
+				fkMap[existingFK] = append(fkMap[existingFK], i)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			fks = append(fks, fkVal)
+			fkMap[fkVal] = append(fkMap[fkVal], i)
+		}
 	}
 
 	if len(fks) == 0 {
@@ -862,8 +876,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
 
-	// 3. Build Query
-	ownerKey := valConfig.FieldByName("OwnerKey").String()
+	// 3. Determine the key to query on the related model (Branch)
+	// OwnerKey should be the primary key of the related model (Branch.id)
 	if ownerKey == "" {
 		ownerKey = relatedInfo.PrimaryKey
 	}
@@ -884,7 +898,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 	}
 
-	// 4. Map back
+	relatedByPK := make(map[any]reflect.Value)
+
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		var pkFieldName string
@@ -895,18 +910,34 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 
 		resPK := val.FieldByName(pkFieldName).Interface()
+		relatedByPK[resPK] = reflect.ValueOf(res)
+	}
 
-		if indices, ok := fkMap[resPK]; ok {
-			for _, idx := range indices {
-				parent := results[idx]
-				parentVal := reflect.ValueOf(parent).Elem()
-				relField := parentVal.FieldByName(relName)
-				if relField.IsValid() && relField.CanSet() {
-					if relField.Kind() == reflect.Pointer {
-						relField.Set(reflect.ValueOf(res))
-					} else {
-						relField.Set(reflect.ValueOf(res).Elem())
-					}
+	// Now assign the related records to parent entities
+	for fkValue, indices := range fkMap {
+		// Find the related record with PK matching this FK value
+		var relatedRecord reflect.Value
+		for pk, record := range relatedByPK {
+			if compareIDs(pk, fkValue) {
+				relatedRecord = record
+				break
+			}
+		}
+
+		if !relatedRecord.IsValid() {
+			continue
+		}
+
+		// Assign to all parent entities with this FK
+		for _, idx := range indices {
+			parent := results[idx]
+			parentVal := reflect.ValueOf(parent).Elem()
+			relField := parentVal.FieldByName(relName)
+			if relField.IsValid() && relField.CanSet() {
+				if relField.Kind() == reflect.Pointer {
+					relField.Set(relatedRecord)
+				} else {
+					relField.Set(relatedRecord.Elem())
 				}
 			}
 		}
