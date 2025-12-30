@@ -527,10 +527,9 @@ func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 			if method.Type.In(0).Kind() == reflect.Pointer {
 				retVals := method.Func.Call([]reflect.Value{ptrValue})
 				return m.applyWhereHas(retVals, subQuery)
-			} else {
-				retVals := method.Func.Call([]reflect.Value{res0})
-				return m.applyWhereHas(retVals, subQuery)
 			}
+			retVals := method.Func.Call([]reflect.Value{res0})
+			return m.applyWhereHas(retVals, subQuery)
 		}
 		return m
 	}
@@ -593,7 +592,7 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 		fnVal := reflect.ValueOf(subQuery)
 		if fnVal.Kind() == reflect.Func {
 			// Create a new model for the related type
-			relatedModel := rel.NewModel(m.db, m.ctx)
+			relatedModel := rel.NewModel(m.ctx, m.db)
 			if relatedModel != nil {
 				fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
 				// Extract constraints from the populated model

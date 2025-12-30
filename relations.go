@@ -107,12 +107,12 @@ type MorphMany[T any] struct {
 type Relation interface {
 	RelationType() RelationType
 	NewRelated() any
-	NewModel(db *sql.DB, ctx context.Context) any
+	NewModel(ctx context.Context, db *sql.DB) any
 }
 
 func (HasOne[T]) RelationType() RelationType { return RelationHasOne }
 func (HasOne[T]) NewRelated() any            { return new(T) }
-func (HasOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (HasOne[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
@@ -121,7 +121,7 @@ func (HasOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
 
 func (HasMany[T]) RelationType() RelationType { return RelationHasMany }
 func (HasMany[T]) NewRelated() any            { return new(T) }
-func (HasMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (HasMany[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
@@ -130,7 +130,7 @@ func (HasMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
 
 func (BelongsTo[T]) RelationType() RelationType { return RelationBelongsTo }
 func (BelongsTo[T]) NewRelated() any            { return new(T) }
-func (BelongsTo[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (BelongsTo[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
@@ -139,7 +139,7 @@ func (BelongsTo[T]) NewModel(db *sql.DB, ctx context.Context) any {
 
 func (BelongsToMany[T]) RelationType() RelationType { return RelationBelongsToMany }
 func (BelongsToMany[T]) NewRelated() any            { return new(T) }
-func (BelongsToMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (BelongsToMany[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
@@ -165,11 +165,11 @@ const (
 
 func (MorphTo[T]) RelationType() RelationType                   { return RelationMorphTo }
 func (MorphTo[T]) NewRelated() any                              { return nil } // Dynamic
-func (MorphTo[T]) NewModel(db *sql.DB, ctx context.Context) any { return nil }
+func (MorphTo[T]) NewModel(ctx context.Context, db *sql.DB) any { return nil }
 
 func (MorphOne[T]) RelationType() RelationType { return RelationMorphOne }
 func (MorphOne[T]) NewRelated() any            { return new(T) }
-func (MorphOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (MorphOne[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
@@ -178,7 +178,7 @@ func (MorphOne[T]) NewModel(db *sql.DB, ctx context.Context) any {
 
 func (MorphMany[T]) RelationType() RelationType { return RelationMorphMany }
 func (MorphMany[T]) NewRelated() any            { return new(T) }
-func (MorphMany[T]) NewModel(db *sql.DB, ctx context.Context) any {
+func (MorphMany[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	m := New[T]()
 	m.db = db
 	m.ctx = ctx
