@@ -1,7 +1,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/rezakhademix/zorm.svg)](https://pkg.go.dev/github.com/rezakhademix/zorm) [![Go Report Card](https://goreportcard.com/badge/github.com/rezakhademix/zorm)](https://goreportcard.com/report/github.com/rezakhademix/zorm) [![codecov](https://codecov.io/gh/rezakhademix/zorm/graph/badge.svg?token=BDWNVIC670)](https://codecov.io/gh/rezakhademix/zorm) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 <div align="center">
-  <h1>Z-ORM</h1>
+  <h1>ZORM</h1>
   <p><strong>A Type-Safe, Production Ready Go ORM</strong></p>
   <p>One ORM To Query Them All</p>
 </div>
@@ -10,27 +10,27 @@
 
 ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern applications. It leverages Go generics to provide compile-time type safety while offering a fluent, chainable API for building complex SQL queries with ease.
 
-## ✨ Key Features
+## Key Features
 
-- **🔒 Type-Safe**: Full compile-time type safety powered by Go generics
-- **🚀 Zero Dependencies**: Built on Go's `database/sql` package, works with any SQL driver
-- **⚡ High Performance**: Prepared statement caching and connection pooling
-- **🔄 Relations**: HasOne, HasMany, BelongsTo, BelongsToMany, Polymorphic relations
-- **🎯 Fluent API**: Chainable query builder with intuitive method names
-- **📊 Advanced Queries**: CTEs, Subqueries, Full-Text Search, Window Functions
-- **💾 Database Splitting**: Automatic read/write split with replica support
-- **🔐 Context Support**: All operations respect `context.Context` for cancellation & timeout
-- **📝 Debugging**: `Print()` method to inspect generated SQL without executing
-- **🪝 Lifecycle Hooks**: BeforeCreate, BeforeUpdate, AfterUpdate hooks
-- **🔁 Accessors**: Computed attributes via getter methods
+- **Type-Safe**: Full compile-time type safety powered by Go generics
+- **Zero Dependencies**: Built on Go's `database/sql` package, works with any SQL driver
+- **High Performance**: Prepared statement caching and connection pooling
+- **Relations**: HasOne, HasMany, BelongsTo, BelongsToMany, Polymorphic relations
+- **Fluent API**: Chainable query builder with intuitive method names
+- **Advanced Queries**: CTEs, Subqueries, Full-Text Search, Window Functions
+- **Database Splitting**: Automatic read/write split with replica support
+- **Context Support**: All operations respect `context.Context` for cancellation & timeout
+- **Debugging**: `Print()` method to inspect generated SQL without executing
+- **Lifecycle Hooks**: BeforeCreate, BeforeUpdate, AfterUpdate hooks
+- **Accessors**: Computed attributes via getter methods
 
-## 📦 Installation
+## Installation
 
 ```bash
 go get github.com/rezakhademix/zorm
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Connect to Database
 
@@ -112,7 +112,7 @@ err = zorm.New[User]().Where("id", 1).Delete(ctx)
 
 ---
 
-## 📚 Complete API Reference
+## API Reference
 
 ### Query Methods
 
@@ -183,7 +183,7 @@ err = zorm.New[User]().Where("id", 1).Delete(ctx)
 
 ---
 
-## 🔍 Query Builder Details
+## Query Builder Details
 
 ### Where Conditions
 
@@ -317,7 +317,7 @@ users, _ := zorm.New[User]().Table("archived_users").Get(ctx)
 
 ---
 
-## 🪝 Lifecycle Hooks
+## Lifecycle Hooks
 
 ZORM supports lifecycle hooks that are automatically called during CRUD operations.
 
@@ -400,16 +400,16 @@ err = zorm.New[User]().Update(ctx, user)
 
 ---
 
-## 🎨 Accessors (Computed Attributes)
+## Accessors (Computed Attributes)
 
-Define getter methods to compute virtual attributes. Methods starting with `Get` are automatically called after scanning.
+Define getter methods to compute virtual attributes. Methods starting with `Get` are automatically called after scanning. The struct must have an `Attributes map[string]any` field to store computed values.
 
 ```go
 type User struct {
     ID         int64
     FirstName  string
     LastName   string
-    Attributes map[string]any `zorm:"-"` // Will hold computed values
+    Attributes map[string]any // Holds computed values
 }
 
 // Accessor: GetFullName -> attributes["full_name"]
@@ -430,9 +430,11 @@ fmt.Println(user.Attributes["initials"])   // "JD"
 
 ---
 
-## 🔗 Relationships
+## Relationships
 
 ### Defining Relations
+
+Relations are defined as methods on your model that return a relation type. The method name can be either `RelationName` or `RelationNameRelation` (e.g., `Posts` or `PostsRelation`).
 
 ```go
 type User struct {
@@ -443,6 +445,7 @@ type User struct {
 }
 
 // HasMany: User has many Posts
+// Method can be named "Posts" or "PostsRelation"
 func (u User) PostsRelation() zorm.HasMany[Post] {
     return zorm.HasMany[Post]{
         ForeignKey: "user_id",  // Column in posts table
@@ -451,7 +454,7 @@ func (u User) PostsRelation() zorm.HasMany[Post] {
 }
 
 // HasOne: User has one Profile
-func (u User) Profile() zorm.HasOne[Profile] {
+func (u User) ProfileRelation() zorm.HasOne[Profile] {
     return zorm.HasOne[Profile]{
         ForeignKey: "user_id",
     }
@@ -465,7 +468,7 @@ type Post struct {
 }
 
 // BelongsTo: Post belongs to User
-func (p Post) Author() zorm.BelongsTo[User] {
+func (p Post) AuthorRelation() zorm.BelongsTo[User] {
     return zorm.BelongsTo[User]{
         ForeignKey: "user_id",  // Column in posts table
         OwnerKey:   "id",       // Optional, defaults to primary key
@@ -487,7 +490,7 @@ func (u User) PostsRelation() zorm.HasMany[Post] {
 ### Eager Loading
 
 ```go
-// Load single relation
+// Load single relation (use the relation name without "Relation" suffix)
 users, _ := zorm.New[User]().With("Posts").Get(ctx)
 
 // Load multiple relations
@@ -545,7 +548,7 @@ type Image struct {
 }
 
 // MorphOne: User has one Image
-func (u User) Avatar() zorm.MorphOne[Image] {
+func (u User) AvatarRelation() zorm.MorphOne[Image] {
     return zorm.MorphOne[Image]{
         Type: "ImageableType",  // Type column
         ID:   "ImageableID",    // ID column
@@ -553,7 +556,7 @@ func (u User) Avatar() zorm.MorphOne[Image] {
 }
 
 // MorphMany: Post has many Images
-func (p Post) Images() zorm.MorphMany[Image] {
+func (p Post) ImagesRelation() zorm.MorphMany[Image] {
     return zorm.MorphMany[Image]{
         Type: "ImageableType",
         ID:   "ImageableID",
@@ -569,7 +572,7 @@ images, _ := zorm.New[Image]().WithMorph("Imageable", map[string][]string{
 
 ---
 
-## 🔐 Transactions
+## Transactions
 
 ```go
 // Function-based transaction
@@ -601,7 +604,7 @@ Transaction features:
 
 ---
 
-## ⚠️ Error Handling
+## Error Handling
 
 ZORM provides comprehensive error handling with categorized errors.
 
@@ -694,7 +697,7 @@ if err != nil {
 
 ---
 
-## 🚀 Advanced Features
+## Advanced Features
 
 ### Statement Caching
 
@@ -827,7 +830,7 @@ func Verified(q *zorm.Model[User]) *zorm.Model[User] {
 }
 
 func RecentlyActive(q *zorm.Model[User]) *zorm.Model[User] {
-    return q.Where("last_login >", time.Now().AddDate(0, -1, 0))
+    return q.Where("last_login", ">", time.Now().AddDate(0, -1, 0))
 }
 
 // Chain scopes
@@ -842,18 +845,18 @@ users, _ := zorm.New[User]().
 
 ```go
 sql, args := zorm.New[User]().
-    Where("age >", 18).
+    Where("age", ">", 18).
     OrderBy("name", "ASC").
     Limit(10).
     Print()
 
-fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > $1 ORDER BY name ASC LIMIT 10
+fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > ? ORDER BY name ASC LIMIT 10
 fmt.Println(args)  // [18]
 ```
 
 ---
 
-## 📖 Complete Example With Relations and Hooks
+## Complete Example
 
 ```go
 package main
@@ -884,7 +887,7 @@ func (u *User) BeforeCreate(ctx context.Context) error {
     return nil
 }
 
-func (u User) Posts() zorm.HasMany[Post] {
+func (u User) PostsRelation() zorm.HasMany[Post] {
     return zorm.HasMany[Post]{ForeignKey: "user_id"}
 }
 
@@ -914,7 +917,7 @@ func main() {
 
     // Query with relations
     users, err := zorm.New[User]().
-        Where("age >", 18).
+        Where("age", ">", 18).
         Where("active", true).
         WithCallback("Posts", func(q *zorm.Model[Post]) {
             q.Where("published", true).Limit(5)
@@ -945,10 +948,10 @@ func main() {
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## 📄 License
+## License
 
 MIT License - see LICENSE file for details.
