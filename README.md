@@ -443,7 +443,7 @@ type User struct {
 }
 
 // HasMany: User has many Posts
-func (u User) Posts() zorm.HasMany[Post] {
+func (u User) PostsRelation() zorm.HasMany[Post] {
     return zorm.HasMany[Post]{
         ForeignKey: "user_id",  // Column in posts table
         LocalKey:   "id",       // Optional, defaults to primary key
@@ -476,7 +476,7 @@ func (p Post) Author() zorm.BelongsTo[User] {
 ### Custom Table Names in Relations
 
 ```go
-func (u User) Posts() zorm.HasMany[Post] {
+func (u User) PostsRelation() zorm.HasMany[Post] {
     return zorm.HasMany[Post]{
         ForeignKey: "user_id",
         Table:      "blog_posts",  // Use custom table name
@@ -525,7 +525,7 @@ type User struct {
     Roles []*Role
 }
 
-func (u User) Roles() zorm.BelongsToMany[Role] {
+func (u User) RolesRelation() zorm.BelongsToMany[Role] {
     return zorm.BelongsToMany[Role]{
         PivotTable: "role_user",   // Join table
         ForeignKey: "user_id",     // FK in pivot table
