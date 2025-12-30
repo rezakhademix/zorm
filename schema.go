@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -211,6 +212,11 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 			continue
 		}
 
+		// Skip relation fields (struct pointers and slices that represent relations)
+		if isRelationField(field.Type) {
+			continue
+		}
+
 		// Skip fields with zorm:"-"
 		tag := field.Tag.Get("zorm")
 		if tag == "-" {
@@ -281,6 +287,34 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 		info.Fields[field.Name] = fInfo
 		info.Columns[dbCol] = fInfo
 	}
+}
+
+// timeType is cached to avoid repeated reflect.TypeOf calls.
+var timeType = reflect.TypeOf(time.Time{})
+
+// isRelationField reports whether t represents a relation field that should be
+// excluded from database queries. Relation fields are:
+//   - Pointers to structs (e.g., *Branch) except *time.Time
+//   - Slices of structs or pointers to structs (e.g., []*Post, []Post)
+func isRelationField(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Ptr:
+		return isRelationStruct(t.Elem())
+	case reflect.Slice:
+		elem := t.Elem()
+		if elem.Kind() == reflect.Ptr {
+			elem = elem.Elem()
+		}
+		return isRelationStruct(elem)
+	default:
+		return false
+	}
+}
+
+// isRelationStruct reports whether t is a struct type representing a relation.
+// time.Time is excluded as it's a valid database column type.
+func isRelationStruct(t reflect.Type) bool {
+	return t.Kind() == reflect.Struct && t != timeType
 }
 
 // ToSnakeCase converts a string to snake_case.
