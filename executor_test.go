@@ -600,3 +600,221 @@ func TestTableName_Default(t *testing.T) {
 		t.Errorf("Expected table name 'test_models', got %q", tableName)
 	}
 }
+
+// =============================================================================
+// RELATION FIELD EXCLUSION TESTS
+// =============================================================================
+
+// TestBranch represents a related entity for testing
+type TestBranch struct {
+	ID   int
+	Name string
+}
+
+// TestPost represents a related entity for HasMany testing
+type TestPost struct {
+	ID     int
+	Title  string
+	UserID int
+}
+
+// TestUserWithRelations is a model with relation fields that should be excluded from queries
+type TestUserWithRelations struct {
+	ID        int
+	Name      string
+	Email     string
+	BranchID  *int         // This is a foreign key - should be included
+	Branch    *TestBranch  // This is a relation - should be excluded
+	Posts     []*TestPost  // This is a relation - should be excluded
+}
+
+// TestUpdate_ExcludesRelationFields verifies that Update query doesn't include relation columns
+func TestUpdate_ExcludesRelationFields(t *testing.T) {
+	// Parse the model info to check fields
+	info := ParseModel[TestUserWithRelations]()
+
+	// Verify regular fields are present
+	regularFields := []string{"ID", "Name", "Email", "BranchID"}
+	for _, fieldName := range regularFields {
+		if _, ok := info.Fields[fieldName]; !ok {
+			t.Errorf("Expected field %s to be present in model info", fieldName)
+		}
+	}
+
+	// Verify relation fields are NOT present
+	relationFields := []string{"Branch", "Posts"}
+	for _, fieldName := range relationFields {
+		if _, ok := info.Fields[fieldName]; ok {
+			t.Errorf("Relation field %s should NOT be present in model info", fieldName)
+		}
+	}
+
+	// Verify columns don't include relation columns
+	if _, ok := info.Columns["branch"]; ok {
+		t.Error("Column 'branch' should NOT exist - it's a relation field")
+	}
+	if _, ok := info.Columns["posts"]; ok {
+		t.Error("Column 'posts' should NOT exist - it's a relation field")
+	}
+
+	// Verify foreign key column IS present
+	if _, ok := info.Columns["branch_id"]; !ok {
+		t.Error("Column 'branch_id' should exist - it's a foreign key, not a relation")
+	}
+}
+
+// TestModelInfo_RelationFieldsExcluded verifies ModelInfo correctly excludes relation fields
+func TestModelInfo_RelationFieldsExcluded(t *testing.T) {
+	info := ParseModel[TestUserWithRelations]()
+
+	// Count fields - should only have ID, Name, Email, BranchID (4 fields)
+	expectedFieldCount := 4
+	if len(info.Fields) != expectedFieldCount {
+		t.Errorf("Expected %d fields, got %d. Fields: %v", expectedFieldCount, len(info.Fields), getFieldNames(info.Fields))
+	}
+
+	// Count columns - should match field count
+	if len(info.Columns) != expectedFieldCount {
+		t.Errorf("Expected %d columns, got %d. Columns: %v", expectedFieldCount, len(info.Columns), getColumnNames(info.Columns))
+	}
+}
+
+// Helper to get field names for error messages
+func getFieldNames(fields map[string]*FieldInfo) []string {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	return names
+}
+
+// Helper to get column names for error messages
+func getColumnNames(columns map[string]*FieldInfo) []string {
+	names := make([]string, 0, len(columns))
+	for name := range columns {
+		names = append(names, name)
+	}
+	return names
+}
+
+// TestComment represents a related entity for nested relation testing
+type TestComment struct {
+	ID     int
+	Body   string
+	PostID int
+}
+
+// TestPostWithComments is a model with nested relations
+type TestPostWithComments struct {
+	ID       int
+	Title    string
+	UserID   int
+	Comments []*TestComment // Relation - should be excluded
+}
+
+// TestModelInfo_NestedRelationsExcluded verifies nested relation fields are excluded
+func TestModelInfo_NestedRelationsExcluded(t *testing.T) {
+	info := ParseModel[TestPostWithComments]()
+
+	// Comments field should NOT be present
+	if _, ok := info.Fields["Comments"]; ok {
+		t.Error("Relation field 'Comments' should NOT be present in model info")
+	}
+
+	// comments column should NOT exist
+	if _, ok := info.Columns["comments"]; ok {
+		t.Error("Column 'comments' should NOT exist - it's a relation field")
+	}
+
+	// Regular fields should be present
+	expectedFields := []string{"ID", "Title", "UserID"}
+	for _, fieldName := range expectedFields {
+		if _, ok := info.Fields[fieldName]; !ok {
+			t.Errorf("Expected field %s to be present", fieldName)
+		}
+	}
+}
+
+// TestProfile represents a HasOne relation target
+type TestProfile struct {
+	ID     int
+	Bio    string
+	UserID int
+}
+
+// TestUserWithProfile tests pointer to struct (HasOne style relation)
+type TestUserWithProfile struct {
+	ID        int
+	Name      string
+	Profile   *TestProfile // HasOne relation - should be excluded
+	ProfileID *int         // Foreign key - should be included
+}
+
+// TestModelInfo_HasOneRelationExcluded verifies HasOne relation fields are excluded
+func TestModelInfo_HasOneRelationExcluded(t *testing.T) {
+	info := ParseModel[TestUserWithProfile]()
+
+	// Profile field should NOT be present
+	if _, ok := info.Fields["Profile"]; ok {
+		t.Error("HasOne relation field 'Profile' should NOT be present in model info")
+	}
+
+	// profile column should NOT exist
+	if _, ok := info.Columns["profile"]; ok {
+		t.Error("Column 'profile' should NOT exist - it's a relation field")
+	}
+
+	// ProfileID (foreign key) should be present
+	if _, ok := info.Fields["ProfileID"]; !ok {
+		t.Error("Foreign key field 'ProfileID' should be present")
+	}
+	if _, ok := info.Columns["profile_id"]; !ok {
+		t.Error("Column 'profile_id' should exist - it's a foreign key")
+	}
+}
+
+// TestModelInfo_MultipleRelationsExcluded tests a model with multiple relation types
+func TestModelInfo_MultipleRelationsExcluded(t *testing.T) {
+	// TestUserWithRelations has:
+	// - BranchID *int (foreign key - include)
+	// - Branch *TestBranch (BelongsTo relation - exclude)
+	// - Posts []*TestPost (HasMany relation - exclude)
+	info := ParseModel[TestUserWithRelations]()
+
+	tests := []struct {
+		name     string
+		field    string
+		column   string
+		shouldExist bool
+	}{
+		{"ID field", "ID", "id", true},
+		{"Name field", "Name", "name", true},
+		{"Email field", "Email", "email", true},
+		{"BranchID foreign key", "BranchID", "branch_id", true},
+		{"Branch relation", "Branch", "branch", false},
+		{"Posts relation", "Posts", "posts", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, fieldExists := info.Fields[tt.field]
+			_, columnExists := info.Columns[tt.column]
+
+			if tt.shouldExist {
+				if !fieldExists {
+					t.Errorf("Field %s should exist", tt.field)
+				}
+				if !columnExists {
+					t.Errorf("Column %s should exist", tt.column)
+				}
+			} else {
+				if fieldExists {
+					t.Errorf("Field %s should NOT exist (it's a relation)", tt.field)
+				}
+				if columnExists {
+					t.Errorf("Column %s should NOT exist (it's a relation)", tt.column)
+				}
+			}
+		})
+	}
+}

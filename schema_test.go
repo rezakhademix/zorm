@@ -72,6 +72,48 @@ func TestParseModel_Embedded(t *testing.T) {
 	}
 }
 
+// RelatedModel is used as a relation target
+type RelatedModel struct {
+	ID   int
+	Name string
+}
+
+// ModelWithRelations tests that relation fields are excluded from columns
+type ModelWithRelations struct {
+	ID        int
+	Name      string
+	Related   *RelatedModel   // Should be skipped (pointer to struct)
+	RelatedMany []*RelatedModel // Should be skipped (slice of pointers to structs)
+}
+
+func TestParseModel_SkipsRelationFields(t *testing.T) {
+	info := ParseModel[ModelWithRelations]()
+
+	// Regular fields should be present
+	if _, ok := info.Fields["ID"]; !ok {
+		t.Error("missing field ID")
+	}
+	if _, ok := info.Fields["Name"]; !ok {
+		t.Error("missing field Name")
+	}
+
+	// Relation fields should be excluded
+	if _, ok := info.Fields["Related"]; ok {
+		t.Error("field Related (pointer to struct) should be skipped as relation")
+	}
+	if _, ok := info.Fields["RelatedMany"]; ok {
+		t.Error("field RelatedMany (slice of structs) should be skipped as relation")
+	}
+
+	// Columns should also not contain relation fields
+	if _, ok := info.Columns["related"]; ok {
+		t.Error("column related should not exist")
+	}
+	if _, ok := info.Columns["related_many"]; ok {
+		t.Error("column related_many should not exist")
+	}
+}
+
 func TestFillStruct(t *testing.T) {
 	m := &TestModel{}
 	data := map[string]any{

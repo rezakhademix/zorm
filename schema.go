@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -211,6 +212,11 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 			continue
 		}
 
+		// Skip relation fields (struct pointers and slices that represent relations)
+		if isRelationField(field.Type) {
+			continue
+		}
+
 		// Skip fields with zorm:"-"
 		tag := field.Tag.Get("zorm")
 		if tag == "-" {
@@ -281,6 +287,38 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 		info.Fields[field.Name] = fInfo
 		info.Columns[dbCol] = fInfo
 	}
+}
+
+// timeType is used to check if a type is time.Time
+var timeType = reflect.TypeOf(time.Time{})
+
+// isRelationField checks if a field type represents a relation (should be skipped in queries).
+// Returns true for:
+// - Pointers to structs (except time.Time)
+// - Slices of structs or pointers to structs
+func isRelationField(t reflect.Type) bool {
+	// Check for slice types (e.g., []*Post, []Post)
+	if t.Kind() == reflect.Slice {
+		elemType := t.Elem()
+		if elemType.Kind() == reflect.Ptr {
+			elemType = elemType.Elem()
+		}
+		// Slices of structs are relations
+		if elemType.Kind() == reflect.Struct && elemType != timeType {
+			return true
+		}
+	}
+
+	// Check for pointer to struct (e.g., *Branch)
+	if t.Kind() == reflect.Ptr {
+		elemType := t.Elem()
+		// Pointer to struct (except time.Time) is a relation
+		if elemType.Kind() == reflect.Struct && elemType != timeType {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ToSnakeCase converts a string to snake_case.
