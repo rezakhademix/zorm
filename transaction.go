@@ -3,6 +3,8 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 )
 
 // Tx wraps sql.Tx.
@@ -10,6 +12,9 @@ type Tx struct {
 	Tx  *sql.Tx
 	ctx context.Context
 }
+
+// ErrRollbackFailed is returned when transaction rollback fails
+var ErrRollbackFailed = errors.New("zorm: rollback failed")
 
 // Transaction executes a function within a transaction.
 func Transaction(ctx context.Context, fn func(tx *Tx) error) error {
@@ -41,10 +46,15 @@ func transaction(ctx context.Context, db *sql.DB, fn func(tx *Tx) error) (err er
 
 	defer func() {
 		if p := recover(); p != nil {
-			tx.Rollback()
+			// Attempt rollback on panic, but still re-panic with original value
+			// Rollback error is discarded as we must re-panic
+			_ = tx.Rollback()
 			panic(p)
 		} else if err != nil {
-			tx.Rollback()
+			// Wrap rollback error with original error if rollback fails
+			if rbErr := tx.Rollback(); rbErr != nil {
+				err = fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
+			}
 		} else {
 			err = tx.Commit()
 		}

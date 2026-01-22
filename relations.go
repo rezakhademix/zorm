@@ -337,7 +337,10 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 
 func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any, relName string, typeMap map[string][]string) error {
 	// 1. Get Type and ID fields from MorphTo config
-	morphRel, _ := relConfig.(MorphTo[any])
+	morphRel, ok := relConfig.(MorphTo[any])
+	if !ok {
+		return fmt.Errorf("relation %s: expected MorphTo[any], got %T", relName, relConfig)
+	}
 	typeField := morphRel.Type
 	idField := morphRel.ID
 
@@ -655,7 +658,10 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	if relatedKey == "" {
 		// We need to know the related model type name
 		// We can get it from relConfig (BelongsToMany[R])
-		rel, _ := relConfig.(Relation)
+		rel, ok := relConfig.(Relation)
+		if !ok {
+			return fmt.Errorf("BelongsToMany: expected Relation interface, got %T", relConfig)
+		}
 		relatedPtr := rel.NewRelated()
 		relatedType := reflect.TypeOf(relatedPtr).Elem()
 		relatedKey = ToSnakeCase(relatedType.Name()) + "_id"
@@ -689,19 +695,21 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	}
 	defer rows.Close()
 
-	// Map: ForeignID -> []RelatedID
-	pivotMap := make(map[any][]any)
+	// Map: ForeignID (string key) -> []RelatedID (string keys)
+	pivotMap := make(map[string][]string)
 	allRelatedIDs := make([]any, 0)
-	relatedIDSet := make(map[any]bool)
+	relatedIDSet := make(map[string]bool)
 
 	for rows.Next() {
 		var fID, rID any
 		if err := rows.Scan(&fID, &rID); err != nil {
 			return err
 		}
-		pivotMap[fID] = append(pivotMap[fID], rID)
-		if !relatedIDSet[rID] {
-			relatedIDSet[rID] = true
+		fKey := fmt.Sprintf("%v", fID)
+		rKey := fmt.Sprintf("%v", rID)
+		pivotMap[fKey] = append(pivotMap[fKey], rKey)
+		if !relatedIDSet[rKey] {
+			relatedIDSet[rKey] = true
 			allRelatedIDs = append(allRelatedIDs, rID)
 		}
 	}
@@ -711,7 +719,10 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	}
 
 	// 4. Query Related Model
-	rel, _ := relConfig.(Relation)
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("BelongsToMany: expected Relation interface, got %T", relConfig)
+	}
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
@@ -738,32 +749,30 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	}
 
 	// 6. Map back to parents
-	// Map: RelatedID -> RelatedInstance
-	relatedIdxMap := make(map[any]reflect.Value)
+	// Map: RelatedID (string key) -> RelatedInstance
+	relatedIdxMap := make(map[string]reflect.Value)
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		rID := val.FieldByName(relatedInfo.Columns[joinKey].Name).Interface()
-		relatedIdxMap[rID] = reflect.ValueOf(res)
+		rKey := fmt.Sprintf("%v", rID)
+		relatedIdxMap[rKey] = reflect.ValueOf(res)
 	}
 
 	for i, parent := range results {
 		parentVal := reflect.ValueOf(parent).Elem()
 		parentID := ids[i]
+		parentKey := fmt.Sprintf("%v", parentID)
 
-		// Find in pivotMap using compareIDs for robustness
-		var children []reflect.Value
-		for fID, rIDs := range pivotMap {
-			if compareIDs(fID, parentID) {
-				for _, rID := range rIDs {
-					// Find in relatedIdxMap using compareIDs
-					for relID, child := range relatedIdxMap {
-						if compareIDs(relID, rID) {
-							children = append(children, child)
-							break
-						}
-					}
-				}
-				break
+		rIDs, found := pivotMap[parentKey]
+		if !found {
+			continue
+		}
+
+		children := make([]reflect.Value, 0, len(rIDs))
+		for _, rKey := range rIDs {
+			// Find in relatedIdxMap using O(1) string key lookup
+			if child, ok := relatedIdxMap[rKey]; ok {
+				children = append(children, child)
 			}
 		}
 
@@ -802,7 +811,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	}
 
 	fks := make([]any, 0, len(results))
-	fkMap := make(map[any][]int) // FK -> []ParentIndices
+	fkMap := make(map[string][]int)   // FK string key -> []ParentIndices
+	fkValues := make(map[string]any)  // FK string key -> original FK value (for query)
 
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
@@ -846,19 +856,13 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			continue
 		}
 
-		// Check if this FK value is already in the list
-		found := false
-		for existingFK := range fkMap {
-			if compareIDs(existingFK, fkVal) {
-				fkMap[existingFK] = append(fkMap[existingFK], i)
-				found = true
-				break
-			}
-		}
-
-		if !found {
+		fkKey := fmt.Sprintf("%v", fkVal)
+		if _, exists := fkMap[fkKey]; exists {
+			fkMap[fkKey] = append(fkMap[fkKey], i)
+		} else {
 			fks = append(fks, fkVal)
-			fkMap[fkVal] = append(fkMap[fkVal], i)
+			fkMap[fkKey] = []int{i}
+			fkValues[fkKey] = fkVal
 		}
 	}
 
@@ -898,7 +902,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 	}
 
-	relatedByPK := make(map[any]reflect.Value)
+	relatedByPK := make(map[string]reflect.Value) // Use string key for O(1) lookup
 
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
@@ -910,21 +914,15 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 
 		resPK := val.FieldByName(pkFieldName).Interface()
-		relatedByPK[resPK] = reflect.ValueOf(res)
+		pkKey := fmt.Sprintf("%v", resPK)
+		relatedByPK[pkKey] = reflect.ValueOf(res)
 	}
 
 	// Now assign the related records to parent entities
-	for fkValue, indices := range fkMap {
-		// Find the related record with PK matching this FK value
-		var relatedRecord reflect.Value
-		for pk, record := range relatedByPK {
-			if compareIDs(pk, fkValue) {
-				relatedRecord = record
-				break
-			}
-		}
-
-		if !relatedRecord.IsValid() {
+	for fkKey, indices := range fkMap {
+		// Find the related record with PK matching this FK value (O(1) lookup)
+		relatedRecord, found := relatedByPK[fkKey]
+		if !found || !relatedRecord.IsValid() {
 			continue
 		}
 
@@ -1230,7 +1228,10 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		}
 	}
 
-	rel, _ := relConfig.(Relation)
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("loadHasManyDynamic: expected Relation interface, got %T", relConfig)
+	}
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
@@ -1349,6 +1350,11 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 		return WrapRelationError(relation, "pivot", ErrInvalidConfig)
 	}
 
+	// Validate relation identifiers to prevent SQL injection
+	if err := ValidateColumnName(pivotTable); err != nil {
+		return fmt.Errorf("invalid pivot table name: %w", err)
+	}
+
 	// 2. Get Parent ID
 	parentVal := reflect.ValueOf(entity).Elem()
 	pkField := m.modelInfo.PrimaryKey
@@ -1366,6 +1372,14 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 		return WrapRelationError(relation, "pivot", ErrInvalidConfig)
 	}
 
+	// Validate key columns
+	if err := ValidateColumnName(foreignKey); err != nil {
+		return fmt.Errorf("invalid foreign key name: %w", err)
+	}
+	if err := ValidateColumnName(relatedKey); err != nil {
+		return fmt.Errorf("invalid related key name: %w", err)
+	}
+
 	// 3. Bulk Insert
 	// We need to collect all columns first to ensure consistency
 	// Base columns: foreignKey, relatedKey
@@ -1381,6 +1395,10 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 
 	var extraCols []string
 	for k := range pivotColsMap {
+		// Validate extra column names
+		if err := ValidateColumnName(k); err != nil {
+			return fmt.Errorf("invalid pivot column name %q: %w", k, err)
+		}
 		extraCols = append(extraCols, k)
 	}
 
@@ -1457,6 +1475,11 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 		return fmt.Errorf("pivot table not defined")
 	}
 
+	// Validate relation identifiers to prevent SQL injection
+	if err := ValidateColumnName(pivotTable); err != nil {
+		return fmt.Errorf("invalid pivot table name: %w", err)
+	}
+
 	// 2. Get Parent ID
 	parentVal := reflect.ValueOf(entity).Elem()
 	pkField := m.modelInfo.PrimaryKey
@@ -1471,6 +1494,11 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
 	}
 
+	// Validate foreign key column
+	if err := ValidateColumnName(foreignKey); err != nil {
+		return fmt.Errorf("invalid foreign key name: %w", err)
+	}
+
 	// 3. Delete
 	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", pivotTable, foreignKey)
 	args := []any{parentID}
@@ -1478,6 +1506,10 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	if len(ids) > 0 {
 		if relatedKey == "" {
 			return fmt.Errorf("RelatedKey must be defined for Detach with IDs")
+		}
+		// Validate related key column
+		if err := ValidateColumnName(relatedKey); err != nil {
+			return fmt.Errorf("invalid related key name: %w", err)
 		}
 		placeholders := make([]string, len(ids))
 		for i, id := range ids {
@@ -1524,6 +1556,11 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 		return fmt.Errorf("pivot table not defined")
 	}
 
+	// Validate relation identifiers to prevent SQL injection
+	if err := ValidateColumnName(pivotTable); err != nil {
+		return fmt.Errorf("invalid pivot table name: %w", err)
+	}
+
 	// 2. Get Parent ID
 	parentVal := reflect.ValueOf(entity).Elem()
 	pkField := m.modelInfo.PrimaryKey
@@ -1541,6 +1578,14 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 		return fmt.Errorf("RelatedKey must be defined for Sync")
 	}
 
+	// Validate key columns
+	if err := ValidateColumnName(foreignKey); err != nil {
+		return fmt.Errorf("invalid foreign key name: %w", err)
+	}
+	if err := ValidateColumnName(relatedKey); err != nil {
+		return fmt.Errorf("invalid related key name: %w", err)
+	}
+
 	// 3. Get Current IDs
 	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", relatedKey, pivotTable, foreignKey)
 	rows, err := m.queryer().QueryContext(ctx, query, parentID)
@@ -1549,54 +1594,37 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	}
 	defer rows.Close()
 
-	currentIDs := make(map[any]bool)
+	currentIDs := make(map[string]any) // string key -> original value
 	for rows.Next() {
 		var id any
 		if err := rows.Scan(&id); err != nil {
 			return err
 		}
-		// Handle type mismatch? Scan into interface{} might give int64, but input might be int.
-		// We should normalize or be careful.
-		// For simplicity, let's assume compatible types or string comparison if needed.
-		currentIDs[id] = true
+		key := fmt.Sprintf("%v", id)
+		currentIDs[key] = id
 	}
 
 	// 4. Determine Attach and Detach
 	var toAttach []any
 	var toDetach []any
 
-	// Normalize input IDs to map for lookup
-	newIDsMap := make(map[any]bool)
+	// Normalize input IDs to map for O(1) lookup
+	newIDsMap := make(map[string]any) // string key -> original value
 	for _, id := range ids {
-		newIDsMap[id] = true
+		key := fmt.Sprintf("%v", id)
+		newIDsMap[key] = id
 	}
 
-	// Find toAttach (in new but not in current)
-	for _, id := range ids {
-		// We need to check if id is in currentIDs.
-		// Handle type conversion properly for numeric types
-		found := false
-		for curID := range currentIDs {
-			if compareIDs(curID, id) {
-				found = true
-				break
-			}
-		}
-		if !found {
+	// Find toAttach (in new but not in current) - O(n) instead of O(n²)
+	for key, id := range newIDsMap {
+		if _, exists := currentIDs[key]; !exists {
 			toAttach = append(toAttach, id)
 		}
 	}
 
-	// Find toDetach (in current but not in new)
-	for curID := range currentIDs {
-		found := false
-		for _, id := range ids {
-			if compareIDs(curID, id) {
-				found = true
-				break
-			}
-		}
-		if !found {
+	// Find toDetach (in current but not in new) - O(n) instead of O(n²)
+	for key, curID := range currentIDs {
+		if _, exists := newIDsMap[key]; !exists {
 			toDetach = append(toDetach, curID)
 		}
 	}
