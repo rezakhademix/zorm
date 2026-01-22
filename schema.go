@@ -36,6 +36,21 @@ var snakeCaseCache sync.Map
 // ErrInvalidColumnName is returned when a column name contains invalid characters.
 var ErrInvalidColumnName = fmt.Errorf("zorm: invalid column name")
 
+// dangerousKeywordsMap provides lookup for exact keyword matches.
+// Used by ValidateColumnName to detect SQL injection attempts.
+var dangerousKeywordsMap = map[string]bool{
+	"union": true, "select": true, "insert": true, "update": true,
+	"delete": true, "drop": true, "truncate": true, "alter": true,
+	"exec": true, "execute": true, "xp_": true, "sp_": true, "0x": true,
+}
+
+// dangerousKeywordsList is used for word boundary checks (prefix/suffix with spaces).
+// Package-level to avoid allocation on each ValidateColumnName call.
+var dangerousKeywordsList = []string{
+	"union", "select", "insert", "update", "delete", "drop", "truncate", "alter", "exec", "execute",
+	"xp_", "sp_", "0x",
+}
+
 // ValidateColumnName checks if a column name is safe to use in SQL queries.
 // It uses a strict whitelist approach to prevent SQL injection.
 // Allowed characters: alphanumeric, underscore, dot, asterisk, space, parens, comma.
@@ -56,18 +71,18 @@ func ValidateColumnName(name string) error {
 	// Check for dangerous keywords that might be allowed by the whitelist
 	// We check for whole words to avoid false positives (e.g. "update_at")
 	lower := strings.ToLower(name)
-	dangerousKeywords := []string{
-		"union", "select", "insert", "update", "delete", "drop", "truncate", "alter", "exec", "execute",
-		"xp_", "sp_", "0x",
+
+	// Fast path: O(1) exact match check using map
+	if dangerousKeywordsMap[lower] {
+		return fmt.Errorf("%w: dangerous keyword '%s' detected in '%s'", ErrInvalidColumnName, lower, name)
 	}
 
-	for _, keyword := range dangerousKeywords {
-		// Check for word boundaries using space (simplest approach given allowed chars)
-		// This catches "id UNION SELECT" but allows "union_member"
+	// Check for word boundaries using space (simplest approach given allowed chars)
+	// This catches "id UNION SELECT" but allows "union_member"
+	for _, keyword := range dangerousKeywordsList {
 		if strings.Contains(lower, " "+keyword+" ") ||
 			strings.HasPrefix(lower, keyword+" ") ||
-			strings.HasSuffix(lower, " "+keyword) ||
-			lower == keyword {
+			strings.HasSuffix(lower, " "+keyword) {
 			return fmt.Errorf("%w: dangerous keyword '%s' detected in '%s'", ErrInvalidColumnName, keyword, name)
 		}
 	}
@@ -81,6 +96,39 @@ func MustValidateColumnName(name string) {
 	if err := ValidateColumnName(name); err != nil {
 		panic(err)
 	}
+}
+
+// ValidateRawQuery validates a raw SQL query fragment to prevent SQL injection.
+// It checks for dangerous patterns like comments, multiple statements, and suspicious keywords.
+// This is used for HAVING clauses and other places where raw query fragments are accepted.
+func ValidateRawQuery(query string) error {
+	if query == "" {
+		return fmt.Errorf("%w: empty query", ErrInvalidColumnName)
+	}
+
+	// Check for comment patterns
+	if strings.Contains(query, "--") || strings.Contains(query, "/*") || strings.Contains(query, "*/") {
+		return fmt.Errorf("%w: SQL comments not allowed in query '%s'", ErrInvalidColumnName, query)
+	}
+
+	// Check for multiple statements
+	if strings.Contains(query, ";") {
+		return fmt.Errorf("%w: multiple statements not allowed in query '%s'", ErrInvalidColumnName, query)
+	}
+
+	// Check for dangerous keywords at word boundaries
+	lower := strings.ToLower(query)
+	dangerousQueryKeywords := []string{"union", "insert", "update", "delete", "drop", "truncate", "alter", "exec", "execute"}
+	for _, keyword := range dangerousQueryKeywords {
+		if strings.Contains(lower, " "+keyword+" ") ||
+			strings.HasPrefix(lower, keyword+" ") ||
+			strings.HasSuffix(lower, " "+keyword) ||
+			lower == keyword {
+			return fmt.Errorf("%w: dangerous keyword '%s' detected in query '%s'", ErrInvalidColumnName, keyword, query)
+		}
+	}
+
+	return nil
 }
 
 // ModelInfo holds the reflection data for a model struct.

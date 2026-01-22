@@ -84,18 +84,15 @@ func (m *Model[T]) queryerForWrite() interface {
 	return GlobalDB
 }
 
-// prepareStmt returns a prepared statement for the given query.
-// If statement caching is enabled (m.stmtCache != nil), it attempts to:
-// 1. Retrieve the statement from cache
-// 2. If not found, prepare the statement and cache it
-// If caching is not enabled, it prepares the statement directly without caching.
-//
-// Returns the statement and a release function. The caller MUST call the release function
-// when finished using the statement.
-func (m *Model[T]) prepareStmt(ctx context.Context, query string) (*sql.Stmt, func(), error) {
+// prepareStmtWithQueryer is the internal implementation for statement preparation.
+// It takes a queryer interface to allow reuse between read and write operations.
+func (m *Model[T]) prepareStmtWithQueryer(ctx context.Context, query string, q interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}) (*sql.Stmt, func(), error) {
 	// If caching is not enabled, prepare directly
 	if m.stmtCache == nil {
-		q := m.queryer()
 		var stmt *sql.Stmt
 		var err error
 		// We need the underlying *sql.DB or *sql.Tx to prepare
@@ -120,7 +117,6 @@ func (m *Model[T]) prepareStmt(ctx context.Context, query string) (*sql.Stmt, fu
 	}
 
 	// Not in cache, prepare it
-	q := m.queryer()
 	var stmt *sql.Stmt
 	var err error
 
@@ -136,77 +132,28 @@ func (m *Model[T]) prepareStmt(ctx context.Context, query string) (*sql.Stmt, fu
 		return nil, nil, err
 	}
 
-	// Store in cache
-	m.stmtCache.Put(query, stmt)
+	// Store in cache and get with incremented ref count atomically
+	// This avoids race conditions where the statement could be evicted between Put and Get
+	cachedStmt, release := m.stmtCache.PutAndGet(query, stmt)
+	return cachedStmt, release, nil
+}
 
-	// Get from cache to increment ref count and get release func
-	// If Put evicted it immediately (race), Get might return nil?
-	// The new cache implementation supports Put then Get.
-	// But what if another thread evicted it between Put and Get?
-	// We'd have to prepare again. Loop?
-	// Simplification: For now, assume it's there.
-	cachedStmt, release := m.stmtCache.Get(query)
-	if cachedStmt != nil {
-		return cachedStmt, release, nil
-	}
-
-	// Fallback if evicted immediately: just return the raw stmt + close
-	return stmt, func() { stmt.Close() }, nil
+// prepareStmt returns a prepared statement for the given query.
+// If statement caching is enabled (m.stmtCache != nil), it attempts to:
+// 1. Retrieve the statement from cache
+// 2. If not found, prepare the statement and cache it
+// If caching is not enabled, it prepares the statement directly without caching.
+//
+// Returns the statement and a release function. The caller MUST call the release function
+// when finished using the statement.
+func (m *Model[T]) prepareStmt(ctx context.Context, query string) (*sql.Stmt, func(), error) {
+	return m.prepareStmtWithQueryer(ctx, query, m.queryer())
 }
 
 // prepareStmtForWrite returns a prepared statement for write operations.
 // Similar to prepareStmt but uses queryerForWrite to ensure primary database is used.
 func (m *Model[T]) prepareStmtForWrite(ctx context.Context, query string) (*sql.Stmt, func(), error) {
-	// If caching is not enabled, prepare directly
-	if m.stmtCache == nil {
-		q := m.queryerForWrite()
-		var stmt *sql.Stmt
-		var err error
-		if db, ok := q.(*sql.DB); ok {
-			stmt, err = db.PrepareContext(ctx, query)
-		} else if tx, ok := q.(*sql.Tx); ok {
-			stmt, err = tx.PrepareContext(ctx, query)
-		} else {
-			return nil, nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
-		}
-
-		if err != nil {
-			return nil, nil, err
-		}
-		return stmt, func() { stmt.Close() }, nil
-	}
-
-	// Try to get from cache
-	if stmt, release := m.stmtCache.Get(query); stmt != nil {
-		return stmt, release, nil
-	}
-
-	// Not in cache, prepare it
-	q := m.queryerForWrite()
-	var stmt *sql.Stmt
-	var err error
-
-	if db, ok := q.(*sql.DB); ok {
-		stmt, err = db.PrepareContext(ctx, query)
-	} else if tx, ok := q.(*sql.Tx); ok {
-		stmt, err = tx.PrepareContext(ctx, query)
-	} else {
-		return nil, nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
-	}
-
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Store in cache
-	m.stmtCache.Put(query, stmt)
-
-	cachedStmt, release := m.stmtCache.Get(query)
-	if cachedStmt != nil {
-		return cachedStmt, release, nil
-	}
-
-	return stmt, func() { stmt.Close() }, nil
+	return m.prepareStmtWithQueryer(ctx, query, m.queryerForWrite())
 }
 
 // Get executes the query and returns a slice of results.
@@ -249,10 +196,12 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 }
 
 // First executes the query and returns the first result.
+// Uses Clone() to avoid mutating the original query state.
 func (m *Model[T]) First(ctx context.Context) (*T, error) {
-	// Enforce limit 1
-	m.limit = 1
-	results, err := m.Get(ctx)
+	// Clone to avoid mutating the original model's limit
+	q := m.Clone()
+	q.limit = 1
+	results, err := q.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -274,20 +223,36 @@ func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
 }
 
 // Pluck retrieves a single column's values from the result set.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
+	if err := ValidateColumnName(column); err != nil {
+		return nil, err
+	}
+
+	// Backup columns state
+	oldColumns := m.columns
+
 	// We only select the specific column
-	// But we need to be careful not to overwrite existing select if user manually selected?
-	// Usually Pluck overrides select.
 	m.columns = []string{column}
 
 	query, args := m.buildSelectQuery()
+
+	// Restore columns state
+	m.columns = oldColumns
+
 	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return nil, WrapQueryError("SELECT", query, args, err)
 	}
 	defer rows.Close()
 
-	var results []any
+	// Pre-allocate results slice based on limit or default capacity
+	initialCap := m.limit
+	if initialCap <= 0 {
+		initialCap = 64 // Default capacity for unbounded queries
+	}
+	results := make([]any, 0, initialCap)
+
 	for rows.Next() {
 		var val any
 		if err := rows.Scan(&val); err != nil {
@@ -411,7 +376,12 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 
 // Sum calculates the sum of a column.
 // Returns 0 if no rows match or the sum is null.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
+	if err := ValidateColumnName(column); err != nil {
+		return 0, err
+	}
+
 	// Backup limit/offset/order
 	limit, offset := m.limit, m.offset
 	orderBys := m.orderBys
@@ -467,7 +437,12 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 
 // Avg calculates the average of a column.
 // Returns 0 if no rows match or the average is null.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
+	if err := ValidateColumnName(column); err != nil {
+		return 0, err
+	}
+
 	// Backup limit/offset/order
 	limit, offset := m.limit, m.offset
 	orderBys := m.orderBys
@@ -527,7 +502,12 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 // CountOver returns count of records partitioned by the specified column.
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64, error) {
+	if err := ValidateColumnName(column); err != nil {
+		return nil, err
+	}
+
 	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
 	query := fmt.Sprintf("SELECT %s, COUNT(*) OVER (PARTITION BY %s) as count FROM %s",
 		column, column, m.TableName())
@@ -1215,7 +1195,14 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	var tx *sql.Tx
 	var err error
 	if m.tx == nil {
-		tx, err = m.db.BeginTx(ctx, nil)
+		db := m.db
+		if db == nil {
+			db = GlobalDB
+		}
+		if db == nil {
+			return ErrNilDatabase
+		}
+		tx, err = db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}

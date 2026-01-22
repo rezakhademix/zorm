@@ -8,7 +8,6 @@ import (
 	"strings"
 )
 
-// Sentinel errors for common failure cases
 var (
 	// ErrRecordNotFound Query errors
 	// ErrRecordNotFound is returned when a query returns no results
@@ -49,6 +48,8 @@ var (
 	ErrConnectionLost = errors.New("zorm: connection lost")
 	// ErrTimeout is returned when a query or connection times out
 	ErrTimeout = errors.New("zorm: operation timeout")
+	// ErrNilDatabase is returned when database connection is nil
+	ErrNilDatabase = errors.New("zorm: database connection is nil")
 
 	// ErrTransactionDeadlock Transaction errors
 	// ErrTransactionDeadlock is returned when a deadlock is detected

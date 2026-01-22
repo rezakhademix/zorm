@@ -180,63 +180,77 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 }
 
 // WhereNull adds an AND condition that checks whether the given column is NULL.
+// Column names are validated to prevent SQL injection.
 //
 // Example:
 //
 //	Model[User]().WhereNull("deleted_at")
 //	// WHERE deleted_at IS NULL
 func (m *Model[T]) WhereNull(column string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	m.wheres = append(m.wheres, "AND "+column+" IS NULL")
 	return m
 }
 
 // OrWhereNull adds an OR condition that checks whether the given column is NULL.
+// Column names are validated to prevent SQL injection.
 //
 // Example:
 //
 //	Model[User]().OrWhereNull("deleted_at")
 //	// OR deleted_at IS NULL
 func (m *Model[T]) OrWhereNull(column string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	m.wheres = append(m.wheres, "OR "+column+" IS NULL")
 	return m
 }
 
 // WhereNotNull adds an AND condition that checks whether the given column is NOT NULL.
+// Column names are validated to prevent SQL injection.
 //
 // Example:
 //
 //	Model[User]().WhereNotNull("verified_at")
 //	// WHERE verified_at IS NOT NULL
 func (m *Model[T]) WhereNotNull(column string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	m.wheres = append(m.wheres, "AND "+column+" IS NOT NULL")
 	return m
 }
 
 // OrWhereNotNull adds an OR condition that checks whether the given column is NOT NULL.
+// Column names are validated to prevent SQL injection.
 //
 // Example:
 //
 //	Model[User]().OrWhereNotNull("verified_at")
 //	// OR verified_at IS NOT NULL
 func (m *Model[T]) OrWhereNotNull(column string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	m.wheres = append(m.wheres, "OR "+column+" IS NOT NULL")
 	return m
 }
 
 // Chunk processes the results in chunks to save memory.
+// Uses Clone() for each iteration to avoid mutating the original query state.
 func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) error) error {
 	page := 1
 	for {
-		// Clone the builder to avoid modifying the original state permanently?
-		// Or just modify limit/offset.
-		// Since we are iterating, modifying m is fine if we reset or just keep moving.
-		// But m.Get() uses m.limit/m.offset.
-
-		// We need to preserve original conditions but update offset.
+		// Clone to avoid mutating the original model's limit/offset
+		q := m.Clone()
 		offset := (page - 1) * size
-		m.Limit(size).Offset(offset)
+		q.limit = size
+		q.offset = offset
 
-		results, err := m.Get(ctx)
+		results, err := q.Get(ctx)
 		if err != nil {
 			return err
 		}
@@ -313,35 +327,75 @@ func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
 }
 
 // GroupByRollup adds a GROUP BY ROLLUP clause.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
-	m.groupBys = append(m.groupBys, fmt.Sprintf("ROLLUP (%s)", strings.Join(columns, ", ")))
+	var validCols []string
+	for _, col := range columns {
+		if err := ValidateColumnName(col); err != nil {
+			continue // Skip invalid column names
+		}
+		validCols = append(validCols, col)
+	}
+	if len(validCols) > 0 {
+		m.groupBys = append(m.groupBys, fmt.Sprintf("ROLLUP (%s)", strings.Join(validCols, ", ")))
+	}
 	return m
 }
 
 // GroupByCube adds a GROUP BY CUBE clause.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) GroupByCube(columns ...string) *Model[T] {
-	m.groupBys = append(m.groupBys, fmt.Sprintf("CUBE (%s)", strings.Join(columns, ", ")))
+	var validCols []string
+	for _, col := range columns {
+		if err := ValidateColumnName(col); err != nil {
+			continue // Skip invalid column names
+		}
+		validCols = append(validCols, col)
+	}
+	if len(validCols) > 0 {
+		m.groupBys = append(m.groupBys, fmt.Sprintf("CUBE (%s)", strings.Join(validCols, ", ")))
+	}
 	return m
 }
 
 // GroupByGroupingSets adds a GROUP BY GROUPING SETS clause.
 // Each slice in sets represents a grouping set.
 // Empty slice represents empty grouping set ().
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 	var setStrings []string
 	for _, set := range sets {
 		if len(set) == 0 {
 			setStrings = append(setStrings, "()")
 		} else {
-			setStrings = append(setStrings, fmt.Sprintf("(%s)", strings.Join(set, ", ")))
+			var validCols []string
+			for _, col := range set {
+				if err := ValidateColumnName(col); err != nil {
+					continue // Skip invalid column names
+				}
+				validCols = append(validCols, col)
+			}
+			if len(validCols) > 0 {
+				setStrings = append(setStrings, fmt.Sprintf("(%s)", strings.Join(validCols, ", ")))
+			}
 		}
 	}
-	m.groupBys = append(m.groupBys, fmt.Sprintf("GROUPING SETS (%s)", strings.Join(setStrings, ", ")))
+	if len(setStrings) > 0 {
+		m.groupBys = append(m.groupBys, fmt.Sprintf("GROUPING SETS (%s)", strings.Join(setStrings, ", ")))
+	}
 	return m
 }
 
 // Having adds a HAVING clause (used with GROUP BY).
+// The query string is validated to prevent SQL injection by checking for dangerous patterns.
+// Use parameterized values (?) for user input.
+// Example: Having("COUNT(*) > ?", 5)
 func (m *Model[T]) Having(query string, args ...any) *Model[T] {
+	// Validate query to prevent SQL injection
+	if err := ValidateRawQuery(query); err != nil {
+		return m // Skip invalid queries
+	}
+
 	// Similar to Where, but for HAVING
 	if len(args) > 0 && !strings.Contains(query, "?") {
 		trimmed := strings.TrimSpace(query)
@@ -410,6 +464,7 @@ type PaginationResult[T any] struct {
 }
 
 // Paginate executes the query with pagination.
+// Uses Clone() to avoid mutating the original query state.
 // If page is less than 1, it defaults to 1.
 // If perPage is less than 1, it defaults to 15.
 func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
@@ -425,10 +480,13 @@ func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*Pagination
 		return nil, err
 	}
 
+	// Clone to avoid mutating the original model's limit/offset
+	q := m.Clone()
 	offset := (page - 1) * perPage
-	m.Limit(perPage).Offset(offset)
+	q.limit = perPage
+	q.offset = offset
 
-	data, err := m.Get(ctx)
+	data, err := q.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -452,6 +510,7 @@ func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*Pagination
 }
 
 // SimplePaginate executes the query with pagination but skips the count query.
+// Uses Clone() to avoid mutating the original query state.
 // Use this when you don't need the total count (e.g., "Load More" buttons).
 // This is ~2x faster than Paginate() since it only runs 1 query.
 // If page is less than 1, it defaults to 1.
@@ -464,10 +523,13 @@ func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*Pagi
 		perPage = 15
 	}
 
+	// Clone to avoid mutating the original model's limit/offset
+	q := m.Clone()
 	offset := (page - 1) * perPage
-	m.Limit(perPage).Offset(offset)
+	q.limit = perPage
+	q.offset = offset
 
-	data, err := m.Get(ctx)
+	data, err := q.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -728,9 +790,13 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 
 // WhereFullText adds a full-text search condition using tsvector and tsquery.
 // Uses default 'english' configuration and plainto_tsquery for user-friendly search.
+// Column names are validated to prevent SQL injection.
 // Example: WhereFullText("content", "search terms")
 // Generates: WHERE to_tsvector('english', content) @@ plainto_tsquery('english', ?)
 func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	clause := fmt.Sprintf("to_tsvector('english', %s) @@ plainto_tsquery('english', ?)", column)
 	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, searchText)
@@ -738,9 +804,16 @@ func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 }
 
 // WhereFullTextWithConfig adds a full-text search condition with a custom text search configuration.
+// Column names and config are validated to prevent SQL injection.
 // Example: WhereFullTextWithConfig("content", "search terms", "spanish")
 // Generates: WHERE to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)
 func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
+	if err := ValidateColumnName(config); err != nil {
+		return m // Skip invalid config names
+	}
 	clause := fmt.Sprintf("to_tsvector('%s', %s) @@ plainto_tsquery('%s', ?)", config, column, config)
 	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, searchText)
@@ -749,9 +822,13 @@ func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *M
 
 // WhereTsVector adds a full-text search condition on a pre-computed tsvector column.
 // This is more efficient when you have an indexed tsvector column.
+// Column names are validated to prevent SQL injection.
 // Example: WhereTsVector("search_vector", "fat & rat")
 // Generates: WHERE search_vector @@ to_tsquery('english', ?)
 func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
+	if err := ValidateColumnName(tsvectorColumn); err != nil {
+		return m // Skip invalid column names
+	}
 	clause := fmt.Sprintf("%s @@ to_tsquery('english', ?)", tsvectorColumn)
 	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, tsquery)
@@ -760,9 +837,13 @@ func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 
 // WherePhraseSearch adds an exact phrase search condition.
 // Uses phraseto_tsquery which preserves word order.
+// Column names are validated to prevent SQL injection.
 // Example: WherePhraseSearch("content", "fat cat")
 // Generates: WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', ?)
 func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		return m // Skip invalid column names
+	}
 	clause := fmt.Sprintf("to_tsvector('english', %s) @@ phraseto_tsquery('english', ?)", column)
 	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
 	m.args = append(m.args, phrase)

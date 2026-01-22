@@ -74,6 +74,11 @@ func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.putLocked(query, stmt)
+}
+
+// putLocked is the internal implementation of Put, assumes lock is held.
+func (c *StmtCache) putLocked(query string, stmt *sql.Stmt) *cacheEntry {
 	// If entry already exists, update it?
 	// It's tricky to update an existing entry safely if it's in use.
 	// We should evict the old one and add new one.
@@ -95,6 +100,22 @@ func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
 	element := c.lruList.PushFront(entry)
 	entry.element = element
 	c.items[query] = entry
+	return entry
+}
+
+// PutAndGet atomically stores a prepared statement and retrieves it with
+// an incremented reference count. This avoids race conditions where the
+// statement could be evicted between Put and Get calls.
+// Returns the statement and a release function. The caller MUST call the release function.
+func (c *StmtCache) PutAndGet(query string, stmt *sql.Stmt) (*sql.Stmt, func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry := c.putLocked(query, stmt)
+	atomic.AddInt32(&entry.refCount, 1)
+	return entry.stmt, func() {
+		c.release(entry)
+	}
 }
 
 // evictLRU removes the least recently used statement from the cache.
