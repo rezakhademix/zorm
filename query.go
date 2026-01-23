@@ -429,6 +429,16 @@ func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 // Having adds a HAVING clause (used with GROUP BY).
 // The query string is validated to prevent SQL injection by checking for dangerous patterns.
 // Use parameterized values (?) for user input.
+//
+// SECURITY WARNING: While ValidateRawQuery prevents traditional SQL injection attacks,
+// it cannot prevent logical injection (e.g., "COUNT(*) > ? OR 1=1"). The query parameter
+// should be a trusted constant expression. DO NOT pass unsanitized user input directly.
+//
+// Safe example:
+//
+//	Having("COUNT(*) > ?", 5)
+//	Having("SUM(amount) >= ?", 1000)
+//
 // Example: Having("COUNT(*) > ?", 5)
 func (m *Model[T]) Having(query string, args ...any) *Model[T] {
 	// Validate query to prevent SQL injection
@@ -917,7 +927,7 @@ func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
 	m.wheres = append(m.wheres, sb.String())
 	PutStringBuilder(sb)
 	m.args = append(m.args, phrase)
-	
+
 	return m
 }
 

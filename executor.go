@@ -1349,7 +1349,7 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 		if err := ValidateColumnName(k); err != nil {
 			return err
 		}
-		
+
 		setSb := GetStringBuilder()
 		setSb.WriteString(k)
 		setSb.WriteString(" = ?")

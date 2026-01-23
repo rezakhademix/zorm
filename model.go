@@ -170,17 +170,34 @@ func (m *Model[T]) reset() {
 	m.ctes = nil
 	m.stmtCache = nil
 
-	// Clear maps by deleting all keys (keeps allocated memory)
-	for k := range m.relationCallbacks {
-		delete(m.relationCallbacks, k)
-	}
-	for k := range m.morphRelations {
-		delete(m.morphRelations, k)
-	}
+	// Recreate maps instead of deleting keys (faster for pooling)
+	m.relationCallbacks = make(map[string]any)
+	m.morphRelations = make(map[string]map[string][]string)
 }
 
 // Clone creates a deep copy of the Model.
 // This is useful for creating new queries based on an existing one without modifying it.
+//
+// IMPORTANT: Clone is NOT safe for concurrent use. Do not call Clone() on a Model
+// instance that is being modified concurrently by another goroutine. This will
+// cause data races. Each goroutine should create its own Model instance.
+//
+// Safe usage:
+//
+//	base := New[User]().Where("active", true)
+//	// Each request handler gets its own clone
+//	handler1 := base.Clone().Where("age >", 18).Get(ctx)
+//	handler2 := base.Clone().Where("verified", true).Get(ctx)
+//
+// Unsafe usage (will cause race):
+//
+//	base := New[User]().Where("active", true)
+//	go func() {
+//	    q1 := base.Clone().Get(ctx1) // RACE if base is being modified
+//	}()
+//	go func() {
+//	    base.Where("new_condition", true) // Modifies base while Clone() reads
+//	}()
 func (m *Model[T]) Clone() *Model[T] {
 	newModel := &Model[T]{
 		ctx:       m.ctx,
