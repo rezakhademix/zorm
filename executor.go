@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -509,12 +510,15 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64,
 	}
 
 	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
-	query := fmt.Sprintf("SELECT %s, COUNT(*) OVER (PARTITION BY %s) as count FROM %s",
-		column, column, m.TableName())
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(column)
+	sb.WriteString(", COUNT(*) OVER (PARTITION BY ")
+	sb.WriteString(column)
+	sb.WriteString(") as count FROM ")
+	sb.WriteString(m.TableName())
 
 	// Add WHERE clause
-	var sb strings.Builder
-	sb.WriteString(query)
 	m.buildWhereClause(&sb)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), m.args...)
@@ -654,13 +658,33 @@ func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 	}
 }
 
+// columnMappingCache caches column-to-field mappings per query signature.
+// Key format: "typeName:col1,col2,col3"
+// Note: We use type name (not table name) because different Go types can map to the same table
+// but have different field definitions.
+var columnMappingCache sync.Map
+
 // mapColumns maps database columns to struct field info.
 // Returns a slice where each element corresponds to the column at that index.
+// Uses caching to avoid repeated lookups for the same column set.
 func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
+	// Build cache key using type name (not table name) to avoid collisions
+	// when different Go types map to the same database table
+	key := m.modelInfo.Type.String() + ":" + strings.Join(columns, ",")
+
+	// Check cache first
+	if cached, ok := columnMappingCache.Load(key); ok {
+		return cached.([]*FieldInfo)
+	}
+
+	// Build mapping
 	fields := make([]*FieldInfo, len(columns))
 	for i, col := range columns {
 		fields[i] = m.modelInfo.Columns[col]
 	}
+
+	// Cache and return
+	columnMappingCache.Store(key, fields)
 	return fields
 }
 
@@ -957,12 +981,17 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		placeholders = append(placeholders, "?")
 	}
 
-	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
-		m.modelInfo.TableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "),
-		m.modelInfo.PrimaryKey,
-	)
+	sb := GetStringBuilder()
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(columns, ", "))
+	sb.WriteString(") VALUES (")
+	sb.WriteString(strings.Join(placeholders, ", "))
+	sb.WriteString(") RETURNING ")
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	query := sb.String()
+	PutStringBuilder(sb)
 
 	// 3. Execute and scan ID directly into the primary key field
 	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
@@ -1043,7 +1072,12 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		if field.IsPrimary {
 			continue
 		}
-		sets = append(sets, fmt.Sprintf("%s = ?", field.Column))
+
+		setSb := GetStringBuilder()
+		setSb.WriteString(field.Column)
+		setSb.WriteString(" = ?")
+		sets = append(sets, setSb.String())
+		PutStringBuilder(setSb)
 		values = append(values, val.FieldByIndex(field.Index).Interface())
 	}
 
@@ -1060,7 +1094,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 
 	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 	pkVal := val.FieldByIndex(pkField.Index).Interface()
-	sb.WriteString(fmt.Sprintf(" WHERE %s = ?", m.modelInfo.PrimaryKey))
+	sb.WriteString(" WHERE ")
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	sb.WriteString(" = ?")
 	values = append(values, pkVal)
 
 	query := sb.String()
@@ -1313,7 +1349,12 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 		if err := ValidateColumnName(k); err != nil {
 			return err
 		}
-		sets = append(sets, fmt.Sprintf("%s = ?", k))
+		
+		setSb := GetStringBuilder()
+		setSb.WriteString(k)
+		setSb.WriteString(" = ?")
+		sets = append(sets, setSb.String())
+		PutStringBuilder(setSb)
 		setArgs = append(setArgs, v)
 	}
 
@@ -1346,6 +1387,112 @@ func (m *Model[T]) DeleteMany(ctx context.Context) error {
 	return m.Delete(ctx)
 }
 
+// BulkInsert inserts multiple records using a single prepared statement.
+// This is more efficient than CreateMany for scenarios where you need
+// fine-grained control or want to handle errors per-entity.
+// The prepared statement is reused for each entity, reducing preparation overhead.
+//
+// Example:
+//
+//	users := []*User{{Name: "Alice"}, {Name: "Bob"}, {Name: "Charlie"}}
+//	err := model.BulkInsert(ctx, users)
+func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
+	if len(entities) == 0 {
+		return nil
+	}
+
+	// Determine columns from first entity
+	var columns []string
+	var fieldsToInsert []*FieldInfo
+
+	val0 := reflect.ValueOf(entities[0]).Elem()
+	for _, field := range m.modelInfo.Fields {
+		fVal := val0.FieldByIndex(field.Index)
+		if field.IsPrimary && field.IsAuto {
+			if fVal.IsZero() {
+				continue
+			}
+		}
+		columns = append(columns, field.Column)
+		fieldsToInsert = append(fieldsToInsert, field)
+	}
+
+	// Build INSERT query once
+	sb := GetStringBuilder()
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(m.TableName())
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(columns, ", "))
+	sb.WriteString(") VALUES (")
+	for i := range columns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('?')
+	}
+	sb.WriteString(") RETURNING ")
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	insertQuery := rebind(sb.String())
+	PutStringBuilder(sb)
+
+	// Get database connection for preparing
+	db := m.db
+	if db == nil {
+		db = GlobalDB
+	}
+	if db == nil {
+		return ErrNilDatabase
+	}
+
+	// If in transaction, use transaction's prepare
+	var stmt *sql.Stmt
+	var err error
+	if m.tx != nil {
+		stmt, err = m.tx.PrepareContext(ctx, insertQuery)
+	} else {
+		stmt, err = db.PrepareContext(ctx, insertQuery)
+	}
+	if err != nil {
+		return WrapQueryError("PREPARE", insertQuery, nil, err)
+	}
+	defer stmt.Close()
+
+	// Get primary key field info
+	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	if !ok {
+		return fmt.Errorf("primary key field %s not found in model", m.modelInfo.PrimaryKey)
+	}
+
+	// Pre-allocate args slice
+	args := make([]any, len(fieldsToInsert))
+
+	// Execute for each entity
+	for _, entity := range entities {
+		val := reflect.ValueOf(entity).Elem()
+
+		// Extract values using cached field indices
+		for i, field := range fieldsToInsert {
+			args[i] = val.FieldByIndex(field.Index).Interface()
+		}
+
+		// Execute and scan returned ID
+		fVal := val.FieldByIndex(pkField.Index)
+		if fVal.CanSet() {
+			err = stmt.QueryRowContext(ctx, args...).Scan(fVal.Addr().Interface())
+			if err != nil {
+				return WrapQueryError("INSERT", insertQuery, args, err)
+			}
+		} else {
+			_, err = stmt.ExecContext(ctx, args...)
+			if err != nil {
+				return WrapQueryError("INSERT", insertQuery, args, err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // loadAccessors calls accessor methods (e.g., GetFullName) on model instances
 // and populates the Attributes map with their return values.
 // Accessor methods must start with "Get", take no arguments, and return a single value.
@@ -1372,6 +1519,20 @@ func (m *Model[T]) loadAccessors(results []*T) {
 	}
 
 	typ := reflect.TypeOf(results[0])
+
+	type methodCache struct {
+		method reflect.Method
+		key    string
+	}
+	methods := make([]methodCache, len(accessorIndices))
+	for i, idx := range accessorIndices {
+		method := typ.Method(idx)
+		methods[i] = methodCache{
+			method: method,
+			key:    ToSnakeCase(strings.TrimPrefix(method.Name, "Get")),
+		}
+	}
+
 	callArgs := make([]reflect.Value, 1)
 
 	for _, res := range results {
@@ -1385,12 +1546,10 @@ func (m *Model[T]) loadAccessors(results []*T) {
 		// Update receiver for method calls
 		callArgs[0] = resVal
 
-		for _, methodIndex := range accessorIndices {
-			method := typ.Method(methodIndex)
-			// Call method using reused args slice
-			ret := method.Func.Call(callArgs)
-			key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))
-			attrField.SetMapIndex(reflect.ValueOf(key), ret[0])
+		for _, mc := range methods {
+			// Call method using cached method and reused args slice
+			ret := mc.method.Func.Call(callArgs)
+			attrField.SetMapIndex(reflect.ValueOf(mc.key), ret[0])
 		}
 	}
 }

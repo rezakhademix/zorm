@@ -72,7 +72,7 @@ func ValidateColumnName(name string) error {
 	// We check for whole words to avoid false positives (e.g. "update_at")
 	lower := strings.ToLower(name)
 
-	// Fast path: O(1) exact match check using map
+	// Fast path: exact match check using map for keywords
 	if dangerousKeywordsMap[lower] {
 		return fmt.Errorf("%w: dangerous keyword '%s' detected in '%s'", ErrInvalidColumnName, lower, name)
 	}
@@ -143,13 +143,14 @@ type ModelInfo struct {
 }
 
 // FieldInfo holds data about a single field in the model.
+// Struct layout is optimized to minimize padding on 64-bit systems.
 type FieldInfo struct {
-	Name      string // Struct field name
-	Column    string // DB column name
-	IsPrimary bool
-	IsAuto    bool // Auto-increment or managed
-	FieldType reflect.Type
-	Index     []int // Index path for nested fields (if we support embedding)
+	Name      string       // 16 bytes
+	Column    string       // 16 bytes
+	FieldType reflect.Type // 16 bytes
+	Index     []int        // 24 bytes
+	IsPrimary bool         // 1 byte
+	IsAuto    bool         // 1 byte + 6 padding
 }
 
 var (
