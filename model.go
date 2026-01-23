@@ -4,8 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"maps"
+	"reflect"
+	"sync"
 	"time"
 )
+
+// modelPools stores sync.Pool instances for each model type.
+// Key is the reflect.Type of the model struct.
+var modelPools sync.Map
 
 // GlobalDB is the global database connection pool.
 // In a real app, this might be managed differently, but for this ORM style,
@@ -84,6 +90,92 @@ func New[T any]() *Model[T] {
 		forceReplica:      -1, // -1 means auto-select
 		wheres:            make([]string, 0, 4),
 		args:              make([]any, 0, 4),
+	}
+}
+
+// getModelPool returns the sync.Pool for the given model type T.
+func getModelPool[T any]() *sync.Pool {
+	var t T
+	typ := reflect.TypeOf(t)
+
+	if pool, ok := modelPools.Load(typ); ok {
+		return pool.(*sync.Pool)
+	}
+
+	// Create new pool
+	pool := &sync.Pool{
+		New: func() any {
+			return &Model[T]{
+				relationCallbacks: make(map[string]any),
+				morphRelations:    make(map[string]map[string][]string),
+				wheres:            make([]string, 0, 4),
+				args:              make([]any, 0, 4),
+			}
+		},
+	}
+	actual, _ := modelPools.LoadOrStore(typ, pool)
+	return actual.(*sync.Pool)
+}
+
+// Acquire retrieves a Model[T] from the pool for high-throughput scenarios.
+// The returned model is pre-configured with default values and ready for use.
+// Call Release() when done to return the model to the pool.
+//
+// Example:
+//
+//	m := Acquire[User]()
+//	defer m.Release()
+//	users, err := m.Where("active", true).Get(ctx)
+func Acquire[T any]() *Model[T] {
+	pool := getModelPool[T]()
+	m := pool.Get().(*Model[T])
+	m.reset()
+	m.ctx = context.Background()
+	m.db = GlobalDB
+	m.modelInfo = ParseModel[T]()
+	m.forceReplica = -1
+	return m
+}
+
+// Release returns the Model to the pool for reuse.
+// After calling Release, the Model should not be used again.
+func (m *Model[T]) Release() {
+	m.reset()
+	pool := getModelPool[T]()
+	pool.Put(m)
+}
+
+// reset clears all query state from the model for reuse.
+func (m *Model[T]) reset() {
+	m.ctx = nil
+	m.db = nil
+	m.tx = nil
+	m.tableName = ""
+	m.columns = m.columns[:0]
+	m.wheres = m.wheres[:0]
+	m.args = m.args[:0]
+	m.orderBys = nil
+	m.groupBys = nil
+	m.havings = nil
+	m.distinct = false
+	m.distinctOn = nil
+	m.limit = 0
+	m.offset = 0
+	m.relations = nil
+	m.lockMode = ""
+	m.forcePrimary = false
+	m.forceReplica = -1
+	m.rawQuery = ""
+	m.rawArgs = nil
+	m.ctes = nil
+	m.stmtCache = nil
+
+	// Clear maps by deleting all keys (keeps allocated memory)
+	for k := range m.relationCallbacks {
+		delete(m.relationCallbacks, k)
+	}
+	for k := range m.morphRelations {
+		delete(m.morphRelations, k)
 	}
 }
 

@@ -484,9 +484,10 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 		}
 
 		// 4. Map back
+		pkFieldInfo := relatedInfo.Columns[pk]
 		for _, res := range relatedResults {
 			val := reflect.ValueOf(res).Elem()
-			resID := val.FieldByName(relatedInfo.Columns[pk].Name).Interface()
+			resID := val.FieldByIndex(pkFieldInfo.Index).Interface()
 
 			// Find parents
 			if indices, ok := parentMap[typeName][resID]; ok {
@@ -511,10 +512,13 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
 
+	// Look up field info once outside the loop
+	pkFieldInfo, hasPKField := m.modelInfo.Columns[pkField]
+
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
-		if field, ok := m.modelInfo.Columns[pkField]; ok {
-			fVal := val.FieldByName(field.Name)
+		if hasPKField {
+			fVal := val.FieldByIndex(pkFieldInfo.Index)
 			if fVal.Kind() == reflect.Pointer {
 				if fVal.IsNil() {
 					ids[i] = nil
@@ -576,7 +580,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
-		fkVal := val.FieldByName(fkFieldInfo.Name).Interface()
+		fkVal := val.FieldByIndex(fkFieldInfo.Index).Interface()
 		relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
 	}
 
@@ -751,9 +755,10 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	// 6. Map back to parents
 	// Map: RelatedID (string key) -> RelatedInstance
 	relatedIdxMap := make(map[string]reflect.Value)
+	joinKeyFieldInfo := relatedInfo.Columns[joinKey]
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
-		rID := val.FieldByName(relatedInfo.Columns[joinKey].Name).Interface()
+		rID := val.FieldByIndex(joinKeyFieldInfo.Index).Interface()
 		rKey := fmt.Sprintf("%v", rID)
 		relatedIdxMap[rKey] = reflect.ValueOf(res)
 	}
@@ -770,7 +775,6 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 
 		children := make([]reflect.Value, 0, len(rIDs))
 		for _, rKey := range rIDs {
-			// Find in relatedIdxMap using O(1) string key lookup
 			if child, ok := relatedIdxMap[rKey]; ok {
 				children = append(children, child)
 			}
@@ -902,25 +906,27 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 	}
 
-	relatedByPK := make(map[string]reflect.Value) // Use string key for O(1) lookup
+	relatedByPK := make(map[string]reflect.Value) // Use string key for lookup
+
+	// Look up field info once outside the loop
+	ownerKeyFieldInfo, hasOwnerKeyField := relatedInfo.Columns[ownerKey]
 
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
-		var pkFieldName string
-		if field, ok := relatedInfo.Columns[ownerKey]; ok {
-			pkFieldName = field.Name
+		var resPK any
+		if hasOwnerKeyField {
+			resPK = val.FieldByIndex(ownerKeyFieldInfo.Index).Interface()
 		} else {
-			pkFieldName = "ID"
+			resPK = val.FieldByName("ID").Interface()
 		}
 
-		resPK := val.FieldByName(pkFieldName).Interface()
 		pkKey := fmt.Sprintf("%v", resPK)
 		relatedByPK[pkKey] = reflect.ValueOf(res)
 	}
 
 	// Now assign the related records to parent entities
 	for fkKey, indices := range fkMap {
-		// Find the related record with PK matching this FK value (O(1) lookup)
+		// Find the related record with PK matching this FK value
 		relatedRecord, found := relatedByPK[fkKey]
 		if !found || !relatedRecord.IsValid() {
 			continue
@@ -986,11 +992,14 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
 
+	// Look up field info once outside the loop
+	pkFieldInfo, hasPKField := m.modelInfo.Columns[pkField]
+
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
-		if field, ok := m.modelInfo.Columns[pkField]; ok {
-			fVal := val.FieldByName(field.Name)
-			if fVal.Kind() == reflect.Ptr {
+		if hasPKField {
+			fVal := val.FieldByIndex(pkFieldInfo.Index)
+			if fVal.Kind() == reflect.Pointer {
 				if fVal.IsNil() {
 					ids[i] = nil
 				} else {
@@ -1087,7 +1096,8 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := relatedInfo.Columns[idColumn]; ok {
-			fkVal := val.FieldByName(field.Name).Interface()
+			// Use FieldByIndex for access instead of FieldByName O(n)
+			fkVal := val.FieldByIndex(field.Index).Interface()
 			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
 		}
 	}
@@ -1222,7 +1232,8 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := modelInfo.Columns[pkField]; ok {
-			ids[i] = val.FieldByName(field.Name).Interface()
+			// Use FieldByIndex for access instead of FieldByName O(n)
+			ids[i] = val.FieldByIndex(field.Index).Interface()
 		} else {
 			ids[i] = val.FieldByName("ID").Interface()
 		}
@@ -1286,7 +1297,8 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := relatedInfo.Columns[foreignKey]; ok {
-			fkVal := val.FieldByName(field.Name).Interface()
+			// Use FieldByIndex for access instead of FieldByName O(n)
+			fkVal := val.FieldByIndex(field.Index).Interface()
 			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
 		}
 	}
@@ -1360,7 +1372,8 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	pkField := m.modelInfo.PrimaryKey
 	var parentID any
 	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		parentID = parentVal.FieldByName(field.Name).Interface()
+		// Use FieldByIndex for access instead of FieldByName O(n)
+		parentID = parentVal.FieldByIndex(field.Index).Interface()
 	} else {
 		parentID = parentVal.FieldByName("ID").Interface()
 	}
@@ -1485,7 +1498,8 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	pkField := m.modelInfo.PrimaryKey
 	var parentID any
 	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		parentID = parentVal.FieldByName(field.Name).Interface()
+		// Use FieldByIndex for access instead of FieldByName O(n)
+		parentID = parentVal.FieldByIndex(field.Index).Interface()
 	} else {
 		parentID = parentVal.FieldByName("ID").Interface()
 	}
@@ -1500,7 +1514,12 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// 3. Delete
-	query := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", pivotTable, foreignKey)
+	var sb strings.Builder
+	sb.WriteString("DELETE FROM ")
+	sb.WriteString(pivotTable)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(foreignKey)
+	sb.WriteString(" = ?")
 	args := []any{parentID}
 
 	if len(ids) > 0 {
@@ -1516,10 +1535,14 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 			placeholders[i] = "?"
 			args = append(args, id)
 		}
-		query += fmt.Sprintf(" AND %s IN (%s)", relatedKey, strings.Join(placeholders, ","))
+		sb.WriteString(" AND ")
+		sb.WriteString(relatedKey)
+		sb.WriteString(" IN (")
+		sb.WriteString(strings.Join(placeholders, ","))
+		sb.WriteByte(')')
 	}
 
-	_, err := m.queryer().ExecContext(ctx, query, args...)
+	_, err := m.queryer().ExecContext(ctx, sb.String(), args...)
 	return err
 }
 
@@ -1566,7 +1589,8 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	pkField := m.modelInfo.PrimaryKey
 	var parentID any
 	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		parentID = parentVal.FieldByName(field.Name).Interface()
+		// Use FieldByIndex for access instead of FieldByName O(n)
+		parentID = parentVal.FieldByIndex(field.Index).Interface()
 	} else {
 		parentID = parentVal.FieldByName("ID").Interface()
 	}
@@ -1587,7 +1611,15 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	}
 
 	// 3. Get Current IDs
-	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", relatedKey, pivotTable, foreignKey)
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(relatedKey)
+	sb.WriteString(" FROM ")
+	sb.WriteString(pivotTable)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(foreignKey)
+	sb.WriteString(" = ?")
+	query := sb.String()
 	rows, err := m.queryer().QueryContext(ctx, query, parentID)
 	if err != nil {
 		return err
@@ -1608,7 +1640,7 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	var toAttach []any
 	var toDetach []any
 
-	// Normalize input IDs to map for O(1) lookup
+	// Normalize input IDs to map for lookup
 	newIDsMap := make(map[string]any) // string key -> original value
 	for _, id := range ids {
 		key := fmt.Sprintf("%v", id)

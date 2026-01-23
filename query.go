@@ -66,11 +66,25 @@ func (m *Model[T]) Where(query any, args ...any) *Model[T] {
 	case 1:
 		value = args[0]
 		operator = "="
-		return m.addWhere("AND", fmt.Sprintf("%s %s", query, operator), value)
+
+		sb := GetStringBuilder()
+		sb.WriteString(query.(string))
+		sb.WriteByte(' ')
+		sb.WriteString(operator)
+		result := sb.String()
+		PutStringBuilder(sb)
+		return m.addWhere("AND", result, value)
 	case 2:
 		operator = fmt.Sprint(args[0])
 		value = args[1]
-		return m.addWhere("AND", fmt.Sprintf("%s %s", query, operator), value)
+
+		sb := GetStringBuilder()
+		sb.WriteString(query.(string))
+		sb.WriteByte(' ')
+		sb.WriteString(operator)
+		result := sb.String()
+		PutStringBuilder(sb)
+		return m.addWhere("AND", result, value)
 	default:
 		return m
 	}
@@ -308,9 +322,15 @@ func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
 	// Validate direction is only ASC or DESC
 	dir := strings.ToUpper(strings.TrimSpace(direction))
 	if dir != "ASC" && dir != "DESC" {
-		dir = "ASC" // Default to ASC if invalid
+		dir = "DESC" // Default to DESC if invalid
 	}
-	m.orderBys = append(m.orderBys, fmt.Sprintf("%s %s", column, dir))
+
+	sb := GetStringBuilder()
+	sb.WriteString(column)
+	sb.WriteByte(' ')
+	sb.WriteString(dir)
+	m.orderBys = append(m.orderBys, sb.String())
+	PutStringBuilder(sb)
 	return m
 }
 
@@ -337,7 +357,12 @@ func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
 		validCols = append(validCols, col)
 	}
 	if len(validCols) > 0 {
-		m.groupBys = append(m.groupBys, fmt.Sprintf("ROLLUP (%s)", strings.Join(validCols, ", ")))
+		sb := GetStringBuilder()
+		sb.WriteString("ROLLUP (")
+		sb.WriteString(strings.Join(validCols, ", "))
+		sb.WriteByte(')')
+		m.groupBys = append(m.groupBys, sb.String())
+		PutStringBuilder(sb)
 	}
 	return m
 }
@@ -353,7 +378,12 @@ func (m *Model[T]) GroupByCube(columns ...string) *Model[T] {
 		validCols = append(validCols, col)
 	}
 	if len(validCols) > 0 {
-		m.groupBys = append(m.groupBys, fmt.Sprintf("CUBE (%s)", strings.Join(validCols, ", ")))
+		sb := GetStringBuilder()
+		sb.WriteString("CUBE (")
+		sb.WriteString(strings.Join(validCols, ", "))
+		sb.WriteByte(')')
+		m.groupBys = append(m.groupBys, sb.String())
+		PutStringBuilder(sb)
 	}
 	return m
 }
@@ -376,12 +406,22 @@ func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 				validCols = append(validCols, col)
 			}
 			if len(validCols) > 0 {
-				setStrings = append(setStrings, fmt.Sprintf("(%s)", strings.Join(validCols, ", ")))
+				setSb := GetStringBuilder()
+				setSb.WriteByte('(')
+				setSb.WriteString(strings.Join(validCols, ", "))
+				setSb.WriteByte(')')
+				setStrings = append(setStrings, setSb.String())
+				PutStringBuilder(setSb)
 			}
 		}
 	}
 	if len(setStrings) > 0 {
-		m.groupBys = append(m.groupBys, fmt.Sprintf("GROUPING SETS (%s)", strings.Join(setStrings, ", ")))
+		sb := GetStringBuilder()
+		sb.WriteString("GROUPING SETS (")
+		sb.WriteString(strings.Join(setStrings, ", "))
+		sb.WriteByte(')')
+		m.groupBys = append(m.groupBys, sb.String())
+		PutStringBuilder(sb)
 	}
 	return m
 }
@@ -639,11 +679,16 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 
 	// 4. Build EXISTS subquery
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("EXISTS (SELECT 1 FROM %s WHERE %s.%s = %s.%s",
-		tableName,
-		tableName, foreignKey,
-		m.TableName(), m.modelInfo.PrimaryKey,
-	))
+	sb.WriteString("EXISTS (SELECT 1 FROM ")
+	sb.WriteString(tableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(tableName)
+	sb.WriteByte('.')
+	sb.WriteString(foreignKey)
+	sb.WriteString(" = ")
+	sb.WriteString(m.TableName())
+	sb.WriteByte('.')
+	sb.WriteString(m.modelInfo.PrimaryKey)
 
 	// 5. Apply additional constraints from callback
 	if subQuery != nil {
@@ -797,8 +842,13 @@ func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
 		return m // Skip invalid column names
 	}
-	clause := fmt.Sprintf("to_tsvector('english', %s) @@ plainto_tsquery('english', ?)", column)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
+
+	sb := GetStringBuilder()
+	sb.WriteString("AND to_tsvector('english', ")
+	sb.WriteString(column)
+	sb.WriteString(") @@ plainto_tsquery('english', ?)")
+	m.wheres = append(m.wheres, sb.String())
+	PutStringBuilder(sb)
 	m.args = append(m.args, searchText)
 	return m
 }
@@ -814,8 +864,17 @@ func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *M
 	if err := ValidateColumnName(config); err != nil {
 		return m // Skip invalid config names
 	}
-	clause := fmt.Sprintf("to_tsvector('%s', %s) @@ plainto_tsquery('%s', ?)", config, column, config)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
+
+	sb := GetStringBuilder()
+	sb.WriteString("AND to_tsvector('")
+	sb.WriteString(config)
+	sb.WriteString("', ")
+	sb.WriteString(column)
+	sb.WriteString(") @@ plainto_tsquery('")
+	sb.WriteString(config)
+	sb.WriteString("', ?)")
+	m.wheres = append(m.wheres, sb.String())
+	PutStringBuilder(sb)
 	m.args = append(m.args, searchText)
 	return m
 }
@@ -829,9 +888,15 @@ func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 	if err := ValidateColumnName(tsvectorColumn); err != nil {
 		return m // Skip invalid column names
 	}
-	clause := fmt.Sprintf("%s @@ to_tsquery('english', ?)", tsvectorColumn)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
+
+	sb := GetStringBuilder()
+	sb.WriteString("AND ")
+	sb.WriteString(tsvectorColumn)
+	sb.WriteString(" @@ to_tsquery('english', ?)")
+	m.wheres = append(m.wheres, sb.String())
+	PutStringBuilder(sb)
 	m.args = append(m.args, tsquery)
+
 	return m
 }
 
@@ -844,9 +909,15 @@ func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
 		return m // Skip invalid column names
 	}
-	clause := fmt.Sprintf("to_tsvector('english', %s) @@ phraseto_tsquery('english', ?)", column)
-	m.wheres = append(m.wheres, fmt.Sprintf("AND %s", clause))
+
+	sb := GetStringBuilder()
+	sb.WriteString("AND to_tsvector('english', ")
+	sb.WriteString(column)
+	sb.WriteString(") @@ phraseto_tsquery('english', ?)")
+	m.wheres = append(m.wheres, sb.String())
+	PutStringBuilder(sb)
 	m.args = append(m.args, phrase)
+	
 	return m
 }
 
