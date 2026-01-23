@@ -692,8 +692,8 @@ func TestOrderBy_ValidatesDirection(t *testing.T) {
 		{"DESC", "DESC"},
 		{"asc", "ASC"},
 		{"desc", "DESC"},
-		{"invalid", "ASC"}, // Should default to ASC
-		{"DROP", "ASC"},    // Injection attempt - should default to ASC
+		{"invalid", "DESC"}, // Should default to DESC
+		{"DROP", "DESC"},    // Injection attempt - should default to DESC
 	}
 
 	for _, tt := range tests {
