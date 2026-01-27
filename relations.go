@@ -1451,7 +1451,7 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 		}
 	}
 
-	_, err := m.queryer().ExecContext(ctx, sb.String(), args...)
+	_, err := m.queryer().ExecContext(ctx, rebind(sb.String()), args...)
 	return err
 }
 
@@ -1542,7 +1542,7 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 		sb.WriteByte(')')
 	}
 
-	_, err := m.queryer().ExecContext(ctx, sb.String(), args...)
+	_, err := m.queryer().ExecContext(ctx, rebind(sb.String()), args...)
 	return err
 }
 
@@ -1620,7 +1620,7 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	sb.WriteString(foreignKey)
 	sb.WriteString(" = ?")
 	query := sb.String()
-	rows, err := m.queryer().QueryContext(ctx, query, parentID)
+	rows, err := m.queryer().QueryContext(ctx, rebind(query), parentID)
 	if err != nil {
 		return err
 	}

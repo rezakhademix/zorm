@@ -1301,7 +1301,7 @@ func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []str
 	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
 
 	query := sb.String()
-	rows, err := m.queryerForWrite().QueryContext(ctx, query, args...)
+	rows, err := m.queryerForWrite().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return WrapQueryError("INSERT", query, args, err)
 	}
