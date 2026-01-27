@@ -110,6 +110,45 @@ err = zorm.New[User]().Update(ctx, user) // updated_at auto-set
 err = zorm.New[User]().Where("id", 1).Delete(ctx)
 ```
 
+### 4. Bulk Operations
+
+```go
+// CreateMany - Insert multiple records in a single query
+users := []*User{
+    {Name: "Alice", Email: "alice@example.com"},
+    {Name: "Bob", Email: "bob@example.com"},
+    {Name: "Charlie", Email: "charlie@example.com"},
+}
+err := zorm.New[User]().CreateMany(ctx, users)
+// All IDs are auto-populated after insert
+fmt.Println(users[0].ID, users[1].ID, users[2].ID)
+
+// UpdateMany - Update multiple records matching query
+err = zorm.New[User]().
+    Where("active", false).
+    UpdateMany(ctx, map[string]any{"status": "inactive"})
+
+// DeleteMany - Delete multiple records matching query
+err = zorm.New[User]().Where("status", "inactive").DeleteMany(ctx)
+```
+
+**CreateMany Features:**
+- Inserts all records in a single SQL statement for efficiency
+- Automatically chunks large batches to stay within database limits (65535 parameters for PostgreSQL)
+- Uses transactions for multi-chunk inserts to ensure atomicity
+- Returns inserted IDs via `RETURNING` clause
+- Works with all hooks (`BeforeCreate` is NOT called - use `BulkInsert` if you need hooks)
+
+```go
+// For very large datasets, CreateMany automatically chunks
+largeDataset := make([]*User, 10000)
+for i := range largeDataset {
+    largeDataset[i] = &User{Name: fmt.Sprintf("User %d", i)}
+}
+err := zorm.New[User]().CreateMany(ctx, largeDataset)
+// Automatically split into multiple INSERT statements within a transaction
+```
+
 ---
 
 ## API Reference
@@ -535,6 +574,74 @@ func (u User) RolesRelation() zorm.BelongsToMany[Role] {
         RelatedKey: "role_id",     // Related FK in pivot table
     }
 }
+```
+
+#### Managing Many-to-Many Associations
+
+ZORM provides three methods to manage pivot table associations: `Attach`, `Detach`, and `Sync`.
+
+```go
+user := &User{ID: 1}
+
+// Attach - Add new associations (inserts into pivot table)
+err := zorm.New[User]().Attach(ctx, user, "Roles", []any{3, 4}, nil)
+// Adds role_user entries: (1,3), (1,4)
+
+// Attach with pivot data (extra columns in pivot table)
+pivotData := map[any]map[string]any{
+    3: {"assigned_at": time.Now(), "assigned_by": 1},
+    4: {"assigned_at": time.Now(), "assigned_by": 1},
+}
+err = zorm.New[User]().Attach(ctx, user, "Roles", []any{3, 4}, pivotData)
+
+// Detach - Remove specific associations
+err = zorm.New[User]().Detach(ctx, user, "Roles", []any{2})
+// Removes role_user entry: (1,2)
+
+// Detach all - Remove all associations for the relation
+err = zorm.New[User]().Detach(ctx, user, "Roles", nil)
+// Removes all role_user entries where user_id = 1
+```
+
+#### Sync - Synchronize Associations
+
+`Sync` is a handy method for managing many-to-many relations. It synchronizes the pivot table to match exactly the IDs you provide:
+- **Attaches** IDs that are in the new list but not in the database
+- **Detaches** IDs that are in the database but not in the new list
+- **Keeps** IDs that exist in both (no duplicate entry errors)
+
+```go
+user := &User{ID: 1}
+// Current roles in DB: [1, 2, 3]
+
+// Sync to new set of roles
+err := zorm.New[User]().Sync(ctx, user, "Roles", []any{1, 2, 4}, nil)
+// Result:
+// - Role 1: kept (exists in both)
+// - Role 2: kept (exists in both)
+// - Role 3: detached (was in DB, not in new list)
+// - Role 4: attached (not in DB, is in new list)
+// Final roles in DB: [1, 2, 4]
+
+// Sync with pivot data for new attachments
+pivotData := map[any]map[string]any{
+    4: {"assigned_at": time.Now()},
+}
+err = zorm.New[User]().Sync(ctx, user, "Roles", []any{1, 2, 4}, pivotData)
+```
+
+**Common Sync Use Cases:**
+
+```go
+// Replace all user roles with a new set
+err := zorm.New[User]().Sync(ctx, user, "Roles", []any{1, 2}, nil)
+
+// Remove all roles (sync with empty list)
+err = zorm.New[User]().Sync(ctx, user, "Roles", []any{}, nil)
+
+// Form submission: update user roles from checkbox selection
+selectedRoleIDs := []any{1, 3, 5}  // From form
+err = zorm.New[User]().Sync(ctx, user, "Roles", selectedRoleIDs, nil)
 ```
 
 ### Polymorphic Relations
