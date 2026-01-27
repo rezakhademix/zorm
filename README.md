@@ -605,7 +605,7 @@ err = zorm.New[User]().Detach(ctx, user, "Roles", nil)
 
 #### Sync - Synchronize Associations
 
-`Sync` is the most powerful method for managing many-to-many relations. It synchronizes the pivot table to match exactly the IDs you provide:
+`Sync` is a handy method for managing many-to-many relations. It synchronizes the pivot table to match exactly the IDs you provide:
 - **Attaches** IDs that are in the new list but not in the database
 - **Detaches** IDs that are in the database but not in the new list
 - **Keeps** IDs that exist in both (no duplicate entry errors)
