@@ -172,6 +172,81 @@ func TestRelations_Sync(t *testing.T) {
 	}
 }
 
+// TestRelations_SyncRemovesOnlyMissing tests that Sync correctly:
+// 1. Removes IDs that are in DB but not in the new list
+// 2. Does NOT cause duplicate entry errors for IDs that already exist
+// Scenario: DB has (1,1),(1,2),(1,3) -> Sync with [1,2] -> should delete (1,3) only
+func TestRelations_SyncRemovesOnlyMissing(t *testing.T) {
+	db := setupRelDBExtended(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	user := &RelUserExtended{ID: 1} // Alice starts with Admin(1) and Editor(2)
+
+	// Add a third role and associate it with Alice
+	_, err := db.Exec("INSERT INTO rel_roles (id, name) VALUES (3, 'Viewer')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("INSERT INTO rel_role_user (user_id, role_id) VALUES (1, 3)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify Alice now has 3 roles: [1, 2, 3]
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1").Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("setup failed: expected 3 roles, got %d", count)
+	}
+
+	// Sync with [1, 2] - should remove role 3, keep 1 and 2 without duplicate error
+	err = New[RelUserExtended]().Sync(ctx, user, "Roles", []any{1, 2}, nil)
+	if err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Verify only roles 1 and 2 remain
+	rows, err := db.Query("SELECT role_id FROM rel_role_user WHERE user_id = 1 ORDER BY role_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var roleIDs []int
+	for rows.Next() {
+		var id int
+		rows.Scan(&id)
+		roleIDs = append(roleIDs, id)
+	}
+
+	if len(roleIDs) != 2 {
+		t.Errorf("expected 2 roles after sync, got %d (%v)", len(roleIDs), roleIDs)
+	}
+
+	// Verify the correct roles remain
+	if len(roleIDs) >= 2 && (roleIDs[0] != 1 || roleIDs[1] != 2) {
+		t.Errorf("expected roles [1, 2], got %v", roleIDs)
+	}
+
+	// Verify role 3 was removed
+	var role3Count int
+	err = db.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1 AND role_id = 3").Scan(&role3Count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role3Count != 0 {
+		t.Errorf("expected role 3 to be removed, but it still exists")
+	}
+}
+
 func TestRelations_AttachWithPivotData(t *testing.T) {
 	// Need a model with pivot columns?
 	// RelRoleUser table in setupRelDBExtended only has user_id and role_id.
