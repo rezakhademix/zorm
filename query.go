@@ -974,6 +974,23 @@ func (m *Model[T]) Print() (string, []any) {
 	return rebind(query), args
 }
 
+// Omit excludes columns from Update operations.
+// This is useful when you want to update most fields but exclude specific ones.
+//
+// Example:
+//
+//	err := model.Omit("phone_number", "address").Update(ctx, user)
+//	// Updates all fields EXCEPT phone_number and address
+func (m *Model[T]) Omit(columns ...string) *Model[T] {
+	if m.omitColumns == nil {
+		m.omitColumns = make(map[string]bool)
+	}
+	for _, col := range columns {
+		m.omitColumns[col] = true
+	}
+	return m
+}
+
 // rebind replaces ? placeholders with $1, $2, etc.
 func rebind(query string) string {
 	sb := GetStringBuilder()

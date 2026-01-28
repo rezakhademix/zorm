@@ -703,6 +703,7 @@ func (m *Model[T]) fillScanDestinations(fields []*FieldInfo, val reflect.Value, 
 
 // scanRows scans sql.Rows into a slice of *T.
 // It uses pre-calculated field mapping and reused destination slice for performance.
+// Automatically tracks original values for dirty checking.
 func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -731,6 +732,9 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
+
+		// Track originals for dirty tracking
+		TrackOriginals(entity, m.modelInfo)
 
 		results = append(results, entity)
 	}
@@ -772,6 +776,7 @@ func (c *Cursor[T]) Next() bool {
 }
 
 // Scan scans the current row into a new entity.
+// Automatically tracks original values for dirty checking.
 func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	// Cache columns and mapping on first call
 	if c.columns == nil {
@@ -794,6 +799,9 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	if err := c.rows.Scan(c.dest...); err != nil {
 		return nil, err
 	}
+
+	// Track originals for dirty tracking
+	TrackOriginals(entity, c.model.modelInfo)
 
 	// Load Accessors
 	c.model.loadAccessors([]*T{entity})
@@ -1073,6 +1081,11 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			continue
 		}
 
+		// Skip omitted columns
+		if m.omitColumns != nil && m.omitColumns[field.Column] {
+			continue
+		}
+
 		setSb := GetStringBuilder()
 		setSb.WriteString(field.Column)
 		setSb.WriteString(" = ?")
@@ -1123,6 +1136,122 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		return WrapQueryError("UPDATE", query, values, err)
 	}
 
+	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
+		if err := hook.AfterUpdate(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UpdateColumns updates only the specified columns of the entity.
+// This is useful when you want explicit control over which columns are updated.
+//
+// Example:
+//
+//	user.Name = "New Name"
+//	user.Email = "new@email.com"
+//	err := model.UpdateColumns(ctx, user, "name", "email")  // Only updates name and email
+func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...string) error {
+	if entity == nil {
+		return ErrNilPointer
+	}
+
+	if len(columns) == 0 {
+		return nil // Nothing to update
+	}
+
+	// Auto-update updated_at if it exists and not explicitly specified
+	hasUpdatedAt := false
+	for _, col := range columns {
+		if col == "updated_at" {
+			hasUpdatedAt = true
+			break
+		}
+	}
+
+	if !hasUpdatedAt {
+		if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
+			val := reflect.ValueOf(entity).Elem()
+			fieldVal := val.FieldByIndex(fieldInfo.Index)
+			if fieldVal.CanSet() {
+				_ = setFieldValue(fieldVal, time.Now())
+				columns = append(columns, "updated_at")
+			}
+		}
+	}
+
+	// BeforeUpdate Hook
+	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
+		if err := hook.BeforeUpdate(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Build UPDATE with specified columns
+	var sets []string
+	var values []any
+
+	val := reflect.ValueOf(entity).Elem()
+
+	for _, column := range columns {
+		field, ok := m.modelInfo.Columns[column]
+		if !ok || field.IsPrimary {
+			continue
+		}
+
+		sets = append(sets, column+" = ?")
+		values = append(values, val.FieldByIndex(field.Index).Interface())
+	}
+
+	if len(sets) == 0 {
+		return nil
+	}
+
+	// Build query
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+
+	sb.WriteString("UPDATE ")
+	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(" SET ")
+	sb.WriteString(strings.Join(sets, ", "))
+
+	// WHERE id = ?
+	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	pkVal := val.FieldByIndex(pkField.Index).Interface()
+	sb.WriteString(" WHERE ")
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	sb.WriteString(" = ?")
+	values = append(values, pkVal)
+
+	query := sb.String()
+	allArgs := append(cteArgs, values...)
+
+	// Execute
+	var err error
+	if m.stmtCache != nil {
+		var stmt *sql.Stmt
+		var release func()
+		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
+		if err != nil {
+			return WrapQueryError("PREPARE", query, values, err)
+		}
+		_, err = stmt.ExecContext(ctx, allArgs...)
+		release()
+	} else {
+		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
+	}
+
+	if err != nil {
+		return WrapQueryError("UPDATE", query, values, err)
+	}
+
+	// Sync originals after successful update
+	SyncOriginals(entity, m.modelInfo)
+
+	// AfterUpdate Hook
 	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
 		if err := hook.AfterUpdate(ctx); err != nil {
 			return err

@@ -70,6 +70,9 @@ type Model[T any] struct {
 
 	// Statement Cache (optional)
 	stmtCache *StmtCache
+
+	// Omit columns for Update/Save operations
+	omitColumns map[string]bool
 }
 
 // CTE represents a Common Table Expression.
@@ -173,6 +176,7 @@ func (m *Model[T]) reset() {
 	// Recreate maps instead of deleting keys (faster for pooling)
 	m.relationCallbacks = make(map[string]any)
 	m.morphRelations = make(map[string]map[string][]string)
+	m.omitColumns = nil
 }
 
 // Clone creates a deep copy of the Model.
@@ -271,6 +275,14 @@ func (m *Model[T]) Clone() *Model[T] {
 				newMap[mk] = newSlice
 			}
 			newModel.morphRelations[k] = newMap
+		}
+	}
+
+	// Copy omitColumns
+	if m.omitColumns != nil {
+		newModel.omitColumns = make(map[string]bool, len(m.omitColumns))
+		for k, v := range m.omitColumns {
+			newModel.omitColumns[k] = v
 		}
 	}
 
