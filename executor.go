@@ -306,8 +306,9 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
+		defer release()
+
 		err = stmt.QueryRowContext(ctx, args...).Scan(&count)
-		release() // explicit release for row
 	} else {
 		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
 	}
@@ -359,8 +360,9 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, WrapQueryError("PREPARE", query, args, err)
 		}
+		defer release()
+
 		err = stmt.QueryRowContext(ctx, args...).Scan(&exists)
-		release()
 	} else {
 		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&exists)
 	}
@@ -420,8 +422,9 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
+		defer release()
+
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
-		release()
 	} else {
 		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
@@ -475,17 +478,15 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
-		var (
-			stmt    *sql.Stmt
-			release func()
-		)
-
+		var stmt *sql.Stmt
+		var release func()
 		stmt, release, err = m.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
+		defer release()
+
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
-		release()
 	} else {
 		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
@@ -971,9 +972,10 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	}
 
 	// 2. Build Insert Query
-	var columns []string
-	var values []any
-	var placeholders []string
+	numFields := len(m.modelInfo.Fields)
+	columns := make([]string, 0, numFields)
+	values := make([]any, 0, numFields)
+	placeholders := make([]string, 0, numFields)
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -1017,17 +1019,15 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	var err error
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
-		var (
-			stmt    *sql.Stmt
-			release func()
-		)
-
+		var stmt *sql.Stmt
+		var release func()
 		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
+		defer release()
+
 		err = stmt.QueryRowContext(ctx, values...).Scan(fVal.Addr().Interface())
-		release()
 	} else {
 		err = m.queryerForWrite().QueryRowContext(ctx, rebind(query), values...).Scan(fVal.Addr().Interface())
 	}
@@ -1068,8 +1068,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	}
 
 	// Build Update Query
-	var sets []string
-	var values []any
+	numFields := len(m.modelInfo.Fields)
+	sets := make([]string, 0, numFields)
+	values := make([]any, 0, numFields+1) // +1 for PK value
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -1119,8 +1120,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
+		defer release()
+
 		_, err = stmt.ExecContext(ctx, allArgs...)
-		release()
 	} else {
 		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
 	}
@@ -1234,8 +1236,9 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		if err != nil {
 			return WrapQueryError("PREPARE", query, values, err)
 		}
+		defer release()
+
 		_, err = stmt.ExecContext(ctx, allArgs...)
-		release()
 	} else {
 		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
 	}
@@ -1279,8 +1282,9 @@ func (m *Model[T]) Delete(ctx context.Context) error {
 		if err != nil {
 			return WrapQueryError("PREPARE", query, m.args, err)
 		}
+		defer release()
+
 		_, err = stmt.ExecContext(ctx, args...)
-		release()
 	} else {
 		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), args...)
 	}
@@ -1309,14 +1313,15 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	}
 
 	// 2. Build Query
-	var columns []string
-	var placeholders []string
+	numFields := len(m.modelInfo.Fields)
+	columns := make([]string, 0, numFields)
+	placeholders := make([]string, 0, numFields)
 
 	// We need to identify which columns to insert.
 	// We skip AutoIncrement PK if zero.
 
 	// Prepare columns list
-	var fieldsToInsert [][]int // Field indices in struct
+	fieldsToInsert := make([][]int, 0, numFields) // Field indices in struct
 
 	val0 := reflect.ValueOf(entities[0]).Elem()
 	for _, field := range m.modelInfo.Fields {
@@ -1351,6 +1356,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	// Use a transaction for multiple chunks to ensure atomicity
 	var tx *sql.Tx
 	var err error
+	var committed bool
 	if m.tx == nil {
 		db := m.db
 		if db == nil {
@@ -1363,7 +1369,11 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer func() {
+			if !committed {
+				tx.Rollback()
+			}
+		}()
 	}
 
 	// Execute in chunks
@@ -1389,6 +1399,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		committed = true
 	}
 
 	return nil
@@ -1403,7 +1414,8 @@ func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []str
 	sb.WriteString(strings.Join(columns, ", "))
 	sb.WriteString(") VALUES ")
 
-	var args []any
+	// Pre-allocate args slice with exact capacity
+	args := make([]any, 0, len(entities)*len(fieldsToInsert))
 	rowPlaceholder := "(" + strings.Join(placeholders, ", ") + ")"
 
 	for i, entity := range entities {

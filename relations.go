@@ -5,8 +5,32 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 )
+
+// anyToKeyString converts common types to string keys efficiently.
+// Falls back to fmt.Sprintf for uncommon types.
+func anyToKeyString(v any) string {
+	switch x := v.(type) {
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int:
+		return strconv.Itoa(x)
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case uint64:
+		return strconv.FormatUint(x, 10)
+	case uint:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10)
+	case string:
+		return x
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
 
 // RelationType defines the type of relationship between two models in the ORM.
 type RelationType string
@@ -570,7 +594,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	}
 
 	// 5. Map back to parents
-	relatedMap := make(map[any][]reflect.Value)
+	relatedMap := make(map[any][]reflect.Value, len(relatedResults))
 
 	// Look up field info once outside the loop
 	fkFieldInfo, hasFKField := relatedInfo.Columns[foreignKey]
@@ -589,7 +613,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 		parentID := ids[i]
 
 		if children, ok := relatedMap[parentID]; ok {
-			relField := parentVal.FieldByName(relName)
+			relField := m.modelInfo.GetRelationField(parentVal, relName)
 			if relField.IsValid() && relField.CanSet() {
 				sliceType := relField.Type()
 				slice := reflect.MakeSlice(sliceType, 0, len(children))
@@ -700,17 +724,17 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	defer rows.Close()
 
 	// Map: ForeignID (string key) -> []RelatedID (string keys)
-	pivotMap := make(map[string][]string)
-	allRelatedIDs := make([]any, 0)
-	relatedIDSet := make(map[string]bool)
+	pivotMap := make(map[string][]string, len(results))
+	allRelatedIDs := make([]any, 0, len(results))
+	relatedIDSet := make(map[string]bool, len(results))
 
 	for rows.Next() {
 		var fID, rID any
 		if err := rows.Scan(&fID, &rID); err != nil {
 			return err
 		}
-		fKey := fmt.Sprintf("%v", fID)
-		rKey := fmt.Sprintf("%v", rID)
+		fKey := anyToKeyString(fID)
+		rKey := anyToKeyString(rID)
 		pivotMap[fKey] = append(pivotMap[fKey], rKey)
 		if !relatedIDSet[rKey] {
 			relatedIDSet[rKey] = true
@@ -754,19 +778,19 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 
 	// 6. Map back to parents
 	// Map: RelatedID (string key) -> RelatedInstance
-	relatedIdxMap := make(map[string]reflect.Value)
+	relatedIdxMap := make(map[string]reflect.Value, len(relatedResults))
 	joinKeyFieldInfo := relatedInfo.Columns[joinKey]
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		rID := val.FieldByIndex(joinKeyFieldInfo.Index).Interface()
-		rKey := fmt.Sprintf("%v", rID)
+		rKey := anyToKeyString(rID)
 		relatedIdxMap[rKey] = reflect.ValueOf(res)
 	}
 
 	for i, parent := range results {
 		parentVal := reflect.ValueOf(parent).Elem()
 		parentID := ids[i]
-		parentKey := fmt.Sprintf("%v", parentID)
+		parentKey := anyToKeyString(parentID)
 
 		rIDs, found := pivotMap[parentKey]
 		if !found {
@@ -781,7 +805,7 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 		}
 
 		if len(children) > 0 {
-			relField := parentVal.FieldByName(relName)
+			relField := m.modelInfo.GetRelationField(parentVal, relName)
 			if relField.IsValid() && relField.CanSet() {
 				sliceType := relField.Type()
 				slice := reflect.MakeSlice(sliceType, 0, len(children))
@@ -815,8 +839,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	}
 
 	fks := make([]any, 0, len(results))
-	fkMap := make(map[string][]int)   // FK string key -> []ParentIndices
-	fkValues := make(map[string]any)  // FK string key -> original FK value (for query)
+	fkMap := make(map[string][]int, len(results))   // FK string key -> []ParentIndices
+	fkValues := make(map[string]any, len(results))  // FK string key -> original FK value (for query)
 
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
@@ -860,7 +884,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			continue
 		}
 
-		fkKey := fmt.Sprintf("%v", fkVal)
+		fkKey := anyToKeyString(fkVal)
 		if _, exists := fkMap[fkKey]; exists {
 			fkMap[fkKey] = append(fkMap[fkKey], i)
 		} else {
@@ -906,7 +930,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		}
 	}
 
-	relatedByPK := make(map[string]reflect.Value) // Use string key for lookup
+	relatedByPK := make(map[string]reflect.Value, len(relatedResults)) // Use string key for lookup
 
 	// Look up field info once outside the loop
 	ownerKeyFieldInfo, hasOwnerKeyField := relatedInfo.Columns[ownerKey]
@@ -920,7 +944,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			resPK = val.FieldByName("ID").Interface()
 		}
 
-		pkKey := fmt.Sprintf("%v", resPK)
+		pkKey := anyToKeyString(resPK)
 		relatedByPK[pkKey] = reflect.ValueOf(res)
 	}
 
@@ -936,7 +960,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 		for _, idx := range indices {
 			parent := results[idx]
 			parentVal := reflect.ValueOf(parent).Elem()
-			relField := parentVal.FieldByName(relName)
+			relField := m.modelInfo.GetRelationField(parentVal, relName)
 			if relField.IsValid() && relField.CanSet() {
 				if relField.Kind() == reflect.Pointer {
 					relField.Set(relatedRecord)
@@ -1092,7 +1116,7 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	}
 
 	// 4. Map back
-	relatedMap := make(map[any][]reflect.Value)
+	relatedMap := make(map[any][]reflect.Value, len(relatedResults))
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := relatedInfo.Columns[idColumn]; ok {
@@ -1107,7 +1131,7 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 		parentID := ids[i]
 
 		if children, ok := relatedMap[parentID]; ok {
-			relField := parentVal.FieldByName(relName)
+			relField := m.modelInfo.GetRelationField(parentVal, relName)
 			if relField.IsValid() && relField.CanSet() {
 				if isOne {
 					// MorphOne: Set single value
@@ -1293,7 +1317,7 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		}
 	}
 
-	relatedMap := make(map[any][]reflect.Value)
+	relatedMap := make(map[any][]reflect.Value, len(relatedResults))
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		if field, ok := relatedInfo.Columns[foreignKey]; ok {
@@ -1308,7 +1332,7 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		parentID := ids[i]
 
 		if children, ok := relatedMap[parentID]; ok {
-			relField := parentVal.FieldByName(relName)
+			relField := modelInfo.GetRelationField(parentVal, relName)
 			if relField.IsValid() && relField.CanSet() {
 				sliceType := relField.Type()
 				slice := reflect.MakeSlice(sliceType, 0, len(children))
@@ -1632,7 +1656,7 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 		if err := rows.Scan(&id); err != nil {
 			return err
 		}
-		key := fmt.Sprintf("%v", id)
+		key := anyToKeyString(id)
 		currentIDs[key] = id
 	}
 
@@ -1641,9 +1665,9 @@ func (m *Model[T]) Sync(ctx context.Context, entity *T, relation string, ids []a
 	var toDetach []any
 
 	// Normalize input IDs to map for lookup
-	newIDsMap := make(map[string]any) // string key -> original value
+	newIDsMap := make(map[string]any, len(ids)) // string key -> original value
 	for _, id := range ids {
-		key := fmt.Sprintf("%v", id)
+		key := anyToKeyString(id)
 		newIDsMap[key] = id
 	}
 

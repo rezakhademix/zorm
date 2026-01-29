@@ -108,10 +108,14 @@ func getModelPool[T any]() *sync.Pool {
 		return pool.(*sync.Pool)
 	}
 
+	// Parse model info once for this type - will be reused by all pooled instances
+	modelInfo := ParseModel[T]()
+
 	// Create new pool
 	pool := &sync.Pool{
 		New: func() any {
 			return &Model[T]{
+				modelInfo:         modelInfo,
 				relationCallbacks: make(map[string]any),
 				morphRelations:    make(map[string]map[string][]string),
 				wheres:            make([]string, 0, 4),
@@ -135,10 +139,12 @@ func getModelPool[T any]() *sync.Pool {
 func Acquire[T any]() *Model[T] {
 	pool := getModelPool[T]()
 	m := pool.Get().(*Model[T])
+	// Save modelInfo before reset since it's set by pool.New and should be reused
+	modelInfo := m.modelInfo
 	m.reset()
 	m.ctx = context.Background()
 	m.db = GlobalDB
-	m.modelInfo = ParseModel[T]()
+	m.modelInfo = modelInfo
 	m.forceReplica = -1
 	return m
 }

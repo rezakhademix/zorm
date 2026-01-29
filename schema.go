@@ -138,6 +138,7 @@ type ModelInfo struct {
 	PrimaryKey      string
 	Fields          map[string]*FieldInfo // StructFieldName -> FieldInfo
 	Columns         map[string]*FieldInfo // DBColumnName -> FieldInfo
+	RelationFields  map[string][]int      // FieldName -> field index for FieldByIndex (relation fields)
 	Accessors       []int                 // Indices of methods starting with "Get"
 	RelationMethods map[string]int        // MethodName -> Index
 }
@@ -151,6 +152,17 @@ type FieldInfo struct {
 	Index     []int        // 24 bytes
 	IsPrimary bool         // 1 byte
 	IsAuto    bool         // 1 byte + 6 padding
+}
+
+// GetRelationField returns the reflect.Value for a relation field by name.
+// Uses cached field indices for O(1) access instead of O(n) FieldByName.
+// Returns invalid Value if field not found.
+func (m *ModelInfo) GetRelationField(structVal reflect.Value, fieldName string) reflect.Value {
+	if idx, ok := m.RelationFields[fieldName]; ok {
+		return structVal.FieldByIndex(idx)
+	}
+	// Fallback to FieldByName for backwards compatibility
+	return structVal.FieldByName(fieldName)
 }
 
 var (
@@ -196,6 +208,7 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		Type:            typ,
 		Fields:          make(map[string]*FieldInfo),
 		Columns:         make(map[string]*FieldInfo),
+		RelationFields:  make(map[string][]int),
 		RelationMethods: make(map[string]int),
 	}
 
@@ -261,8 +274,12 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 			continue
 		}
 
-		// Skip relation fields (struct pointers and slices that represent relations)
+		// Record relation fields for efficient FieldByIndex lookups during relation loading
 		if isRelationField(field.Type) {
+			currentIndex := append(indexPrefix, i)
+			finalIndex := make([]int, len(currentIndex))
+			copy(finalIndex, currentIndex)
+			info.RelationFields[field.Name] = finalIndex
 			continue
 		}
 
