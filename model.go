@@ -73,6 +73,9 @@ type Model[T any] struct {
 
 	// Omit columns for Update/Save operations
 	omitColumns map[string]bool
+
+	// Tracking scope for batch operations with automatic cleanup
+	trackingScope *TrackingScope
 }
 
 // CTE represents a Common Table Expression.
@@ -177,6 +180,7 @@ func (m *Model[T]) reset() {
 	m.relationCallbacks = make(map[string]any)
 	m.morphRelations = make(map[string]map[string][]string)
 	m.omitColumns = nil
+	m.trackingScope = nil
 }
 
 // Clone creates a deep copy of the Model.
@@ -281,10 +285,11 @@ func (m *Model[T]) Clone() *Model[T] {
 	// Copy omitColumns
 	if m.omitColumns != nil {
 		newModel.omitColumns = make(map[string]bool, len(m.omitColumns))
-		for k, v := range m.omitColumns {
-			newModel.omitColumns[k] = v
-		}
+		maps.Copy(newModel.omitColumns, m.omitColumns)
 	}
+
+	// Copy tracking scope reference (scopes can be shared)
+	newModel.trackingScope = m.trackingScope
 
 	return newModel
 }
@@ -330,6 +335,25 @@ func (m *Model[T]) SetDB(db *sql.DB) *Model[T] {
 //	model := New[User]().WithStmtCache(cache)
 func (m *Model[T]) WithStmtCache(cache *StmtCache) *Model[T] {
 	m.stmtCache = cache
+	return m
+}
+
+// WithTrackingScope sets a tracking scope for this model instance.
+// All entities loaded through this model will be registered with the scope,
+// and their tracking data will be automatically cleared when the scope is closed.
+//
+// This is useful for batch operations where you want automatic cleanup
+// of tracking data without memory leaks.
+//
+// Example:
+//
+//	scope := zorm.NewTrackingScope()
+//	defer scope.Close()
+//	model := zorm.New[User]().WithTrackingScope(scope)
+//	users, _ := model.Get(ctx) // All users are tracked in scope
+//	// When scope.Close() is called, all tracking data is cleared
+func (m *Model[T]) WithTrackingScope(scope *TrackingScope) *Model[T] {
+	m.trackingScope = scope
 	return m
 }
 

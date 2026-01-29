@@ -704,6 +704,7 @@ func (m *Model[T]) fillScanDestinations(fields []*FieldInfo, val reflect.Value, 
 // scanRows scans sql.Rows into a slice of *T.
 // It uses pre-calculated field mapping and reused destination slice for performance.
 // Automatically tracks original values for dirty checking.
+// If a tracking scope is configured, entities are registered with the scope.
 func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -733,8 +734,8 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 			return nil, err
 		}
 
-		// Track originals for dirty tracking
-		TrackOriginals(entity, m.modelInfo)
+		// Track originals for dirty tracking (with optional scope)
+		trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
 
 		results = append(results, entity)
 	}
@@ -777,6 +778,7 @@ func (c *Cursor[T]) Next() bool {
 
 // Scan scans the current row into a new entity.
 // Automatically tracks original values for dirty checking.
+// If a tracking scope is configured, entities are registered with the scope.
 func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	// Cache columns and mapping on first call
 	if c.columns == nil {
@@ -800,8 +802,8 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 		return nil, err
 	}
 
-	// Track originals for dirty tracking
-	TrackOriginals(entity, c.model.modelInfo)
+	// Track originals for dirty tracking (with optional scope)
+	trackOriginalsWithScope(entity, c.model.modelInfo, c.model.trackingScope)
 
 	// Load Accessors
 	c.model.loadAccessors([]*T{entity})
@@ -1034,14 +1036,9 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		return WrapQueryError("INSERT", query, values, err)
 	}
 
-	// Update LastInsertId if possible and supported
-	// Postgres RETURNING id handles this above.
+	// Track the newly created entity so it can be used with dirty tracking
+	trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
 
-	// Create doesn't seem to have a fallback Exec?
-	// The original code uses QueryRowContext for INSERT, presumably for RETURNING ID.
-	// So the above block covers it.
-
-	// Moving to Update method
 	return nil
 }
 
@@ -1086,11 +1083,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			continue
 		}
 
-		setSb := GetStringBuilder()
-		setSb.WriteString(field.Column)
-		setSb.WriteString(" = ?")
-		sets = append(sets, setSb.String())
-		PutStringBuilder(setSb)
+		sets = append(sets, field.Column+" = ?")
 		values = append(values, val.FieldByIndex(field.Index).Interface())
 	}
 
@@ -1135,6 +1128,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	if err != nil {
 		return WrapQueryError("UPDATE", query, values, err)
 	}
+
+	// Sync originals after successful update to mark entity as clean
+	syncOriginals(entity, m.modelInfo)
 
 	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
 		if err := hook.AfterUpdate(ctx); err != nil {
@@ -1249,7 +1245,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	}
 
 	// Sync originals after successful update
-	SyncOriginals(entity, m.modelInfo)
+	syncOriginals(entity, m.modelInfo)
 
 	// AfterUpdate Hook
 	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
@@ -1315,10 +1311,6 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	// 2. Build Query
 	var columns []string
 	var placeholders []string
-
-	// Determine columns from first entity (or model info)
-	// We use modelInfo fields.
-	// We assume all entities have same structure (they do, they are *T).
 
 	// We need to identify which columns to insert.
 	// We skip AutoIncrement PK if zero.

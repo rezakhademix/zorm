@@ -375,11 +375,11 @@ func TestSyncOriginals(t *testing.T) {
 	}
 
 	// Sync originals (simulates what happens after a successful save)
-	SyncOriginals(loaded, model.modelInfo)
+	syncOriginals(loaded, model.modelInfo)
 
 	// Now it should be clean
 	if model.IsDirtyField(loaded, "name") {
-		t.Error("Expected name to be clean after SyncOriginals")
+		t.Error("Expected name to be clean after syncOriginals")
 	}
 
 	// And the original should now be the new value
@@ -456,6 +456,126 @@ func TestIsClean(t *testing.T) {
 	}
 }
 
+func TestHasDirtyFields(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a user
+	user := &DirtyUser{
+		Name:  "John Doe",
+		Email: "john@example.com",
+	}
+	err := New[DirtyUser]().SetDB(db).Create(ctx, user)
+	if err != nil {
+		t.Fatalf("Failed to create user: %v", err)
+	}
+
+	// Load user from DB
+	model := New[DirtyUser]().SetDB(db)
+	loaded, err := model.Find(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Failed to find user: %v", err)
+	}
+
+	// Initially no dirty fields
+	if model.HasDirtyFields(loaded) {
+		t.Error("Expected no dirty fields initially")
+	}
+
+	// Modify name
+	loaded.Name = "Jane Doe"
+
+	// Now should have dirty fields
+	if !model.HasDirtyFields(loaded) {
+		t.Error("Expected dirty fields after modification")
+	}
+}
+
+func TestEntityTrackedAfterCreate(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	model := New[DirtyUser]().SetDB(db)
+
+	// Create a user
+	user := &DirtyUser{
+		Name:  "John Doe",
+		Email: "john@example.com",
+	}
+
+	// Before create, entity is not tracked
+	if IsTracked(user) {
+		t.Error("Expected entity to not be tracked before create")
+	}
+
+	err := model.Create(ctx, user)
+	if err != nil {
+		t.Fatalf("Failed to create user: %v", err)
+	}
+
+	// After create, entity should be tracked
+	if !IsTracked(user) {
+		t.Error("Expected entity to be tracked after create")
+	}
+
+	// Entity should be clean (no dirty fields)
+	if model.HasDirtyFields(user) {
+		t.Error("Expected no dirty fields after create")
+	}
+}
+
+func TestUpdateSyncsOriginals(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a user
+	user := &DirtyUser{
+		Name:  "John Doe",
+		Email: "john@example.com",
+	}
+	err := New[DirtyUser]().SetDB(db).Create(ctx, user)
+	if err != nil {
+		t.Fatalf("Failed to create user: %v", err)
+	}
+
+	// Load user from DB
+	model := New[DirtyUser]().SetDB(db)
+	loaded, err := model.Find(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("Failed to find user: %v", err)
+	}
+
+	// Modify name
+	loaded.Name = "Jane Doe"
+
+	// Verify it's dirty before update
+	if !model.IsDirtyField(loaded, "name") {
+		t.Error("Expected name to be dirty before update")
+	}
+
+	// Update
+	err = model.Update(ctx, loaded)
+	if err != nil {
+		t.Fatalf("Failed to update user: %v", err)
+	}
+
+	// After update, entity should be clean
+	if model.IsDirtyField(loaded, "name") {
+		t.Error("Expected name to be clean after update")
+	}
+
+	// Original should now be the new value
+	origName := GetOriginal(loaded, "name")
+	if origName != "Jane Doe" {
+		t.Errorf("Expected original name 'Jane Doe' after update, got '%v'", origName)
+	}
+}
+
 // DirtyUserWithUnique is a test model with a unique constraint
 type DirtyUserWithUnique struct {
 	ID          int `zorm:"primaryKey"`
@@ -529,5 +649,356 @@ func TestUpdateWithOmitPreventsUniqueConflict(t *testing.T) {
 	}
 	if reloaded.PhoneNumber != "555-1234" {
 		t.Errorf("Expected phone_number '555-1234', got '%s'", reloaded.PhoneNumber)
+	}
+}
+
+// ============================================================
+// Memory Management Tests
+// ============================================================
+
+func TestLRUTracker_Eviction(t *testing.T) {
+	// Create a tracker with capacity of 3
+	tracker := newLRUTracker(3)
+
+	// Add 3 entities
+	tracker.Store(1, map[string]any{"name": "user1"})
+	tracker.Store(2, map[string]any{"name": "user2"})
+	tracker.Store(3, map[string]any{"name": "user3"})
+
+	if tracker.Len() != 3 {
+		t.Errorf("Expected 3 entities, got %d", tracker.Len())
+	}
+
+	// Adding a 4th should evict the oldest (1)
+	tracker.Store(4, map[string]any{"name": "user4"})
+
+	if tracker.Len() != 3 {
+		t.Errorf("Expected 3 entities after eviction, got %d", tracker.Len())
+	}
+
+	// Entity 1 should be evicted
+	if _, ok := tracker.Load(1); ok {
+		t.Error("Expected entity 1 to be evicted")
+	}
+
+	// Entities 2, 3, 4 should still exist
+	if _, ok := tracker.Load(2); !ok {
+		t.Error("Expected entity 2 to exist")
+	}
+	if _, ok := tracker.Load(3); !ok {
+		t.Error("Expected entity 3 to exist")
+	}
+	if _, ok := tracker.Load(4); !ok {
+		t.Error("Expected entity 4 to exist")
+	}
+}
+
+func TestLRUTracker_AccessOrder(t *testing.T) {
+	// Create a tracker with capacity of 3
+	tracker := newLRUTracker(3)
+
+	// Add 3 entities
+	tracker.Store(1, map[string]any{"name": "user1"})
+	tracker.Store(2, map[string]any{"name": "user2"})
+	tracker.Store(3, map[string]any{"name": "user3"})
+
+	// Access entity 1 (moves to front)
+	tracker.Load(1)
+
+	// Adding a 4th should evict entity 2 (now the oldest)
+	tracker.Store(4, map[string]any{"name": "user4"})
+
+	// Entity 2 should be evicted
+	if _, ok := tracker.Load(2); ok {
+		t.Error("Expected entity 2 to be evicted")
+	}
+
+	// Entity 1 should still exist (was accessed)
+	if _, ok := tracker.Load(1); !ok {
+		t.Error("Expected entity 1 to exist")
+	}
+}
+
+func TestLRUTracker_Update(t *testing.T) {
+	tracker := newLRUTracker(3)
+
+	// Add entity
+	tracker.Store(1, map[string]any{"name": "user1"})
+
+	// Update entity
+	tracker.Store(1, map[string]any{"name": "user1_updated"})
+
+	// Should still have only 1 entity
+	if tracker.Len() != 1 {
+		t.Errorf("Expected 1 entity after update, got %d", tracker.Len())
+	}
+
+	// Should have updated value
+	originals, ok := tracker.Load(1)
+	if !ok {
+		t.Fatal("Expected entity 1 to exist")
+	}
+	if originals["name"] != "user1_updated" {
+		t.Errorf("Expected updated name, got %v", originals["name"])
+	}
+}
+
+func TestLRUTracker_Delete(t *testing.T) {
+	tracker := newLRUTracker(3)
+
+	tracker.Store(1, map[string]any{"name": "user1"})
+	tracker.Store(2, map[string]any{"name": "user2"})
+
+	if tracker.Len() != 2 {
+		t.Errorf("Expected 2 entities, got %d", tracker.Len())
+	}
+
+	tracker.Delete(1)
+
+	if tracker.Len() != 1 {
+		t.Errorf("Expected 1 entity after delete, got %d", tracker.Len())
+	}
+
+	if _, ok := tracker.Load(1); ok {
+		t.Error("Expected entity 1 to be deleted")
+	}
+}
+
+func TestLRUTracker_Clear(t *testing.T) {
+	tracker := newLRUTracker(3)
+
+	tracker.Store(1, map[string]any{"name": "user1"})
+	tracker.Store(2, map[string]any{"name": "user2"})
+
+	tracker.Clear()
+
+	if tracker.Len() != 0 {
+		t.Errorf("Expected 0 entities after clear, got %d", tracker.Len())
+	}
+}
+
+func TestLRUTracker_Unbounded(t *testing.T) {
+	// Capacity of 0 means unbounded
+	tracker := newLRUTracker(0)
+
+	// Add many entities
+	for i := 0; i < 100; i++ {
+		tracker.Store(uintptr(i), map[string]any{"name": "user"})
+	}
+
+	// All should exist
+	if tracker.Len() != 100 {
+		t.Errorf("Expected 100 entities in unbounded tracker, got %d", tracker.Len())
+	}
+}
+
+func TestTrackingScope_Cleanup(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Clear any existing tracking data
+	ClearAllOriginals()
+
+	// Create test users
+	for i := 0; i < 5; i++ {
+		user := &DirtyUser{
+			Name:  "User " + string(rune('A'+i)),
+			Email: "user@example.com",
+		}
+		err := New[DirtyUser]().SetDB(db).Create(ctx, user)
+		if err != nil {
+			t.Fatalf("Failed to create user: %v", err)
+		}
+	}
+
+	// Clear tracking from creation
+	ClearAllOriginals()
+
+	initialCount := TrackedEntityCount()
+
+	// Create a scope and load entities
+	scope := NewTrackingScope()
+	users, err := New[DirtyUser]().SetDB(db).WithTrackingScope(scope).Get(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get users: %v", err)
+	}
+
+	if len(users) != 5 {
+		t.Fatalf("Expected 5 users, got %d", len(users))
+	}
+
+	// Verify entities are tracked
+	countAfterLoad := TrackedEntityCount()
+	if countAfterLoad != initialCount+5 {
+		t.Errorf("Expected %d tracked entities, got %d", initialCount+5, countAfterLoad)
+	}
+
+	// Verify scope tracks the entities
+	if scope.Len() != 5 {
+		t.Errorf("Expected scope to track 5 entities, got %d", scope.Len())
+	}
+
+	// Close scope - should clear tracking
+	scope.Close()
+
+	// Verify tracking is cleared
+	countAfterClose := TrackedEntityCount()
+	if countAfterClose != initialCount {
+		t.Errorf("Expected %d tracked entities after scope close, got %d", initialCount, countAfterClose)
+	}
+
+	// Entities should no longer be tracked
+	for _, user := range users {
+		if IsTracked(user) {
+			t.Error("Expected entity to not be tracked after scope close")
+		}
+	}
+}
+
+func TestTrackingScope_DoubleClose(t *testing.T) {
+	scope := NewTrackingScope()
+
+	// First close should work
+	scope.Close()
+
+	// Second close should not panic
+	scope.Close()
+}
+
+func TestConfigureDirtyTracking(t *testing.T) {
+	// Clear existing tracking data first
+	ClearAllOriginals()
+
+	// Configure with limited capacity
+	ConfigureDirtyTracking(5)
+
+	// Add 10 entities
+	for i := 0; i < 10; i++ {
+		user := &DirtyUser{ID: i, Name: "User"}
+		trackOriginals(user, ParseModel[DirtyUser]())
+	}
+
+	// Should only have 5 tracked
+	if TrackedEntityCount() != 5 {
+		t.Errorf("Expected 5 tracked entities with capacity limit, got %d", TrackedEntityCount())
+	}
+
+	// Restore default capacity (10,000)
+	ConfigureDirtyTracking(10000)
+}
+
+func TestClearAllOriginals(t *testing.T) {
+	// Add some entities
+	for i := 0; i < 5; i++ {
+		user := &DirtyUser{ID: i, Name: "User"}
+		trackOriginals(user, ParseModel[DirtyUser]())
+	}
+
+	if TrackedEntityCount() == 0 {
+		t.Error("Expected some tracked entities")
+	}
+
+	// Clear all
+	ClearAllOriginals()
+
+	if TrackedEntityCount() != 0 {
+		t.Errorf("Expected 0 tracked entities after ClearAllOriginals, got %d", TrackedEntityCount())
+	}
+}
+
+func TestConcurrentTracking(t *testing.T) {
+	// Clear any existing tracking
+	ClearAllOriginals()
+
+	modelInfo := ParseModel[DirtyUser]()
+
+	// Run concurrent tracking operations
+	done := make(chan bool)
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			for j := 0; j < 100; j++ {
+				user := &DirtyUser{ID: id*100 + j, Name: "User"}
+				trackOriginals(user, modelInfo)
+
+				// Also do some reads
+				_ = IsTracked(user)
+				_ = GetOriginals(user)
+
+				// And some clears
+				if j%10 == 0 {
+					ClearOriginals(user)
+				}
+			}
+			done <- true
+		}(i)
+	}
+
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	// Should not panic and tracker should be in consistent state
+	count := TrackedEntityCount()
+	t.Logf("Final tracked count after concurrent operations: %d", count)
+}
+
+func TestCursorWithTrackingScope(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create test users
+	for i := 0; i < 5; i++ {
+		user := &DirtyUser{
+			Name:  "User " + string(rune('A'+i)),
+			Email: "user@example.com",
+		}
+		err := New[DirtyUser]().SetDB(db).Create(ctx, user)
+		if err != nil {
+			t.Fatalf("Failed to create user: %v", err)
+		}
+	}
+
+	// Clear tracking from creation
+	ClearAllOriginals()
+
+	// Create a scope and use cursor
+	scope := NewTrackingScope()
+	cursor, err := New[DirtyUser]().SetDB(db).WithTrackingScope(scope).Cursor(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create cursor: %v", err)
+	}
+	defer cursor.Close()
+
+	var users []*DirtyUser
+	for cursor.Next() {
+		user, err := cursor.Scan(ctx)
+		if err != nil {
+			t.Fatalf("Failed to scan: %v", err)
+		}
+		users = append(users, user)
+	}
+
+	if len(users) != 5 {
+		t.Fatalf("Expected 5 users from cursor, got %d", len(users))
+	}
+
+	// Verify scope tracks the entities
+	if scope.Len() != 5 {
+		t.Errorf("Expected scope to track 5 entities, got %d", scope.Len())
+	}
+
+	// Close scope - should clear tracking
+	scope.Close()
+
+	// Entities should no longer be tracked
+	for _, user := range users {
+		if IsTracked(user) {
+			t.Error("Expected entity to not be tracked after scope close")
+		}
 	}
 }
