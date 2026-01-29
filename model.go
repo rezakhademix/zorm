@@ -6,6 +6,7 @@ import (
 	"maps"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,10 +20,15 @@ var modelPools sync.Map
 // For now, we'll allow setting it globally or per-instance.
 var GlobalDB *sql.DB
 
-// GlobalResolver is the global database resolver for primary/replica setup.
-// If configured, it will automatically route read queries to replicas
-// and write queries to the primary database.
-var GlobalResolver *DBResolver
+// globalResolver is the atomic pointer to the database resolver for primary/replica setup.
+// Using atomic.Pointer ensures thread-safe read/write access.
+var globalResolver atomic.Pointer[DBResolver]
+
+// GetGlobalResolver returns the current global database resolver.
+// Returns nil if no resolver is configured.
+func GetGlobalResolver() *DBResolver {
+	return globalResolver.Load()
+}
 
 // Model provides a strongly typed ORM interface for working with the entity
 // type T. It stores the active query state—including selected columns, filters,
@@ -214,16 +220,19 @@ func (m *Model[T]) reset() {
 //	}()
 func (m *Model[T]) Clone() *Model[T] {
 	newModel := &Model[T]{
-		ctx:       m.ctx,
-		db:        m.db,
-		tx:        m.tx,
-		modelInfo: m.modelInfo,
-		tableName: m.tableName,
-		distinct:  m.distinct,
-		limit:     m.limit,
-		offset:    m.offset,
-		rawQuery:  m.rawQuery,
-		stmtCache: m.stmtCache, // Preserve statement cache reference
+		ctx:          m.ctx,
+		db:           m.db,
+		tx:           m.tx,
+		modelInfo:    m.modelInfo,
+		tableName:    m.tableName,
+		distinct:     m.distinct,
+		limit:        m.limit,
+		offset:       m.offset,
+		rawQuery:     m.rawQuery,
+		stmtCache:    m.stmtCache, // Preserve statement cache reference
+		lockMode:     m.lockMode,
+		forcePrimary: m.forcePrimary,
+		forceReplica: m.forceReplica,
 	}
 
 	// Copy slices
@@ -383,6 +392,7 @@ func ConfigureConnectionPool(db *sql.DB, maxOpen, maxIdle int, maxLifetime, idle
 }
 
 // ConfigureDBResolver configures the global database resolver for primary/replica setup.
+// This function is thread-safe and can be called at any time.
 // Example:
 //
 //	ConfigureDBResolver(
@@ -391,10 +401,17 @@ func ConfigureConnectionPool(db *sql.DB, maxOpen, maxIdle int, maxLifetime, idle
 //	    WithLoadBalancer(RoundRobinLB),
 //	)
 func ConfigureDBResolver(opts ...ResolverOption) {
-	GlobalResolver = &DBResolver{
+	resolver := &DBResolver{
 		lb: &RoundRobinLoadBalancer{}, // Default load balancer
 	}
 	for _, opt := range opts {
-		opt(GlobalResolver)
+		opt(resolver)
 	}
+	globalResolver.Store(resolver)
+}
+
+// ClearDBResolver removes the global database resolver.
+// This function is thread-safe.
+func ClearDBResolver() {
+	globalResolver.Store(nil)
 }

@@ -1,9 +1,11 @@
 package zorm
 
 import (
+	"container/list"
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"reflect"
 	"strconv"
@@ -14,7 +16,7 @@ import (
 
 // queryer returns the appropriate query executor based on transaction state and resolver configuration.
 // If a transaction is active (m.tx != nil), it returns the transaction executor.
-// If GlobalResolver is configured, it routes based on forcePrimary/forceReplica flags.
+// If a resolver is configured via GetGlobalResolver(), it routes based on forcePrimary/forceReplica flags.
 // Otherwise, it returns the database connection executor.
 // This allows the ORM to seamlessly work with both transactional and non-transactional contexts,
 // as well as primary/replica setups.
@@ -29,8 +31,8 @@ func (m *Model[T]) queryer() interface {
 	}
 
 	// If resolver is configured, use it for routing
-	if GlobalResolver != nil {
-		return m.resolveDB()
+	if resolver := GetGlobalResolver(); resolver != nil {
+		return m.resolveDB(resolver)
 	}
 
 	// Fallback to model or global DB
@@ -41,15 +43,15 @@ func (m *Model[T]) queryer() interface {
 }
 
 // resolveDB determines which database connection to use based on resolver configuration.
-func (m *Model[T]) resolveDB() *sql.DB {
+func (m *Model[T]) resolveDB(resolver *DBResolver) *sql.DB {
 	// Manual override: force primary
 	if m.forcePrimary {
-		return GlobalResolver.Primary()
+		return resolver.Primary()
 	}
 
 	// Manual override: force specific replica
 	if m.forceReplica >= 0 {
-		db := GlobalResolver.ReplicaAt(m.forceReplica)
+		db := resolver.ReplicaAt(m.forceReplica)
 		if db != nil {
 			return db
 		}
@@ -58,7 +60,7 @@ func (m *Model[T]) resolveDB() *sql.DB {
 
 	// Auto-select replica (load balanced)
 	// For read operations, this will be called by executor
-	return GlobalResolver.Replica()
+	return resolver.Replica()
 }
 
 // queryerForWrite returns the primary database for write operations.
@@ -74,8 +76,8 @@ func (m *Model[T]) queryerForWrite() interface {
 	}
 
 	// If resolver is configured, always use primary for writes
-	if GlobalResolver != nil {
-		return GlobalResolver.Primary()
+	if resolver := GetGlobalResolver(); resolver != nil {
+		return resolver.Primary()
 	}
 
 	// Fallback to model or global DB
@@ -225,30 +227,26 @@ func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
 
 // Pluck retrieves a single column's values from the result set.
 // Column names are validated to prevent SQL injection.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
 	}
 
-	// Backup columns state
-	oldColumns := m.columns
+	// Clone to avoid mutating shared state (thread-safe)
+	q := m.Clone()
+	q.columns = []string{column}
 
-	// We only select the specific column
-	m.columns = []string{column}
+	query, args := q.buildSelectQuery()
 
-	query, args := m.buildSelectQuery()
-
-	// Restore columns state
-	m.columns = oldColumns
-
-	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
+	rows, err := q.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return nil, WrapQueryError("SELECT", query, args, err)
 	}
 	defer rows.Close()
 
 	// Pre-allocate results slice based on limit or default capacity
-	initialCap := m.limit
+	initialCap := q.limit
 	if initialCap <= 0 {
 		initialCap = 64 // Default capacity for unbounded queries
 	}
@@ -270,39 +268,33 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 }
 
 // Count returns the number of records matching the query.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Count(ctx context.Context) (int64, error) {
-	// Backup limit/offset/order
-	limit, offset := m.limit, m.offset
-	orderBys := m.orderBys
+	// Clone to avoid mutating shared state (thread-safe)
+	q := m.Clone()
+	q.limit, q.offset = 0, 0
+	q.orderBys = nil
 
-	// Reset for count
-	m.limit, m.offset = 0, 0
-	m.orderBys = nil
-
-	tableName := m.TableName()
+	tableName := q.TableName()
 	var sb strings.Builder
-	cteArgs := m.buildWithClause(&sb)
+	cteArgs := q.buildWithClause(&sb)
 
 	sb.WriteString("SELECT COUNT(*) FROM ")
 	sb.WriteString(tableName)
 
-	m.buildWhereClause(&sb)
+	q.buildWhereClause(&sb)
 
 	query := sb.String()
-	args := append(cteArgs, m.args...)
-
-	// Restore state
-	m.limit, m.offset = limit, offset
-	m.orderBys = orderBys
+	args := append(cteArgs, q.args...)
 
 	var count int64
 	var err error
 
 	// Use prepared statement if caching is enabled
-	if m.stmtCache != nil {
+	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = m.prepareStmt(ctx, rebind(query))
+		stmt, release, err = q.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -310,7 +302,7 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&count)
 	} else {
-		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
+		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
 	}
 
 	if err != nil {
@@ -322,41 +314,35 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 
 // Exists checks if any record matches the query conditions.
 // It uses "SELECT 1 FROM table WHERE conditions LIMIT 1" for efficiency.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
-	// Backup limit/offset/order
-	limit, offset := m.limit, m.offset
-	orderBys := m.orderBys
+	// Clone to avoid mutating shared state (thread-safe)
+	q := m.Clone()
+	q.limit = 1
+	q.offset = 0
+	q.orderBys = nil
 
-	// Set limit 1 and reset offset/order for efficiency
-	m.limit = 1
-	m.offset = 0
-	m.orderBys = nil
-
-	tableName := m.TableName()
+	tableName := q.TableName()
 	var sb strings.Builder
-	cteArgs := m.buildWithClause(&sb)
+	cteArgs := q.buildWithClause(&sb)
 
 	sb.WriteString("SELECT 1 FROM ")
 	sb.WriteString(tableName)
 
-	m.buildWhereClause(&sb)
+	q.buildWhereClause(&sb)
 	sb.WriteString(" LIMIT 1")
 
 	query := sb.String()
-	args := append(cteArgs, m.args...)
-
-	// Restore state
-	m.limit, m.offset = limit, offset
-	m.orderBys = orderBys
+	args := append(cteArgs, q.args...)
 
 	var exists int
 	var err error
 
 	// Use prepared statement if caching is enabled
-	if m.stmtCache != nil {
+	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = m.prepareStmt(ctx, rebind(query))
+		stmt, release, err = q.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return false, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -364,7 +350,7 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&exists)
 	} else {
-		err = m.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&exists)
+		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&exists)
 	}
 
 	if err == sql.ErrNoRows {
@@ -380,45 +366,39 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 // Sum calculates the sum of a column.
 // Returns 0 if no rows match or the sum is null.
 // Column names are validated to prevent SQL injection.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
 	}
 
-	// Backup limit/offset/order
-	limit, offset := m.limit, m.offset
-	orderBys := m.orderBys
+	// Clone to avoid mutating shared state (thread-safe)
+	q := m.Clone()
+	q.limit, q.offset = 0, 0
+	q.orderBys = nil
 
-	// Reset for sum
-	m.limit, m.offset = 0, 0
-	m.orderBys = nil
-
-	tableName := m.TableName()
+	tableName := q.TableName()
 	var sb strings.Builder
-	cteArgs := m.buildWithClause(&sb)
+	cteArgs := q.buildWithClause(&sb)
 
 	sb.WriteString("SELECT SUM(")
 	sb.WriteString(column)
 	sb.WriteString(") FROM ")
 	sb.WriteString(tableName)
 
-	m.buildWhereClause(&sb)
+	q.buildWhereClause(&sb)
 
 	query := sb.String()
-	args := append(cteArgs, m.args...)
-
-	// Restore state
-	m.limit, m.offset = limit, offset
-	m.orderBys = orderBys
+	args := append(cteArgs, q.args...)
 
 	var result sql.NullFloat64
 	var err error
 
 	// Use prepared statement if caching is enabled
-	if m.stmtCache != nil {
+	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = m.prepareStmt(ctx, query)
+		stmt, release, err = q.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -426,7 +406,7 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
+		err = q.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -442,45 +422,39 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 // Avg calculates the average of a column.
 // Returns 0 if no rows match or the average is null.
 // Column names are validated to prevent SQL injection.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
 	}
 
-	// Backup limit/offset/order
-	limit, offset := m.limit, m.offset
-	orderBys := m.orderBys
+	// Clone to avoid mutating shared state (thread-safe)
+	q := m.Clone()
+	q.limit, q.offset = 0, 0
+	q.orderBys = nil
 
-	// Reset for avg
-	m.limit, m.offset = 0, 0
-	m.orderBys = nil
-
-	tableName := m.TableName()
+	tableName := q.TableName()
 	var sb strings.Builder
-	cteArgs := m.buildWithClause(&sb)
+	cteArgs := q.buildWithClause(&sb)
 
 	sb.WriteString("SELECT AVG(")
 	sb.WriteString(column)
 	sb.WriteString(") FROM ")
 	sb.WriteString(tableName)
 
-	m.buildWhereClause(&sb)
+	q.buildWhereClause(&sb)
 
 	query := sb.String()
-	args := append(cteArgs, m.args...)
-
-	// Restore state
-	m.limit, m.offset = limit, offset
-	m.orderBys = orderBys
+	args := append(cteArgs, q.args...)
 
 	var result sql.NullFloat64
 	var err error
 
 	// Use prepared statement if caching is enabled
-	if m.stmtCache != nil {
+	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = m.prepareStmt(ctx, query)
+		stmt, release, err = q.prepareStmt(ctx, query)
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -488,7 +462,7 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = m.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
+		err = q.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -663,7 +637,82 @@ func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 // Key format: "typeName:col1,col2,col3"
 // Note: We use type name (not table name) because different Go types can map to the same table
 // but have different field definitions.
-var columnMappingCache sync.Map
+// Uses sharded LRU cache to prevent unbounded memory growth.
+var columnMappingCache = newColumnCache(1000) // Cache up to 1000 mappings
+
+// columnCache is a sharded LRU cache for column mappings.
+type columnCache struct {
+	shards   [64]*columnCacheShard
+	capacity int
+}
+
+type columnCacheShard struct {
+	mu       sync.Mutex
+	items    map[string][]*FieldInfo
+	lruList  *list.List
+	capacity int
+}
+
+type columnCacheEntry struct {
+	key   string
+	value []*FieldInfo
+}
+
+func newColumnCache(capacity int) *columnCache {
+	shardCapacity := capacity / 64
+	if shardCapacity < 1 {
+		shardCapacity = 1
+	}
+
+	c := &columnCache{capacity: capacity}
+	for i := 0; i < 64; i++ {
+		c.shards[i] = &columnCacheShard{
+			items:    make(map[string][]*FieldInfo),
+			lruList:  list.New(),
+			capacity: shardCapacity,
+		}
+	}
+	return c
+}
+
+func (c *columnCache) getShard(key string) *columnCacheShard {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return c.shards[h.Sum32()%64]
+}
+
+func (c *columnCache) Load(key string) ([]*FieldInfo, bool) {
+	shard := c.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if val, ok := shard.items[key]; ok {
+		return val, true
+	}
+	return nil, false
+}
+
+func (c *columnCache) Store(key string, value []*FieldInfo) {
+	shard := c.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if _, exists := shard.items[key]; exists {
+		return // Already exists
+	}
+
+	// Evict if at capacity
+	if len(shard.items) >= shard.capacity {
+		if back := shard.lruList.Back(); back != nil {
+			entry := back.Value.(*columnCacheEntry)
+			delete(shard.items, entry.key)
+			shard.lruList.Remove(back)
+		}
+	}
+
+	shard.lruList.PushFront(&columnCacheEntry{key: key, value: value})
+	shard.items[key] = value
+}
 
 // mapColumns maps database columns to struct field info.
 // Returns a slice where each element corresponds to the column at that index.
@@ -675,7 +724,7 @@ func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
 
 	// Check cache first
 	if cached, ok := columnMappingCache.Load(key); ok {
-		return cached.([]*FieldInfo)
+		return cached
 	}
 
 	// Build mapping
@@ -806,8 +855,8 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	// Track originals for dirty tracking (with optional scope)
 	trackOriginalsWithScope(entity, c.model.modelInfo, c.model.trackingScope)
 
-	// Load Accessors
-	c.model.loadAccessors([]*T{entity})
+	// Load Accessors (using single-entity version to avoid slice allocation)
+	c.model.loadAccessorsSingle(entity)
 
 	// Load Relations if any are configured
 	if len(c.model.relations) > 0 {
@@ -975,7 +1024,6 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	numFields := len(m.modelInfo.Fields)
 	columns := make([]string, 0, numFields)
 	values := make([]any, 0, numFields)
-	placeholders := make([]string, 0, numFields)
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -990,7 +1038,6 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 		columns = append(columns, field.Column)
 		values = append(values, fVal.Interface())
-		placeholders = append(placeholders, "?")
 	}
 
 	sb := GetStringBuilder()
@@ -999,7 +1046,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	sb.WriteString(" (")
 	sb.WriteString(strings.Join(columns, ", "))
 	sb.WriteString(") VALUES (")
-	sb.WriteString(strings.Join(placeholders, ", "))
+	writePlaceholdersWithSeparator(sb, len(columns), ", ")
 	sb.WriteString(") RETURNING ")
 	sb.WriteString(m.modelInfo.PrimaryKey)
 	query := sb.String()
@@ -1315,7 +1362,6 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	// 2. Build Query
 	numFields := len(m.modelInfo.Fields)
 	columns := make([]string, 0, numFields)
-	placeholders := make([]string, 0, numFields)
 
 	// We need to identify which columns to insert.
 	// We skip AutoIncrement PK if zero.
@@ -1333,7 +1379,6 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		}
 		columns = append(columns, field.Column)
 		fieldsToInsert = append(fieldsToInsert, field.Index)
-		placeholders = append(placeholders, "?")
 	}
 
 	// Determine chunk size based on Postgres limit of 65535 parameters
@@ -1350,7 +1395,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	}
 
 	if len(entities) <= chunkSize {
-		return m.createBatch(ctx, entities, columns, fieldsToInsert, placeholders)
+		return m.createBatch(ctx, entities, columns, fieldsToInsert)
 	}
 
 	// Use a transaction for multiple chunks to ensure atomicity
@@ -1390,7 +1435,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 			batchModel.tx = tx
 		}
 
-		if err := batchModel.createBatch(ctx, batch, columns, fieldsToInsert, placeholders); err != nil {
+		if err := batchModel.createBatch(ctx, batch, columns, fieldsToInsert); err != nil {
 			return err
 		}
 	}
@@ -1406,7 +1451,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 }
 
 // createBatch performs a single batch insert query.
-func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []string, fieldsToInsert [][]int, placeholders []string) error {
+func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []string, fieldsToInsert [][]int) error {
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(m.TableName())
@@ -1416,7 +1461,13 @@ func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []str
 
 	// Pre-allocate args slice with exact capacity
 	args := make([]any, 0, len(entities)*len(fieldsToInsert))
-	rowPlaceholder := "(" + strings.Join(placeholders, ", ") + ")"
+
+	// Build row placeholder once: "(?, ?, ...)"
+	var rowSb strings.Builder
+	rowSb.WriteByte('(')
+	writePlaceholdersWithSeparator(&rowSb, len(columns), ", ")
+	rowSb.WriteByte(')')
+	rowPlaceholder := rowSb.String()
 
 	for i, entity := range entities {
 		if i > 0 {
@@ -1684,5 +1735,41 @@ func (m *Model[T]) loadAccessors(results []*T) {
 			ret := mc.method.Func.Call(callArgs)
 			attrField.SetMapIndex(reflect.ValueOf(mc.key), ret[0])
 		}
+	}
+}
+
+// loadAccessorsSingle processes Get* methods for a single entity and populates Attributes.
+// This is an optimized version of loadAccessors that avoids slice allocation for single entities.
+func (m *Model[T]) loadAccessorsSingle(entity *T) {
+	if entity == nil {
+		return
+	}
+
+	val := reflect.ValueOf(entity).Elem()
+	attrField := val.FieldByName("Attributes")
+
+	if !attrField.IsValid() || attrField.Kind() != reflect.Map {
+		return
+	}
+
+	// Use cached accessors from ModelInfo
+	accessorIndices := m.modelInfo.Accessors
+	if len(accessorIndices) == 0 {
+		return
+	}
+
+	if attrField.IsNil() {
+		attrField.Set(reflect.MakeMap(attrField.Type()))
+	}
+
+	resVal := reflect.ValueOf(entity)
+	typ := resVal.Type()
+	callArgs := []reflect.Value{resVal}
+
+	for _, idx := range accessorIndices {
+		method := typ.Method(idx)
+		key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))
+		ret := method.Func.Call(callArgs)
+		attrField.SetMapIndex(reflect.ValueOf(key), ret[0])
 	}
 }

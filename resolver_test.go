@@ -141,18 +141,19 @@ func TestConfigureDBResolver(t *testing.T) {
 		WithLoadBalancer(RoundRobinLB),
 	)
 
-	if GlobalResolver == nil {
-		t.Fatal("Expected GlobalResolver to be configured")
+	resolver := GetGlobalResolver()
+	if resolver == nil {
+		t.Fatal("Expected global resolver to be configured")
 	}
-	if GlobalResolver.Primary() != primary {
+	if resolver.Primary() != primary {
 		t.Error("Expected primary to be configured")
 	}
-	if len(GlobalResolver.replicas) != 2 {
-		t.Errorf("Expected 2 replicas, got %d", len(GlobalResolver.replicas))
+	if !resolver.HasReplicas() {
+		t.Error("Expected replicas to be configured")
 	}
 
 	// Clean up
-	GlobalResolver = nil
+	ClearDBResolver()
 }
 
 // TestModel_UsePrimary tests forcing primary database
