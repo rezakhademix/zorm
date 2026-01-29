@@ -1002,7 +1002,6 @@ func rebind(query string) string {
 	questionMarkCount := 0
 	inQuote := false
 
-	// ... existing loop ...
 	for i := 0; i < len(query); i++ {
 		c := query[i]
 		if c == '\'' {
@@ -1017,5 +1016,9 @@ func rebind(query string) string {
 			sb.WriteByte(c)
 		}
 	}
-	return strings.Clone(sb.String())
+	// sb.String() returns a string referencing the builder's buffer, but since
+	// Reset() only nils the slice header (doesn't free the underlying array),
+	// and the next user of this builder will allocate a fresh buffer, the
+	// returned string remains valid. No Clone needed.
+	return sb.String()
 }

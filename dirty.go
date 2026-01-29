@@ -10,111 +10,151 @@ import (
 
 // trackerEntry represents a single entity's tracking data in the LRU cache.
 type trackerEntry struct {
-	key      uintptr
+	key       uintptr
 	originals map[string]any
-	element  *list.Element // Position in LRU list
+	element   *list.Element // Position in LRU list
 }
 
-// lruTracker provides bounded dirty tracking with LRU eviction.
-// When the tracker reaches capacity, the least recently used entries are evicted.
-type lruTracker struct {
+// lruTrackerShard is a single shard of the tracker with its own lock.
+type lruTrackerShard struct {
 	mu       sync.Mutex
 	capacity int
 	items    map[uintptr]*trackerEntry
 	lruList  *list.List // Front = most recently used, Back = least recently used
 }
 
+// shardCount is the number of shards for the tracker.
+// Using 256 shards provides good distribution while keeping memory overhead low.
+const shardCount = 256
+
+// lruTracker provides bounded dirty tracking with LRU eviction.
+// When the tracker reaches capacity, the least recently used entries are evicted.
+// Uses sharded locking to reduce contention under high concurrency.
+type lruTracker struct {
+	shards   [shardCount]*lruTrackerShard
+	capacity int // total capacity across all shards
+}
+
 // newLRUTracker creates a new LRU tracker with the specified capacity.
 // A capacity of 0 means unbounded (no eviction).
 func newLRUTracker(capacity int) *lruTracker {
-	return &lruTracker{
-		capacity: capacity,
-		items:    make(map[uintptr]*trackerEntry),
-		lruList:  list.New(),
+	// Distribute capacity across shards
+	shardCapacity := capacity / shardCount
+	if shardCapacity < 1 && capacity > 0 {
+		shardCapacity = 1
 	}
+
+	t := &lruTracker{
+		capacity: capacity,
+	}
+
+	for i := 0; i < shardCount; i++ {
+		t.shards[i] = &lruTrackerShard{
+			capacity: shardCapacity,
+			items:    make(map[uintptr]*trackerEntry),
+			lruList:  list.New(),
+		}
+	}
+
+	return t
+}
+
+// getShard returns the shard for the given key.
+func (t *lruTracker) getShard(key uintptr) *lruTrackerShard {
+	return t.shards[key%shardCount]
 }
 
 // Store adds or updates tracking data for an entity.
 func (t *lruTracker) Store(key uintptr, originals map[string]any) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	shard := t.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if entry, exists := t.items[key]; exists {
+	if entry, exists := shard.items[key]; exists {
 		// Update existing entry and move to front
 		entry.originals = originals
-		t.lruList.MoveToFront(entry.element)
+		shard.lruList.MoveToFront(entry.element)
 		return
 	}
 
 	// Evict if at capacity
-	if t.capacity > 0 && len(t.items) >= t.capacity {
-		t.evictLRU()
+	if shard.capacity > 0 && len(shard.items) >= shard.capacity {
+		shard.evictLRU()
 	}
 
 	// Add new entry
 	entry := &trackerEntry{
-		key:      key,
+		key:       key,
 		originals: originals,
 	}
-	entry.element = t.lruList.PushFront(entry)
-	t.items[key] = entry
+	entry.element = shard.lruList.PushFront(entry)
+	shard.items[key] = entry
 }
 
 // Load retrieves tracking data for an entity.
 func (t *lruTracker) Load(key uintptr) (map[string]any, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	shard := t.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	entry, exists := t.items[key]
+	entry, exists := shard.items[key]
 	if !exists {
 		return nil, false
 	}
 
 	// Move to front (mark as recently used)
-	t.lruList.MoveToFront(entry.element)
+	shard.lruList.MoveToFront(entry.element)
 	return entry.originals, true
 }
 
 // Delete removes tracking data for an entity.
 func (t *lruTracker) Delete(key uintptr) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	shard := t.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	entry, exists := t.items[key]
+	entry, exists := shard.items[key]
 	if !exists {
 		return
 	}
 
-	t.lruList.Remove(entry.element)
-	delete(t.items, key)
+	shard.lruList.Remove(entry.element)
+	delete(shard.items, key)
 }
 
 // Clear removes all tracking data.
 func (t *lruTracker) Clear() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.items = make(map[uintptr]*trackerEntry)
-	t.lruList.Init()
+	for i := 0; i < shardCount; i++ {
+		shard := t.shards[i]
+		shard.mu.Lock()
+		shard.items = make(map[uintptr]*trackerEntry)
+		shard.lruList.Init()
+		shard.mu.Unlock()
+	}
 }
 
 // Len returns the number of tracked entities.
 func (t *lruTracker) Len() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.items)
+	total := 0
+	for i := 0; i < shardCount; i++ {
+		shard := t.shards[i]
+		shard.mu.Lock()
+		total += len(shard.items)
+		shard.mu.Unlock()
+	}
+	return total
 }
 
 // evictLRU removes the least recently used entry. Must be called with lock held.
-func (t *lruTracker) evictLRU() {
-	back := t.lruList.Back()
+func (s *lruTrackerShard) evictLRU() {
+	back := s.lruList.Back()
 	if back == nil {
 		return
 	}
 
 	entry := back.Value.(*trackerEntry)
-	t.lruList.Remove(back)
-	delete(t.items, entry.key)
+	s.lruList.Remove(back)
+	delete(s.items, entry.key)
 }
 
 // TrackingScope provides scoped dirty tracking for batch operations.
