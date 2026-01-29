@@ -6,7 +6,138 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// fastEqual compares two values for equality using type-specific comparison
+// for common types, falling back to reflect.DeepEqual for complex types.
+// This is significantly faster than reflect.DeepEqual for primitive types.
+func fastEqual(a, b any) bool {
+	// Handle nil cases
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	// Fast path for common types
+	switch av := a.(type) {
+	case int:
+		if bv, ok := b.(int); ok {
+			return av == bv
+		}
+	case int64:
+		if bv, ok := b.(int64); ok {
+			return av == bv
+		}
+	case int32:
+		if bv, ok := b.(int32); ok {
+			return av == bv
+		}
+	case int16:
+		if bv, ok := b.(int16); ok {
+			return av == bv
+		}
+	case int8:
+		if bv, ok := b.(int8); ok {
+			return av == bv
+		}
+	case uint:
+		if bv, ok := b.(uint); ok {
+			return av == bv
+		}
+	case uint64:
+		if bv, ok := b.(uint64); ok {
+			return av == bv
+		}
+	case uint32:
+		if bv, ok := b.(uint32); ok {
+			return av == bv
+		}
+	case uint16:
+		if bv, ok := b.(uint16); ok {
+			return av == bv
+		}
+	case uint8:
+		if bv, ok := b.(uint8); ok {
+			return av == bv
+		}
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return av == bv
+		}
+	case float32:
+		if bv, ok := b.(float32); ok {
+			return av == bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
+		}
+	case time.Time:
+		if bv, ok := b.(time.Time); ok {
+			return av.Equal(bv)
+		}
+	case *int:
+		if bv, ok := b.(*int); ok {
+			if av == nil && bv == nil {
+				return true
+			}
+			if av == nil || bv == nil {
+				return false
+			}
+			return *av == *bv
+		}
+	case *int64:
+		if bv, ok := b.(*int64); ok {
+			if av == nil && bv == nil {
+				return true
+			}
+			if av == nil || bv == nil {
+				return false
+			}
+			return *av == *bv
+		}
+	case *string:
+		if bv, ok := b.(*string); ok {
+			if av == nil && bv == nil {
+				return true
+			}
+			if av == nil || bv == nil {
+				return false
+			}
+			return *av == *bv
+		}
+	case *bool:
+		if bv, ok := b.(*bool); ok {
+			if av == nil && bv == nil {
+				return true
+			}
+			if av == nil || bv == nil {
+				return false
+			}
+			return *av == *bv
+		}
+	case *time.Time:
+		if bv, ok := b.(*time.Time); ok {
+			if av == nil && bv == nil {
+				return true
+			}
+			if av == nil || bv == nil {
+				return false
+			}
+			return av.Equal(*bv)
+		}
+	}
+
+	// Fallback to reflect.DeepEqual for complex types
+	return reflect.DeepEqual(a, b)
+}
 
 // trackerEntry represents a single entity's tracking data in the LRU cache.
 type trackerEntry struct {
@@ -357,7 +488,7 @@ func isDirty[T any](entity *T, column string, modelInfo *ModelInfo) bool {
 	}
 
 	current := reflect.ValueOf(entity).Elem().FieldByIndex(field.Index).Interface()
-	return !reflect.DeepEqual(original, current)
+	return !fastEqual(original, current)
 }
 
 // isClean checks if a specific field has NOT changed from its original value.
@@ -391,7 +522,7 @@ func getDirty[T any](entity *T, modelInfo *ModelInfo) map[string]any {
 			continue
 		}
 
-		if original, exists := orig[field.Column]; !exists || !reflect.DeepEqual(original, current) {
+		if original, exists := orig[field.Column]; !exists || !fastEqual(original, current) {
 			dirty[field.Column] = current
 		}
 	}
@@ -436,7 +567,7 @@ func hasDirtyFields[T any](entity *T, modelInfo *ModelInfo) bool {
 		}
 
 		current := val.FieldByIndex(field.Index).Interface()
-		if original, exists := orig[field.Column]; !exists || !reflect.DeepEqual(original, current) {
+		if original, exists := orig[field.Column]; !exists || !fastEqual(original, current) {
 			return true
 		}
 	}

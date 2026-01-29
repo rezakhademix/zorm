@@ -3,18 +3,30 @@ package zorm
 import (
 	"container/list"
 	"database/sql"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 )
+
+// stmtShardCount is the number of shards for the statement cache.
+// Using 64 shards provides good distribution while keeping memory overhead low.
+const stmtShardCount = 64
 
 // StmtCache provides a thread-safe LRU cache for prepared statements.
 // It stores prepared SQL statements and automatically evicts the least
 // recently used entries when the cache reaches its maximum capacity.
 //
-// The cache is safe for concurrent use by multiple goroutines and helps
+// The cache uses sharded locking to reduce contention under high concurrency.
+// It is safe for concurrent use by multiple goroutines and helps
 // improve performance by reusing prepared statements instead of re-preparing
 // them on every execution.
 type StmtCache struct {
+	shards   [stmtShardCount]*stmtCacheShard
+	capacity int
+}
+
+// stmtCacheShard represents a single shard of the cache with its own lock.
+type stmtCacheShard struct {
 	mu       sync.Mutex
 	capacity int
 	items    map[string]*cacheEntry
@@ -39,11 +51,33 @@ func NewStmtCache(capacity int) *StmtCache {
 	if capacity <= 0 {
 		capacity = 100
 	}
-	return &StmtCache{
-		capacity: capacity,
-		items:    make(map[string]*cacheEntry),
-		lruList:  list.New(),
+
+	// Distribute capacity across shards
+	shardCapacity := capacity / stmtShardCount
+	if shardCapacity < 1 {
+		shardCapacity = 1
 	}
+
+	c := &StmtCache{
+		capacity: capacity,
+	}
+
+	for i := 0; i < stmtShardCount; i++ {
+		c.shards[i] = &stmtCacheShard{
+			capacity: shardCapacity,
+			items:    make(map[string]*cacheEntry),
+			lruList:  list.New(),
+		}
+	}
+
+	return c
+}
+
+// getShard returns the shard for the given query using FNV-1a hash.
+func (c *StmtCache) getShard(query string) *stmtCacheShard {
+	h := fnv.New32a()
+	h.Write([]byte(query))
+	return c.shards[h.Sum32()%stmtShardCount]
 }
 
 // Get retrieves a cached prepared statement for the given SQL query.
@@ -51,14 +85,15 @@ func NewStmtCache(capacity int) *StmtCache {
 // when finished using the statement.
 // Returns nil, nil if the statement is not found in the cache.
 func (c *StmtCache) Get(query string) (*sql.Stmt, func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(query)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	if entry, exists := c.items[query]; exists {
-		c.lruList.MoveToFront(entry.element)
+	if entry, exists := shard.items[query]; exists {
+		shard.lruList.MoveToFront(entry.element)
 		atomic.AddInt32(&entry.refCount, 1)
 		return entry.stmt, func() {
-			c.release(entry)
+			c.release(shard, entry)
 		}
 	}
 
@@ -71,24 +106,25 @@ func (c *StmtCache) Get(query string) (*sql.Stmt, func()) {
 //
 // If a statement with the same query already exists, it will be replaced.
 func (c *StmtCache) Put(query string, stmt *sql.Stmt) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(query)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	c.putLocked(query, stmt)
+	c.putLocked(shard, query, stmt)
 }
 
 // putLocked is the internal implementation of Put, assumes lock is held.
-func (c *StmtCache) putLocked(query string, stmt *sql.Stmt) *cacheEntry {
+func (c *StmtCache) putLocked(shard *stmtCacheShard, query string, stmt *sql.Stmt) *cacheEntry {
 	// If entry already exists, update it?
 	// It's tricky to update an existing entry safely if it's in use.
 	// We should evict the old one and add new one.
-	if entry, exists := c.items[query]; exists {
-		c.evictEntry(entry)
+	if entry, exists := shard.items[query]; exists {
+		c.evictEntry(shard, entry)
 	}
 
 	// Evict LRU entry if at capacity
-	if len(c.items) >= c.capacity {
-		c.evictLRU()
+	if len(shard.items) >= shard.capacity {
+		c.evictLRU(shard)
 	}
 
 	entry := &cacheEntry{
@@ -97,9 +133,9 @@ func (c *StmtCache) putLocked(query string, stmt *sql.Stmt) *cacheEntry {
 		refCount: 0,
 		evicted:  false,
 	}
-	element := c.lruList.PushFront(entry)
+	element := shard.lruList.PushFront(entry)
 	entry.element = element
-	c.items[query] = entry
+	shard.items[query] = entry
 	return entry
 }
 
@@ -108,30 +144,31 @@ func (c *StmtCache) putLocked(query string, stmt *sql.Stmt) *cacheEntry {
 // statement could be evicted between Put and Get calls.
 // Returns the statement and a release function. The caller MUST call the release function.
 func (c *StmtCache) PutAndGet(query string, stmt *sql.Stmt) (*sql.Stmt, func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(query)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	entry := c.putLocked(query, stmt)
+	entry := c.putLocked(shard, query, stmt)
 	atomic.AddInt32(&entry.refCount, 1)
 	return entry.stmt, func() {
-		c.release(entry)
+		c.release(shard, entry)
 	}
 }
 
 // evictLRU removes the least recently used statement from the cache.
-func (c *StmtCache) evictLRU() {
-	element := c.lruList.Back()
+func (c *StmtCache) evictLRU(shard *stmtCacheShard) {
+	element := shard.lruList.Back()
 	if element == nil {
 		return
 	}
 	entry := element.Value.(*cacheEntry)
-	c.evictEntry(entry)
+	c.evictEntry(shard, entry)
 }
 
 // evictEntry removes an entry from the map and list, marking it as evicted.
-func (c *StmtCache) evictEntry(entry *cacheEntry) {
-	c.lruList.Remove(entry.element)
-	delete(c.items, entry.query)
+func (c *StmtCache) evictEntry(shard *stmtCacheShard, entry *cacheEntry) {
+	shard.lruList.Remove(entry.element)
+	delete(shard.items, entry.query)
 	entry.evicted = true
 
 	// If no one is using it, close immediately
@@ -141,11 +178,11 @@ func (c *StmtCache) evictEntry(entry *cacheEntry) {
 }
 
 // release decrements the ref count and closes if evicted and unused.
-func (c *StmtCache) release(entry *cacheEntry) {
+func (c *StmtCache) release(shard *stmtCacheShard, entry *cacheEntry) {
 	newCount := atomic.AddInt32(&entry.refCount, -1)
 	if newCount == 0 {
-		c.mu.Lock()
-		defer c.mu.Unlock()
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
 		// Double check under lock (though evicted/refCount logic is mostly safe, closing should be consistent)
 		// If it was evicted while we used it, we must close it now.
 		if entry.evicted && atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
@@ -156,18 +193,21 @@ func (c *StmtCache) release(entry *cacheEntry) {
 
 // Clear closes all cached statements and clears the cache.
 func (c *StmtCache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for i := 0; i < stmtShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.Lock()
 
-	for _, entry := range c.items {
-		entry.evicted = true
-		if atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
-			_ = entry.stmt.Close()
+		for _, entry := range shard.items {
+			entry.evicted = true
+			if atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
+				_ = entry.stmt.Close()
+			}
 		}
-	}
 
-	c.items = make(map[string]*cacheEntry)
-	c.lruList.Init()
+		shard.items = make(map[string]*cacheEntry)
+		shard.lruList.Init()
+		shard.mu.Unlock()
+	}
 }
 
 // Close closes all cached statements and releases all resources.
@@ -178,7 +218,12 @@ func (c *StmtCache) Close() error {
 
 // Len returns the current number of cached statements.
 func (c *StmtCache) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.items)
+	total := 0
+	for i := 0; i < stmtShardCount; i++ {
+		shard := c.shards[i]
+		shard.mu.Lock()
+		total += len(shard.items)
+		shard.mu.Unlock()
+	}
+	return total
 }

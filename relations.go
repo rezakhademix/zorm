@@ -479,15 +479,11 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 		sb.WriteString(" WHERE ")
 		sb.WriteString(pk)
 		sb.WriteString(" IN (")
+		writePlaceholders(&sb, len(ids))
+		sb.WriteString(")")
 
 		args := make([]any, len(ids))
-		placeholders := make([]string, len(ids))
-		for i, id := range ids {
-			placeholders[i] = "?"
-			args[i] = id
-		}
-		sb.WriteString(strings.Join(placeholders, ","))
-		sb.WriteString(")")
+		copy(args, ids)
 
 		rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 		if err != nil {
@@ -707,15 +703,11 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	pivotSb.WriteString(" WHERE ")
 	pivotSb.WriteString(foreignKey)
 	pivotSb.WriteString(" IN (")
+	writePlaceholders(&pivotSb, len(ids))
+	pivotSb.WriteString(")")
 
 	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	pivotSb.WriteString(strings.Join(placeholders, ","))
-	pivotSb.WriteString(")")
+	copy(args, ids)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(pivotSb.String()), args...)
 	if err != nil {
@@ -992,15 +984,11 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 	sb.WriteString(" WHERE ")
 	sb.WriteString(key)
 	sb.WriteString(" IN (")
+	writePlaceholders(&sb, len(ids))
+	sb.WriteString(")")
 
 	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	sb.WriteString(strings.Join(placeholders, ","))
-	sb.WriteString(")")
+	copy(args, ids)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
@@ -1084,17 +1072,12 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	sb.WriteString(" = ? AND ")
 	sb.WriteString(idColumn)
 	sb.WriteString(" IN (")
+	writePlaceholders(&sb, len(ids))
+	sb.WriteString(")")
 
 	args := make([]any, 0, len(ids)+1)
 	args = append(args, parentType)
-
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-	sb.WriteString(strings.Join(placeholders, ","))
-	sb.WriteString(")")
+	args = append(args, ids...)
 
 	// Execute
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
@@ -1289,15 +1272,11 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	sb.WriteString(" WHERE ")
 	sb.WriteString(foreignKey)
 	sb.WriteString(" IN (")
+	writePlaceholders(&sb, len(ids))
+	sb.WriteString(")")
 
 	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	sb.WriteString(strings.Join(placeholders, ","))
-	sb.WriteString(")")
+	copy(args, ids)
 
 	// Execute
 	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
@@ -1554,16 +1533,12 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 		if err := ValidateColumnName(relatedKey); err != nil {
 			return fmt.Errorf("invalid related key name: %w", err)
 		}
-		placeholders := make([]string, len(ids))
-		for i, id := range ids {
-			placeholders[i] = "?"
-			args = append(args, id)
-		}
 		sb.WriteString(" AND ")
 		sb.WriteString(relatedKey)
 		sb.WriteString(" IN (")
-		sb.WriteString(strings.Join(placeholders, ","))
+		writePlaceholders(&sb, len(ids))
 		sb.WriteByte(')')
+		args = append(args, ids...)
 	}
 
 	_, err := m.queryer().ExecContext(ctx, rebind(sb.String()), args...)

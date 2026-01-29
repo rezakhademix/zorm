@@ -430,30 +430,43 @@ func TestConfigureConnectionPool_Signature(t *testing.T) {
 // CONFIGUREDBRESOLVER TESTS
 // =============================================================================
 
-// TestConfigureDBResolver_SetsGlobalResolver verifies GlobalResolver is set
+// TestConfigureDBResolver_SetsGlobalResolver verifies global resolver is set
 func TestConfigureDBResolver_SetsGlobalResolver(t *testing.T) {
 	// Save original
-	originalResolver := GlobalResolver
-	defer func() { GlobalResolver = originalResolver }()
+	originalResolver := GetGlobalResolver()
+	defer func() {
+		if originalResolver != nil {
+			ConfigureDBResolver(WithPrimary(originalResolver.Primary()))
+		} else {
+			ClearDBResolver()
+		}
+	}()
 
-	GlobalResolver = nil
+	ClearDBResolver()
 
 	ConfigureDBResolver()
 
-	if GlobalResolver == nil {
-		t.Error("ConfigureDBResolver should set GlobalResolver")
+	if GetGlobalResolver() == nil {
+		t.Error("ConfigureDBResolver should set global resolver")
 	}
 }
 
 // TestConfigureDBResolver_DefaultLoadBalancer verifies default LB is set
 func TestConfigureDBResolver_DefaultLoadBalancer(t *testing.T) {
 	// Save original
-	originalResolver := GlobalResolver
-	defer func() { GlobalResolver = originalResolver }()
+	originalResolver := GetGlobalResolver()
+	defer func() {
+		if originalResolver != nil {
+			ConfigureDBResolver(WithPrimary(originalResolver.Primary()))
+		} else {
+			ClearDBResolver()
+		}
+	}()
 
 	ConfigureDBResolver()
 
-	if GlobalResolver.lb == nil {
+	resolver := GetGlobalResolver()
+	if resolver == nil || resolver.lb == nil {
 		t.Error("ConfigureDBResolver should set default load balancer")
 	}
 }
@@ -461,8 +474,14 @@ func TestConfigureDBResolver_DefaultLoadBalancer(t *testing.T) {
 // TestConfigureDBResolver_WithOptions verifies options are applied
 func TestConfigureDBResolver_WithOptions(t *testing.T) {
 	// Save original
-	originalResolver := GlobalResolver
-	defer func() { GlobalResolver = originalResolver }()
+	originalResolver := GetGlobalResolver()
+	defer func() {
+		if originalResolver != nil {
+			ConfigureDBResolver(WithPrimary(originalResolver.Primary()))
+		} else {
+			ClearDBResolver()
+		}
+	}()
 
 	// Create mock DBs
 	var primaryDB *sql.DB
@@ -473,16 +492,17 @@ func TestConfigureDBResolver_WithOptions(t *testing.T) {
 		WithReplicas(replicaDB),
 	)
 
-	if GlobalResolver == nil {
-		t.Fatal("ConfigureDBResolver should set GlobalResolver")
+	resolver := GetGlobalResolver()
+	if resolver == nil {
+		t.Fatal("ConfigureDBResolver should set global resolver")
 	}
 
-	if GlobalResolver.primary != primaryDB {
+	if resolver.Primary() != primaryDB {
 		t.Error("WithPrimary option should set primary DB")
 	}
 
-	if len(GlobalResolver.replicas) != 1 {
-		t.Errorf("WithReplicas should add 1 replica, got %d", len(GlobalResolver.replicas))
+	if !resolver.HasReplicas() {
+		t.Error("WithReplicas should add 1 replica")
 	}
 }
 

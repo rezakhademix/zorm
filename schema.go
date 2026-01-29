@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"container/list"
 	"database/sql"
 	"fmt"
 	"reflect"
@@ -30,8 +31,83 @@ func PutStringBuilder(sb *strings.Builder) {
 	sbPool.Put(sb)
 }
 
+// writePlaceholders writes n question mark placeholders separated by commas to sb.
+// Example: writePlaceholders(sb, 3) writes "?,?,?"
+// This avoids allocating a []string slice for strings.Join.
+func writePlaceholders(sb *strings.Builder, n int) {
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('?')
+	}
+}
+
+// writePlaceholdersWithSeparator writes n question mark placeholders with a custom separator.
+// Example: writePlaceholdersWithSeparator(sb, 3, ", ") writes "?, ?, ?"
+func writePlaceholdersWithSeparator(sb *strings.Builder, n int, sep string) {
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteString(sep)
+		}
+		sb.WriteByte('?')
+	}
+}
+
 // snakeCaseCache caches ToSnakeCase results to avoid repeated conversions.
-var snakeCaseCache sync.Map
+// Uses a bounded LRU cache to prevent unbounded memory growth if ToSnakeCase
+// is called with arbitrary strings. In normal use (struct field names only),
+// the cache should stabilize quickly.
+var snakeCaseCache = newSnakeCaseCache(1000)
+
+// snakeCaseCacheType is a bounded LRU cache for snake_case conversions.
+type snakeCaseCacheType struct {
+	mu       sync.RWMutex
+	items    map[string]string
+	lruList  *list.List
+	capacity int
+}
+
+type snakeCacheEntry struct {
+	key   string
+	value string
+}
+
+func newSnakeCaseCache(capacity int) *snakeCaseCacheType {
+	return &snakeCaseCacheType{
+		items:    make(map[string]string),
+		lruList:  list.New(),
+		capacity: capacity,
+	}
+}
+
+func (c *snakeCaseCacheType) Load(key string) (string, bool) {
+	c.mu.RLock()
+	val, ok := c.items[key]
+	c.mu.RUnlock()
+	return val, ok
+}
+
+func (c *snakeCaseCacheType) Store(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.items[key]; exists {
+		return // Already exists
+	}
+
+	// Evict if at capacity
+	if len(c.items) >= c.capacity {
+		if back := c.lruList.Back(); back != nil {
+			entry := back.Value.(*snakeCacheEntry)
+			delete(c.items, entry.key)
+			c.lruList.Remove(back)
+		}
+	}
+
+	c.lruList.PushFront(&snakeCacheEntry{key: key, value: value})
+	c.items[key] = value
+}
 
 // ErrInvalidColumnName is returned when a column name contains invalid characters.
 var ErrInvalidColumnName = fmt.Errorf("zorm: invalid column name")
@@ -389,7 +465,7 @@ func isRelationStruct(t reflect.Type) bool {
 func ToSnakeCase(s string) string {
 	// Check cache first
 	if cached, ok := snakeCaseCache.Load(s); ok {
-		return cached.(string)
+		return cached
 	}
 
 	sb := GetStringBuilder()
