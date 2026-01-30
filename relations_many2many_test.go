@@ -412,12 +412,6 @@ func TestSync_MissingRelatedKey(t *testing.T) {
 	GlobalDB = db
 	defer func() { GlobalDB = oldDB }()
 
-	// Define a model with BelongsToMany missing RelatedKey
-	type UserBadRel struct {
-		ID    int `zorm:"primaryKey"`
-		Roles []*RelRole
-	}
-
 	// We can't easily test this without creating a new model with incomplete config
 	// The existing model has a proper config, so we'll test that Sync requires RelatedKey
 	// by checking the code path - but the existing tests cover this adequately

@@ -443,35 +443,6 @@ func (u RelUserWithProfile) ProfileRelation() HasOne[RelProfile] {
 	}
 }
 
-func setupRelDBHasOne(t *testing.T) *sql.DB {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
-	}
-
-	_, err = db.Exec(`
-		CREATE TABLE rel_users_with_profile (
-			id INTEGER PRIMARY KEY,
-			name TEXT
-		);
-		CREATE TABLE rel_profiles (
-			id INTEGER PRIMARY KEY,
-			user_id INTEGER UNIQUE,
-			bio TEXT
-		);
-
-		INSERT INTO rel_users_with_profile (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
-		INSERT INTO rel_profiles (id, user_id, bio) VALUES
-			(1, 1, 'Alice''s bio'),
-			(2, 2, 'Bob''s bio');
-	`)
-	if err != nil {
-		t.Fatalf("failed to setup DB: %v", err)
-	}
-	return db
-}
-
-
 func TestHasOne_WithTableOverride(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
@@ -493,13 +464,6 @@ func TestHasOne_WithTableOverride(t *testing.T) {
 	oldDB := GlobalDB
 	GlobalDB = db
 	defer func() { GlobalDB = oldDB }()
-
-	// Define a user with custom table override
-	type UserWithCustomProfile struct {
-		ID      int `zorm:"primaryKey"`
-		Name    string
-		Profile *RelProfile
-	}
 
 	// We'll test the GetOverrideTable method directly
 	rel := HasOne[RelProfile]{
