@@ -164,6 +164,7 @@ const shardCount = 256
 type lruTracker struct {
 	shards   [shardCount]*lruTrackerShard
 	capacity int // total capacity across all shards
+	count    atomic.Int64 // total count across all shards for O(1) Len()
 }
 
 // newLRUTracker creates a new LRU tracker with the specified capacity.
@@ -208,9 +209,11 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any) {
 		return
 	}
 
-	// Evict if at capacity
+	// Evict if at capacity (count stays the same on eviction+add)
+	evicted := false
 	if shard.capacity > 0 && len(shard.items) >= shard.capacity {
 		shard.evictLRU()
+		evicted = true
 	}
 
 	// Add new entry
@@ -220,6 +223,11 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any) {
 	}
 	entry.element = shard.lruList.PushFront(entry)
 	shard.items[key] = entry
+
+	// Only increment if we didn't evict (net +1)
+	if !evicted {
+		t.count.Add(1)
+	}
 }
 
 // Load retrieves tracking data for an entity.
@@ -251,6 +259,7 @@ func (t *lruTracker) Delete(key uintptr) {
 
 	shard.lruList.Remove(entry.element)
 	delete(shard.items, key)
+	t.count.Add(-1)
 }
 
 // Clear removes all tracking data.
@@ -262,18 +271,13 @@ func (t *lruTracker) Clear() {
 		shard.lruList.Init()
 		shard.mu.Unlock()
 	}
+	t.count.Store(0)
 }
 
 // Len returns the number of tracked entities.
+// Uses atomic counter for O(1) performance instead of O(shardCount) with locks.
 func (t *lruTracker) Len() int {
-	total := 0
-	for i := 0; i < shardCount; i++ {
-		shard := t.shards[i]
-		shard.mu.Lock()
-		total += len(shard.items)
-		shard.mu.Unlock()
-	}
-	return total
+	return int(t.count.Load())
 }
 
 // evictLRU removes the least recently used entry. Must be called with lock held.

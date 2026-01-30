@@ -341,14 +341,14 @@ func (m *Model[T]) Clone() *Model[T] {
 		copy(newModel.ctes, m.ctes)
 	}
 
-	// Copy maps
-	newModel.relationCallbacks = make(map[string]any)
-	if m.relationCallbacks != nil {
+	// Copy maps - only allocate if source has content
+	if len(m.relationCallbacks) > 0 {
+		newModel.relationCallbacks = make(map[string]any, len(m.relationCallbacks))
 		maps.Copy(newModel.relationCallbacks, m.relationCallbacks)
 	}
 
-	newModel.morphRelations = make(map[string]map[string][]string)
-	if m.morphRelations != nil {
+	if len(m.morphRelations) > 0 {
+		newModel.morphRelations = make(map[string]map[string][]string, len(m.morphRelations))
 		for k, v := range m.morphRelations {
 			newMap := make(map[string][]string, len(v))
 			for mk, mv := range v {
@@ -361,8 +361,8 @@ func (m *Model[T]) Clone() *Model[T] {
 		}
 	}
 
-	// Copy omitColumns
-	if m.omitColumns != nil {
+	// Copy omitColumns - only allocate if source has content
+	if len(m.omitColumns) > 0 {
 		newModel.omitColumns = make(map[string]bool, len(m.omitColumns))
 		maps.Copy(newModel.omitColumns, m.omitColumns)
 	}

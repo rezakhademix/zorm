@@ -1016,6 +1016,7 @@ func rebind(query string) string {
 			sb.WriteByte(c)
 		}
 	}
+	
 	// Clone the string to ensure it's independent of the builder's buffer.
 	// While strings.Builder.Reset() nils the buffer (making reuse safe in practice),
 	// explicitly cloning provides defense-in-depth against implementation changes.
