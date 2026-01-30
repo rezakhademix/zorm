@@ -61,31 +61,37 @@ func writePlaceholdersWithSeparator(sb *strings.Builder, n int, sep string) {
 var snakeCaseCache = newSnakeCaseCache(1000)
 
 // snakeCaseCacheType is a bounded LRU cache for snake_case conversions.
+// Uses sync.Mutex (not RWMutex) because Load() updates LRU order.
 type snakeCaseCacheType struct {
-	mu       sync.RWMutex
-	items    map[string]string
+	mu       sync.Mutex
+	items    map[string]*snakeCacheEntry
 	lruList  *list.List
 	capacity int
 }
 
 type snakeCacheEntry struct {
-	key   string
-	value string
+	key     string
+	value   string
+	element *list.Element // Reference to list element for O(1) MoveToFront
 }
 
 func newSnakeCaseCache(capacity int) *snakeCaseCacheType {
 	return &snakeCaseCacheType{
-		items:    make(map[string]string),
+		items:    make(map[string]*snakeCacheEntry),
 		lruList:  list.New(),
 		capacity: capacity,
 	}
 }
 
 func (c *snakeCaseCacheType) Load(key string) (string, bool) {
-	c.mu.RLock()
-	val, ok := c.items[key]
-	c.mu.RUnlock()
-	return val, ok
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, ok := c.items[key]; ok {
+		c.lruList.MoveToFront(entry.element) // Update LRU order
+		return entry.value, true
+	}
+	return "", false
 }
 
 func (c *snakeCaseCacheType) Store(key, value string) {
@@ -99,14 +105,15 @@ func (c *snakeCaseCacheType) Store(key, value string) {
 	// Evict if at capacity
 	if len(c.items) >= c.capacity {
 		if back := c.lruList.Back(); back != nil {
-			entry := back.Value.(*snakeCacheEntry)
-			delete(c.items, entry.key)
+			oldEntry := back.Value.(*snakeCacheEntry)
+			delete(c.items, oldEntry.key)
 			c.lruList.Remove(back)
 		}
 	}
 
-	c.lruList.PushFront(&snakeCacheEntry{key: key, value: value})
-	c.items[key] = value
+	entry := &snakeCacheEntry{key: key, value: value}
+	entry.element = c.lruList.PushFront(entry)
+	c.items[key] = entry
 }
 
 // ErrInvalidColumnName is returned when a column name contains invalid characters.

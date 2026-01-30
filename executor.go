@@ -648,14 +648,15 @@ type columnCache struct {
 
 type columnCacheShard struct {
 	mu       sync.Mutex
-	items    map[string][]*FieldInfo
+	items    map[string]*columnCacheEntry
 	lruList  *list.List
 	capacity int
 }
 
 type columnCacheEntry struct {
-	key   string
-	value []*FieldInfo
+	key     string
+	value   []*FieldInfo
+	element *list.Element // Reference to list element for O(1) MoveToFront
 }
 
 func newColumnCache(capacity int) *columnCache {
@@ -667,7 +668,7 @@ func newColumnCache(capacity int) *columnCache {
 	c := &columnCache{capacity: capacity}
 	for i := 0; i < 64; i++ {
 		c.shards[i] = &columnCacheShard{
-			items:    make(map[string][]*FieldInfo),
+			items:    make(map[string]*columnCacheEntry),
 			lruList:  list.New(),
 			capacity: shardCapacity,
 		}
@@ -686,8 +687,9 @@ func (c *columnCache) Load(key string) ([]*FieldInfo, bool) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if val, ok := shard.items[key]; ok {
-		return val, true
+	if entry, ok := shard.items[key]; ok {
+		shard.lruList.MoveToFront(entry.element) // Update LRU order
+		return entry.value, true
 	}
 	return nil, false
 }
@@ -710,8 +712,9 @@ func (c *columnCache) Store(key string, value []*FieldInfo) {
 		}
 	}
 
-	shard.lruList.PushFront(&columnCacheEntry{key: key, value: value})
-	shard.items[key] = value
+	entry := &columnCacheEntry{key: key, value: value}
+	entry.element = shard.lruList.PushFront(entry)
+	shard.items[key] = entry
 }
 
 // mapColumns maps database columns to struct field info.
