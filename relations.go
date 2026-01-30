@@ -19,15 +19,33 @@ func anyToKeyString(v any) string {
 		return strconv.Itoa(x)
 	case int32:
 		return strconv.FormatInt(int64(x), 10)
+	case int16:
+		return strconv.FormatInt(int64(x), 10)
+	case int8:
+		return strconv.FormatInt(int64(x), 10)
 	case uint64:
 		return strconv.FormatUint(x, 10)
 	case uint:
 		return strconv.FormatUint(uint64(x), 10)
 	case uint32:
 		return strconv.FormatUint(uint64(x), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(x), 10)
 	case string:
 		return x
+	case []byte:
+		// Common for UUIDs stored as binary
+		return string(x)
+	case [16]byte:
+		// UUID as fixed-size array (common representation)
+		return string(x[:])
 	default:
+		// Check for fmt.Stringer interface (covers uuid.UUID and similar types)
+		if s, ok := v.(fmt.Stringer); ok {
+			return s.String()
+		}
 		return fmt.Sprintf("%v", v)
 	}
 }

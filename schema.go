@@ -134,11 +134,33 @@ var dangerousKeywordsList = []string{
 	"xp_", "sp_", "0x",
 }
 
+// columnValidationCache caches validation results for column names.
+// Uses sync.Map for thread-safe access with good read performance.
+// Value is true for valid columns (no error), false otherwise.
+var columnValidationCache sync.Map
+
 // ValidateColumnName checks if a column name is safe to use in SQL queries.
 // It uses a strict whitelist approach to prevent SQL injection.
 // Allowed characters: alphanumeric, underscore, dot, asterisk, space, parens, comma.
 // Dangerous characters like quotes, semicolons, and comments are rejected.
+// Results are cached to avoid repeated validation of the same column names.
 func ValidateColumnName(name string) error {
+	// Check cache first
+	if valid, ok := columnValidationCache.Load(name); ok {
+		if valid.(bool) {
+			return nil
+		}
+		return fmt.Errorf("%w: '%s'", ErrInvalidColumnName, name)
+	}
+
+	err := validateColumnNameUncached(name)
+	// Cache the result (true = valid, false = invalid)
+	columnValidationCache.Store(name, err == nil)
+	return err
+}
+
+// validateColumnNameUncached performs the actual validation without caching.
+func validateColumnNameUncached(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty column name", ErrInvalidColumnName)
 	}

@@ -726,8 +726,19 @@ func (c *columnCache) Store(key string, value []*FieldInfo) {
 // Uses caching to avoid repeated lookups for the same column set.
 func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
 	// Build cache key using type name (not table name) to avoid collisions
-	// when different Go types map to the same database table
-	key := m.modelInfo.Type.String() + ":" + strings.Join(columns, ",")
+	// when different Go types map to the same database table.
+	// Use strings.Builder for efficient key construction.
+	sb := GetStringBuilder()
+	sb.WriteString(m.modelInfo.Type.String())
+	sb.WriteByte(':')
+	for i, col := range columns {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(col)
+	}
+	key := sb.String()
+	PutStringBuilder(sb)
 
 	// Check cache first
 	if cached, ok := columnMappingCache.Load(key); ok {
