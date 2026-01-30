@@ -24,6 +24,14 @@ ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern
 - **Lifecycle Hooks**: BeforeCreate, BeforeUpdate, AfterUpdate hooks
 - **Accessors**: Computed attributes via getter methods
 
+  
+## AI-Assisted Development
+
+This project was developed with the help of AI tools, using **Claude Code**. While AI contributed to code suggestions and ideas, **all AI-generated code was reviewed by humans**, and nothing was automatically approved.
+
+This repository is **not entirely AI-written** or **vibe coded**; it reflects modern programming practices enhanced by AI assistance. AI was used as a tool to accelerate development, not replace human judgment and you can see **Claude Code** as a contributor
+
+
 ## Installation
 
 ```bash
