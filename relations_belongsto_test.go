@@ -1099,3 +1099,208 @@ func TestBelongsTo_UserBranch_DataIntegrity(t *testing.T) {
 		}
 	}
 }
+
+// ==================== Nullable FK Edge Cases ====================
+
+type BookNullableFK struct {
+	ID       int  `zorm:"primaryKey"`
+	Title    string
+	AuthorID *int
+	Author   *AuthorInt
+}
+
+func (b BookNullableFK) TableName() string {
+	return "books_nullable_fk"
+}
+
+func (b BookNullableFK) AuthorRelation() BelongsTo[AuthorInt] {
+	return BelongsTo[AuthorInt]{
+		ForeignKey: "author_id",
+	}
+}
+
+func setupBelongsToNullableFKDB(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE authors_int (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE books_nullable_fk (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			title TEXT NOT NULL,
+			author_id INTEGER
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to create tables: %v", err)
+	}
+
+	_, err = db.Exec(`
+		INSERT INTO authors_int (id, name) VALUES (1, 'George Orwell');
+		INSERT INTO books_nullable_fk (id, title, author_id) VALUES
+			(1, '1984', 1),
+			(2, 'Unknown Author Book', NULL),
+			(3, 'Zero Author Book', 0);
+	`)
+	if err != nil {
+		t.Fatalf("failed to insert data: %v", err)
+	}
+
+	return db
+}
+
+func TestBelongsTo_NilForeignKey(t *testing.T) {
+	db := setupBelongsToNullableFKDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	books, err := New[BookNullableFK]().With("Author").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get books: %v", err)
+	}
+
+	if len(books) != 3 {
+		t.Fatalf("expected 3 books, got %d", len(books))
+	}
+
+	// Book with valid author
+	book1984 := books[0]
+	if book1984.Title != "1984" {
+		t.Errorf("expected '1984', got %q", book1984.Title)
+	}
+	if book1984.Author == nil {
+		t.Error("expected '1984' to have author loaded")
+	} else if book1984.Author.Name != "George Orwell" {
+		t.Errorf("expected 'George Orwell', got %q", book1984.Author.Name)
+	}
+
+	// Book with NULL author_id - should have nil Author
+	unknownBook := books[1]
+	if unknownBook.Title != "Unknown Author Book" {
+		t.Errorf("expected 'Unknown Author Book', got %q", unknownBook.Title)
+	}
+	if unknownBook.AuthorID != nil {
+		t.Errorf("expected nil AuthorID, got %v", unknownBook.AuthorID)
+	}
+	if unknownBook.Author != nil {
+		t.Errorf("expected nil Author for NULL FK, got %+v", unknownBook.Author)
+	}
+}
+
+func TestBelongsTo_ZeroValueForeignKey(t *testing.T) {
+	db := setupBelongsToNullableFKDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	books, err := New[BookNullableFK]().With("Author").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get books: %v", err)
+	}
+
+	// Find the book with author_id = 0
+	var zeroBook *BookNullableFK
+	for _, b := range books {
+		if b.Title == "Zero Author Book" {
+			zeroBook = b
+			break
+		}
+	}
+
+	if zeroBook == nil {
+		t.Fatal("Zero Author Book not found")
+	}
+
+	// The FK value is 0, which is a zero value
+	// isZero should return true for 0, so author should not be loaded
+	if zeroBook.Author != nil {
+		t.Errorf("expected nil Author for zero FK value, got %+v", zeroBook.Author)
+	}
+}
+
+func TestBelongsTo_NullableFK_LoadSlice(t *testing.T) {
+	db := setupBelongsToNullableFKDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	books, err := New[BookNullableFK]().Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get books: %v", err)
+	}
+
+	// Load authors
+	err = New[BookNullableFK]().LoadSlice(ctx, books, "Author")
+	if err != nil {
+		t.Fatalf("LoadSlice failed: %v", err)
+	}
+
+	// Verify only the book with valid FK has author loaded
+	for _, b := range books {
+		if b.Title == "1984" {
+			if b.Author == nil {
+				t.Error("expected '1984' to have author after LoadSlice")
+			}
+		} else {
+			if b.Author != nil {
+				t.Errorf("book %q should not have author loaded, got %+v", b.Title, b.Author)
+			}
+		}
+	}
+}
+
+func TestBelongsTo_AllNullFKs(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE authors_int (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE books_nullable_fk (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER);
+
+		INSERT INTO books_nullable_fk (id, title, author_id) VALUES
+			(1, 'Book A', NULL),
+			(2, 'Book B', NULL);
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	books, err := New[BookNullableFK]().With("Author").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get books: %v", err)
+	}
+
+	if len(books) != 2 {
+		t.Fatalf("expected 2 books, got %d", len(books))
+	}
+
+	// All books have NULL FKs, so no authors should be loaded
+	for _, b := range books {
+		if b.Author != nil {
+			t.Errorf("book %q: expected nil Author, got %+v", b.Title, b.Author)
+		}
+	}
+}
