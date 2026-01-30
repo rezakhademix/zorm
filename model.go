@@ -14,11 +14,35 @@ import (
 // Key is the reflect.Type of the model struct.
 var modelPools sync.Map
 
+// globalDB is the atomic pointer to the global database connection pool.
+// Use GetGlobalDB() and SetGlobalDB() for thread-safe access.
+var globalDB atomic.Pointer[sql.DB]
+
 // GlobalDB is the global database connection pool.
-// In a real app, this might be managed differently, but for this ORM style,
-// we often have a global or a passed-in DB.
-// For now, we'll allow setting it globally or per-instance.
+// For thread-safe access in concurrent code, prefer SetGlobalDB() for writes.
+// Reads via GetGlobalDB() will check both this variable and the atomic pointer
+// for backwards compatibility with code that directly assigns to GlobalDB.
 var GlobalDB *sql.DB
+
+// GetGlobalDB returns the global database connection in a thread-safe manner.
+// For backwards compatibility, it checks both the atomic pointer and the
+// deprecated GlobalDB variable, preferring the atomic if set.
+func GetGlobalDB() *sql.DB {
+	// First check atomic pointer (thread-safe path)
+	if db := globalDB.Load(); db != nil {
+		return db
+	}
+	// Fall back to deprecated variable for backwards compatibility
+	// This allows existing code that does "GlobalDB = db" to keep working
+	return GlobalDB
+}
+
+// SetGlobalDB sets the global database connection in a thread-safe manner.
+// This also updates the GlobalDB variable for backwards compatibility.
+func SetGlobalDB(db *sql.DB) {
+	globalDB.Store(db)
+	GlobalDB = db // Keep in sync for backwards compatibility
+}
 
 // globalResolver is the atomic pointer to the database resolver for primary/replica setup.
 // Using atomic.Pointer ensures thread-safe read/write access.
@@ -38,7 +62,15 @@ func GetGlobalResolver() *DBResolver {
 // The Model also tracks the execution context, database handle or transaction,
 // and metadata derived from T that is used for mapping database rows into
 // entities.
+//
+// Thread Safety: Model instances are NOT safe for concurrent modification.
+// Use Clone() to create independent copies for concurrent use, or create
+// new Model instances per goroutine. The mu field provides protection for
+// Clone() operations to safely read state while another goroutine may be
+// calling Clone() on the same model.
 type Model[T any] struct {
+	mu sync.RWMutex // Protects query state for Clone() operations
+
 	ctx       context.Context
 	db        *sql.DB
 	tx        *sql.Tx
@@ -95,7 +127,7 @@ type CTE struct {
 func New[T any]() *Model[T] {
 	return &Model[T]{
 		ctx:               context.Background(),
-		db:                GlobalDB,
+		db:                GetGlobalDB(),
 		modelInfo:         ParseModel[T](),
 		relationCallbacks: make(map[string]any),
 		morphRelations:    make(map[string]map[string][]string),
@@ -149,7 +181,7 @@ func Acquire[T any]() *Model[T] {
 	modelInfo := m.modelInfo
 	m.reset()
 	m.ctx = context.Background()
-	m.db = GlobalDB
+	m.db = GetGlobalDB()
 	m.modelInfo = modelInfo
 	m.forceReplica = -1
 	return m
@@ -163,15 +195,37 @@ func (m *Model[T]) Release() {
 	pool.Put(m)
 }
 
+// maxPooledSliceCap is the maximum capacity for slices retained in pooled models.
+// Slices larger than this will be replaced to prevent memory bloat.
+const maxPooledSliceCap = 64
+
 // reset clears all query state from the model for reuse.
+// It carefully balances memory reuse (keeping small allocations) with
+// preventing memory bloat (replacing overly large allocations).
 func (m *Model[T]) reset() {
 	m.ctx = nil
 	m.db = nil
 	m.tx = nil
 	m.tableName = ""
-	m.columns = m.columns[:0]
-	m.wheres = m.wheres[:0]
-	m.args = m.args[:0]
+
+	// Reuse slices if they have reasonable capacity, otherwise replace
+	// This prevents memory bloat from queries with many conditions
+	if cap(m.columns) <= maxPooledSliceCap {
+		m.columns = m.columns[:0]
+	} else {
+		m.columns = nil
+	}
+	if cap(m.wheres) <= maxPooledSliceCap {
+		m.wheres = m.wheres[:0]
+	} else {
+		m.wheres = nil
+	}
+	if cap(m.args) <= maxPooledSliceCap {
+		m.args = m.args[:0]
+	} else {
+		m.args = nil
+	}
+
 	m.orderBys = nil
 	m.groupBys = nil
 	m.havings = nil
@@ -188,9 +242,19 @@ func (m *Model[T]) reset() {
 	m.ctes = nil
 	m.stmtCache = nil
 
-	// Recreate maps instead of deleting keys (faster for pooling)
-	m.relationCallbacks = make(map[string]any)
-	m.morphRelations = make(map[string]map[string][]string)
+	// Clear maps by deleting keys to reuse capacity, or recreate if too large
+	// This provides better pooling efficiency than always recreating
+	if m.relationCallbacks != nil && len(m.relationCallbacks) <= maxPooledSliceCap {
+		clear(m.relationCallbacks)
+	} else {
+		m.relationCallbacks = make(map[string]any)
+	}
+	if m.morphRelations != nil && len(m.morphRelations) <= maxPooledSliceCap {
+		clear(m.morphRelations)
+	} else {
+		m.morphRelations = make(map[string]map[string][]string)
+	}
+
 	m.omitColumns = nil
 	m.trackingScope = nil
 }
@@ -198,27 +262,27 @@ func (m *Model[T]) reset() {
 // Clone creates a deep copy of the Model.
 // This is useful for creating new queries based on an existing one without modifying it.
 //
-// IMPORTANT: Clone is NOT safe for concurrent use. Do not call Clone() on a Model
-// instance that is being modified concurrently by another goroutine. This will
-// cause data races. Each goroutine should create its own Model instance.
+// Thread Safety: Clone() acquires a read lock to safely copy state. Multiple goroutines
+// can call Clone() concurrently on the same model. However, calling Clone() while another
+// goroutine is modifying the model (via Where, Select, etc.) requires the modification
+// methods to also acquire locks, which they do not for performance reasons.
 //
-// Safe usage:
+// Recommended usage patterns:
 //
-//	base := New[User]().Where("active", true)
-//	// Each request handler gets its own clone
+//	// Pattern 1: Create base query once, then clone for each request
+//	base := New[User]().Where("active", true)  // Setup phase, single goroutine
+//	// ... later, in request handlers (multiple goroutines)
 //	handler1 := base.Clone().Where("age >", 18).Get(ctx)
 //	handler2 := base.Clone().Where("verified", true).Get(ctx)
 //
-// Unsafe usage (will cause race):
-//
-//	base := New[User]().Where("active", true)
+//	// Pattern 2: Create new model per goroutine
 //	go func() {
-//	    q1 := base.Clone().Get(ctx1) // RACE if base is being modified
-//	}()
-//	go func() {
-//	    base.Where("new_condition", true) // Modifies base while Clone() reads
+//	    m := New[User]().Where("active", true).Get(ctx)
 //	}()
 func (m *Model[T]) Clone() *Model[T] {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	newModel := &Model[T]{
 		ctx:          m.ctx,
 		db:           m.db,

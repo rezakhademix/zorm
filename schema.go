@@ -248,10 +248,10 @@ func (m *ModelInfo) GetRelationField(structVal reflect.Value, fieldName string) 
 	return structVal.FieldByName(fieldName)
 }
 
-var (
-	modelCache = make(map[reflect.Type]*ModelInfo)
-	cacheMu    sync.RWMutex
-)
+// modelCache stores parsed ModelInfo for each type.
+// Uses sync.Map for optimal read-heavy workloads with infrequent writes,
+// which matches the ORM's usage pattern (parse once, read many times).
+var modelCache sync.Map
 
 // ParseModel inspects the struct T and returns its metadata.
 func ParseModel[T any]() *ModelInfo {
@@ -261,6 +261,7 @@ func ParseModel[T any]() *ModelInfo {
 }
 
 // ParseModelType inspects the type and returns its metadata.
+// Uses sync.Map for thread-safe caching with optimal read performance.
 func ParseModelType(typ reflect.Type) *ModelInfo {
 	// Handle pointer types
 	if typ.Kind() == reflect.Pointer {
@@ -272,21 +273,14 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		panic("ZORM: Model generic type T must be a struct")
 	}
 
-	cacheMu.RLock()
-	if info, ok := modelCache[typ]; ok {
-		cacheMu.RUnlock()
-		return info
-	}
-	cacheMu.RUnlock()
-
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-
-	// Double check locking
-	if info, ok := modelCache[typ]; ok {
-		return info
+	// Fast path: check if already cached
+	if cached, ok := modelCache.Load(typ); ok {
+		return cached.(*ModelInfo)
 	}
 
+	// Slow path: parse the model
+	// Note: Multiple goroutines may parse the same type concurrently on first access.
+	// This is acceptable as parsing is idempotent and LoadOrStore ensures only one wins.
 	info := &ModelInfo{
 		Type:            typ,
 		Fields:          make(map[string]*FieldInfo),
@@ -337,8 +331,9 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		}
 	}
 
-	modelCache[typ] = info
-	return info
+	// Store in cache; if another goroutine stored first, use their value
+	actual, _ := modelCache.LoadOrStore(typ, info)
+	return actual.(*ModelInfo)
 }
 
 func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {

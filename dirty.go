@@ -348,11 +348,12 @@ func (s *TrackingScope) Len() int {
 }
 
 // globalTracker is the default tracker used for dirty tracking.
-// By default, it tracks up to 10,000 entities. Use ConfigureDirtyTracking to change capacity.
+// By default, it tracks up to 50,000 entities. Use ConfigureDirtyTracking to change capacity.
+// The higher default reduces the chance of evicting actively-used entities.
 var globalTracker atomic.Pointer[lruTracker]
 
 func init() {
-	globalTracker.Store(newLRUTracker(10000))
+	globalTracker.Store(newLRUTracker(50000))
 }
 
 // Memory management considerations for dirty tracking:
@@ -467,11 +468,15 @@ func GetOriginals[T any](entity *T) map[string]any {
 // isDirty checks if a specific field has changed from its original value.
 // Returns true if the field was modified, or if the entity is not tracked (new entity).
 // Returns false if the field is unchanged or if the entity/column is nil/invalid.
+//
+// Note: This function touches the LRU entry to prevent actively-used entities
+// from being evicted during modification-then-update cycles.
 func isDirty[T any](entity *T, column string, modelInfo *ModelInfo) bool {
 	if entity == nil {
 		return false
 	}
 
+	// Load also touches the LRU entry, preventing eviction of actively-used entities
 	orig, ok := globalTracker.Load().Load(getEntityKey(entity))
 	if !ok {
 		return true // Not tracked = treat as dirty (new entity)

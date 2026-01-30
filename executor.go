@@ -39,7 +39,7 @@ func (m *Model[T]) queryer() interface {
 	if m.db != nil {
 		return m.db
 	}
-	return GlobalDB
+	return GetGlobalDB()
 }
 
 // resolveDB determines which database connection to use based on resolver configuration.
@@ -84,7 +84,7 @@ func (m *Model[T]) queryerForWrite() interface {
 	if m.db != nil {
 		return m.db
 	}
-	return GlobalDB
+	return GetGlobalDB()
 }
 
 // prepareStmtWithQueryer is the internal implementation for statement preparation.
@@ -479,10 +479,14 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
 // Column names are validated to prevent SQL injection.
+// This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64, error) {
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
 	}
+
+	// Clone to avoid mutating shared state (thread-safe, consistent with Count/Sum/Avg)
+	q := m.Clone()
 
 	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
 	var sb strings.Builder
@@ -491,12 +495,12 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64,
 	sb.WriteString(", COUNT(*) OVER (PARTITION BY ")
 	sb.WriteString(column)
 	sb.WriteString(") as count FROM ")
-	sb.WriteString(m.TableName())
+	sb.WriteString(q.TableName())
 
 	// Add WHERE clause
-	m.buildWhereClause(&sb)
+	q.buildWhereClause(&sb)
 
-	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), m.args...)
+	rows, err := q.queryer().QueryContext(ctx, rebind(sb.String()), q.args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1010,6 +1014,16 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 }
 
 // Create inserts a new record.
+//
+// Hook Behavior: If the entity implements BeforeCreate(context.Context) error,
+// it will be called before the INSERT. If BeforeCreate succeeds but INSERT fails,
+// any side effects from BeforeCreate are NOT rolled back automatically.
+//
+// For atomic operations with hooks that have side effects, wrap in a transaction:
+//
+//	err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
+//	    return model.WithTx(tx).Create(ctx, entity)
+//	})
 func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Validate input
 	if entity == nil {
@@ -1017,6 +1031,8 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	}
 
 	// 1. BeforeCreate Hook
+	// Note: If this succeeds but INSERT fails, hook side effects are not rolled back.
+	// Use transactions for atomic operations with hooks that have side effects.
 	if hook, ok := any(entity).(interface{ BeforeCreate(context.Context) error }); ok {
 		if err := hook.BeforeCreate(ctx); err != nil {
 			return err
@@ -1094,6 +1110,18 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 // Update updates a single record based on its primary key.
 // The entity must not be nil and must have a valid primary key value.
+//
+// Hook Behavior:
+//   - BeforeUpdate: Called before UPDATE. If it succeeds but UPDATE fails,
+//     side effects are NOT rolled back.
+//   - AfterUpdate: Called after successful UPDATE. If it fails, the UPDATE
+//     is already committed and will NOT be rolled back.
+//
+// For atomic operations with hooks that have side effects, wrap in a transaction:
+//
+//	err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
+//	    return model.WithTx(tx).Update(ctx, entity)
+//	})
 func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// Validate input
 	if entity == nil {
@@ -1110,7 +1138,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		}
 	}
 
-	// Hooks
+	// Hooks - Note: If BeforeUpdate succeeds but UPDATE fails, hook side effects
+	// are not rolled back. Use transactions for atomic operations.
 	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
 		if err := hook.BeforeUpdate(ctx); err != nil {
 			return err
@@ -1408,7 +1437,7 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	if m.tx == nil {
 		db := m.db
 		if db == nil {
-			db = GlobalDB
+			db = GetGlobalDB()
 		}
 		if db == nil {
 			return ErrNilDatabase
@@ -1625,7 +1654,7 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 	// Get database connection for preparing
 	db := m.db
 	if db == nil {
-		db = GlobalDB
+		db = GetGlobalDB()
 	}
 	if db == nil {
 		return ErrNilDatabase
@@ -1707,16 +1736,18 @@ func (m *Model[T]) loadAccessors(results []*T) {
 
 	typ := reflect.TypeOf(results[0])
 
+	// Pre-cache method info and key reflect.Values to avoid allocations in the hot loop
 	type methodCache struct {
-		method reflect.Method
-		key    string
+		method   reflect.Method
+		keyValue reflect.Value // Pre-computed reflect.Value for the key string
 	}
 	methods := make([]methodCache, len(accessorIndices))
 	for i, idx := range accessorIndices {
 		method := typ.Method(idx)
+		key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))
 		methods[i] = methodCache{
-			method: method,
-			key:    ToSnakeCase(strings.TrimPrefix(method.Name, "Get")),
+			method:   method,
+			keyValue: reflect.ValueOf(key), // Cache the reflect.Value once
 		}
 	}
 
@@ -1736,7 +1767,8 @@ func (m *Model[T]) loadAccessors(results []*T) {
 		for _, mc := range methods {
 			// Call method using cached method and reused args slice
 			ret := mc.method.Func.Call(callArgs)
-			attrField.SetMapIndex(reflect.ValueOf(mc.key), ret[0])
+			// Use pre-cached key reflect.Value to avoid allocation per iteration
+			attrField.SetMapIndex(mc.keyValue, ret[0])
 		}
 	}
 }
@@ -1769,10 +1801,12 @@ func (m *Model[T]) loadAccessorsSingle(entity *T) {
 	typ := resVal.Type()
 	callArgs := []reflect.Value{resVal}
 
+	// Pre-cache key reflect.Values to avoid allocations in the loop
 	for _, idx := range accessorIndices {
 		method := typ.Method(idx)
 		key := ToSnakeCase(strings.TrimPrefix(method.Name, "Get"))
+		keyValue := reflect.ValueOf(key) // Cache outside hot path
 		ret := method.Func.Call(callArgs)
-		attrField.SetMapIndex(reflect.ValueOf(key), ret[0])
+		attrField.SetMapIndex(keyValue, ret[0])
 	}
 }

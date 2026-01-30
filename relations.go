@@ -221,25 +221,37 @@ func (r MorphOne[T]) GetOverrideTable() string  { return r.Table }
 func (r MorphMany[T]) GetOverrideTable() string { return r.Table }
 
 // Load eager loads relations on a single entity.
+// This method creates an internal clone to avoid mutating the original model's state,
+// making it safe to reuse the model for subsequent queries.
 func (m *Model[T]) Load(ctx context.Context, entity *T, relations ...string) error {
-	m.relations = append(m.relations, relations...)
-	return m.loadRelations(ctx, []*T{entity})
+	// Clone to avoid mutating shared state
+	q := m.Clone()
+	q.relations = append(q.relations, relations...)
+	return q.loadRelations(ctx, []*T{entity})
 }
 
 // LoadSlice eager loads relations on a slice of entities.
+// This method creates an internal clone to avoid mutating the original model's state,
+// making it safe to reuse the model for subsequent queries.
 func (m *Model[T]) LoadSlice(ctx context.Context, entities []*T, relations ...string) error {
-	m.relations = append(m.relations, relations...)
-	return m.loadRelations(ctx, entities)
+	// Clone to avoid mutating shared state
+	q := m.Clone()
+	q.relations = append(q.relations, relations...)
+	return q.loadRelations(ctx, entities)
 }
 
 // LoadMorph eager loads a polymorphic relation with constraints on a slice.
+// This method creates an internal clone to avoid mutating the original model's state,
+// making it safe to reuse the model for subsequent queries.
 func (m *Model[T]) LoadMorph(ctx context.Context, entities []*T, relation string, typeMap map[string][]string) error {
-	if m.morphRelations == nil {
-		m.morphRelations = make(map[string]map[string][]string)
+	// Clone to avoid mutating shared state
+	q := m.Clone()
+	if q.morphRelations == nil {
+		q.morphRelations = make(map[string]map[string][]string)
 	}
-	m.relations = append(m.relations, relation)
-	m.morphRelations[relation] = typeMap
-	return m.loadRelations(ctx, entities)
+	q.relations = append(q.relations, relation)
+	q.morphRelations[relation] = typeMap
+	return q.loadRelations(ctx, entities)
 }
 
 // loadRelations processes the With() clauses and loads data.

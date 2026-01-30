@@ -1016,9 +1016,8 @@ func rebind(query string) string {
 			sb.WriteByte(c)
 		}
 	}
-	// sb.String() returns a string referencing the builder's buffer, but since
-	// Reset() only nils the slice header (doesn't free the underlying array),
-	// and the next user of this builder will allocate a fresh buffer, the
-	// returned string remains valid. No Clone needed.
-	return sb.String()
+	// Clone the string to ensure it's independent of the builder's buffer.
+	// While strings.Builder.Reset() nils the buffer (making reuse safe in practice),
+	// explicitly cloning provides defense-in-depth against implementation changes.
+	return strings.Clone(sb.String())
 }

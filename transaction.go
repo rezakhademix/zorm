@@ -18,12 +18,13 @@ var ErrRollbackFailed = errors.New("zorm: rollback failed")
 
 // Transaction executes a function within a transaction.
 func Transaction(ctx context.Context, fn func(tx *Tx) error) error {
-	// Use GlobalDB
-	if GlobalDB == nil {
+	// Use global database connection (thread-safe access)
+	db := GetGlobalDB()
+	if db == nil {
 		return sql.ErrConnDone
 	}
 
-	return transaction(ctx, GlobalDB, fn)
+	return transaction(ctx, db, fn)
 }
 
 // Transaction executes a function within a transaction using the model's database connection.
