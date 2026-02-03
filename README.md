@@ -289,6 +289,46 @@ for _, email := range emails {
 }
 ```
 
+### Scalar Queries (Type-Safe Single Column)
+
+`ScalarQuery[T]` provides a type-safe query builder for fetching single-column scalar values. Unlike `Model[T]` which returns full struct records, `ScalarQuery` returns simple typed values like `[]string`, `[]int64`, `[]float64`, etc.
+
+```go
+// Example 1: Get all usernames from users table
+names, err := zorm.Query[string]().
+    Table("users").
+    Select("name").
+    Where("active", true).
+    Get(ctx)
+// names is []string{"Alice", "Bob", "Charlie"}
+
+// Example 2: Get user IDs ordered by creation date
+ids, err := zorm.Query[int64]().
+    Table("users").
+    Select("id").
+    OrderBy("created_at", "DESC").
+    Limit(100).
+    Get(ctx)
+// ids is []int64{42, 41, 40, ...}
+
+// Example 3: Get distinct roles with count filtering
+roles, err := zorm.Query[string]().
+    Table("users").
+    Select("role").
+    Distinct().
+    GroupBy("role").
+    Having("COUNT(*) >", 5).
+    Get(ctx)
+// roles is []string{"admin", "editor"} (roles with more than 5 users)
+```
+
+`ScalarQuery` supports the same query builder methods as `Model`:
+- `Where`, `OrWhere`, `WhereIn`, `WhereNull`, `WhereNotNull`
+- `OrderBy`, `Limit`, `Offset`
+- `Distinct`, `GroupBy`, `Having`
+- `First` (returns single value), `Count` (returns row count)
+- `SetDB`, `WithTx`, `Clone`, `Print`
+
 ### Cursor (Memory-Efficient Iteration)
 
 For large datasets, use `Cursor` to iterate row by row without loading everything into memory:
