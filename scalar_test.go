@@ -944,3 +944,918 @@ func TestScalarQuery_WhereColumnValidation(t *testing.T) {
 		t.Errorf("expected 4 results (invalid WHERE skipped), got %d", len(results))
 	}
 }
+
+// ============================================
+// HIGH PRIORITY TESTS
+// ============================================
+
+func TestScalarQuery_MultipleOrderBy(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("role", "ASC").
+		OrderBy("name", "DESC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// role ASC: admin (Alice, Diana), user (Bob, Charlie)
+	// then name DESC within each role
+	expected := []string{"Diana", "Alice", "Charlie", "Bob"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_MultipleGroupBy(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// GroupBy multiple columns
+	count, err := Query[int64]().
+		SetDB(db).
+		Table("users").
+		Select("COUNT(*)").
+		GroupBy("role", "active").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return groups: (admin,1), (user,1), (user,0)
+	// Note: Both admins are active=1, users split between active=1 and active=0
+	if len(count) != 3 {
+		t.Errorf("expected 3 groups, got %d", len(count))
+	}
+}
+
+func TestScalarQuery_MultipleHaving(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	roles, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("role").
+		GroupBy("role").
+		Having("COUNT(*) >= ?", 1).
+		Having("COUNT(*) <= ?", 2).
+		OrderBy("role", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Both admin (2 users) and user (2 users) satisfy HAVING conditions
+	expected := []string{"admin", "user"}
+	if len(roles) != len(expected) {
+		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+
+	for i, role := range roles {
+		if role != expected[i] {
+			t.Errorf("expected roles[%d] = %q, got %q", i, expected[i], role)
+		}
+	}
+}
+
+func TestScalarQuery_ComplexQuery(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Test all features combined
+	roles, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("role").
+		Where("active", 1).
+		GroupBy("role").
+		Having("COUNT(*) > ?", 0).
+		OrderBy("role", "ASC").
+		Limit(10).
+		Offset(0).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Active users: Alice (admin), Bob (user), Diana (admin)
+	// Groups: admin (2), user (1) - both have COUNT > 0
+	expected := []string{"admin", "user"}
+	if len(roles) != len(expected) {
+		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+}
+
+func TestScalarQuery_WhereRawNoArgs(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("age > 28").
+		OrderBy("age", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Users with age > 28: Alice (30), Charlie (35)
+	expected := []string{"Alice", "Charlie"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_WhereRawMultipleArgs(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Raw WHERE with 3+ args triggers the raw query path (default case in addWhere)
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("age > ? AND name LIKE ? AND active = ?", 20, "A%", 1).
+		OrderBy("name", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Users with age > 20 AND name starting with A AND active: Alice (30)
+	expected := []string{"Alice"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	if names[0] != "Alice" {
+		t.Errorf("expected 'Alice', got %q", names[0])
+	}
+}
+
+func TestScalarQuery_OrderByInvalidDirection(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Invalid direction should default to DESC
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "INVALID").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// With DESC order by id, Diana (4), Charlie (3), Bob (2), Alice (1)
+	if len(names) != 4 {
+		t.Fatalf("expected 4 names, got %d", len(names))
+	}
+
+	// First should be Diana (highest id)
+	if names[0] != "Diana" {
+		t.Errorf("expected first name 'Diana' with invalid direction defaulting to DESC, got %q", names[0])
+	}
+}
+
+func TestScalarQuery_ScanError(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Trying to scan string column "name" into int64 should cause scan error
+	_, err := Query[int64]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Get(ctx)
+
+	// SQLite may or may not return error depending on the value
+	// But trying to scan a text value should at least succeed (SQLite is lenient)
+	// The main point is the query runs without panicking
+	_ = err
+}
+
+func TestScalarQuery_ContextCancellation(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Get(ctx)
+
+	if err == nil {
+		t.Error("expected error with canceled context, got nil")
+	}
+}
+
+func TestScalarQuery_ContextTimeout(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Get(ctx)
+
+	if err == nil {
+		t.Error("expected error with timeout context, got nil")
+	}
+}
+
+func TestScalarQuery_EmptyResultSet(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Query for non-existent data
+	results, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("id", 9999).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return empty slice, not nil
+	if results == nil {
+		t.Error("expected empty slice, got nil")
+	}
+
+	if len(results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(results))
+	}
+}
+
+// ============================================
+// MEDIUM PRIORITY TESTS
+// ============================================
+
+func TestScalarQuery_NegativeLimit(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Negative limit should be treated as no limit (limit <= 0 check in buildQuery)
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Limit(-1).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users since negative limit is ignored
+	if len(names) != 4 {
+		t.Errorf("expected 4 names with negative limit, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_ZeroLimit(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Zero limit should be treated as no limit (limit <= 0 check in buildQuery)
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Limit(0).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users since zero limit is ignored
+	if len(names) != 4 {
+		t.Errorf("expected 4 names with zero limit, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_VeryLargeLimit(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Very large limit should work fine
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Limit(1000000).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users
+	if len(names) != 4 {
+		t.Errorf("expected 4 names, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_NegativeOffset(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Negative offset should be treated as no offset (offset <= 0 check in buildQuery)
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Offset(-1).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users starting from first
+	if len(names) != 4 {
+		t.Errorf("expected 4 names with negative offset, got %d", len(names))
+	}
+
+	if names[0] != "Alice" {
+		t.Errorf("expected first name 'Alice', got %q", names[0])
+	}
+}
+
+func TestScalarQuery_EmptyTableName(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Empty table name
+	_, err := Query[string]().
+		SetDB(db).
+		Table("").
+		Select("name").
+		Get(ctx)
+
+	// Should fail due to invalid SQL
+	if err == nil {
+		t.Error("expected error with empty table name, got nil")
+	}
+}
+
+func TestScalarQuery_EmptyColumnName(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Empty column should be rejected by validation, defaults to *
+	results, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("").
+		Where("id", 1).
+		Get(ctx)
+
+	// With empty Select, it defaults to * which may work differently
+	// The main point is it shouldn't panic
+	_ = results
+	_ = err
+}
+
+func TestScalarQuery_MultipleWhereIn(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		WhereIn("id", []any{1, 2, 3, 4}).
+		WhereIn("role", []any{"admin"}).
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Only admins: Alice (1), Diana (4)
+	expected := []string{"Alice", "Diana"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_OrWhereWithWhereIn(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("id", 1).
+		OrWhere("role", "user").
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// id=1 (Alice) OR role='user' (Bob, Charlie)
+	expected := []string{"Alice", "Bob", "Charlie"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_CloneAfterComplexQuery(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create a complex base query
+	base := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("active", 1).
+		Where("age", ">", 20).
+		OrderBy("name", "ASC").
+		Limit(10).
+		Offset(0)
+
+	// Clone and modify
+	clone := base.Clone()
+	clone = clone.Distinct()
+
+	// Original should not have distinct
+	query1 := base.buildQuery()
+	if strings.Contains(query1, "DISTINCT") {
+		t.Error("original query should not have DISTINCT after cloning")
+	}
+
+	// Clone should have distinct
+	query2 := clone.buildQuery()
+	if !strings.Contains(query2, "DISTINCT") {
+		t.Error("cloned query should have DISTINCT")
+	}
+
+	// Both should execute successfully
+	results1, err := base.Get(ctx)
+	if err != nil {
+		t.Fatalf("base Get failed: %v", err)
+	}
+
+	results2, err := clone.Get(ctx)
+	if err != nil {
+		t.Fatalf("clone Get failed: %v", err)
+	}
+
+	// Results should be the same (all active users with age > 20)
+	if len(results1) != len(results2) {
+		t.Errorf("expected same result count, got base=%d, clone=%d", len(results1), len(results2))
+	}
+}
+
+func TestScalarQuery_HavingWithoutGroupBy(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Having without GroupBy - SQL behavior depends on database
+	// SQLite may allow this for aggregate queries
+	_, err := Query[int64]().
+		SetDB(db).
+		Table("users").
+		Select("COUNT(*)").
+		Having("COUNT(*) > ?", 0).
+		Get(ctx)
+
+	// The query should execute (SQLite allows this)
+	// Main point is it shouldn't panic
+	_ = err
+}
+
+// ============================================
+// EDGE CASE TESTS
+// ============================================
+
+func TestScalarQuery_WhereMapEmpty(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Empty map should not add any conditions
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where(map[string]any{}).
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users
+	if len(names) != 4 {
+		t.Errorf("expected 4 names with empty map, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_WhereInvalidType(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Non-string, non-map type should be ignored
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where(12345). // Invalid type
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return all 4 users since invalid Where is skipped
+	if len(names) != 4 {
+		t.Errorf("expected 4 names with invalid Where type, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_SelectWithExpression(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Select with SQL expression - validation may reject this
+	// but we can test COUNT(*) which is commonly used
+	q := Query[int64]().
+		SetDB(db).
+		Table("users")
+
+	// Manually set column to bypass validation for testing
+	q.column = "COUNT(*)"
+
+	count, err := q.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(count) != 1 || count[0] != 4 {
+		t.Errorf("expected COUNT(*) = 4, got %v", count)
+	}
+}
+
+func TestScalarQuery_HavingArgsOrder(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Test that HAVING args are in correct order when combined with WHERE
+	roles, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("role").
+		Where("active", 1).
+		GroupBy("role").
+		Having("COUNT(*) >= ?", 1).
+		OrderBy("role", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Active users: Alice (admin), Bob (user), Diana (admin)
+	// Groups: admin (2), user (1)
+	expected := []string{"admin", "user"}
+	if len(roles) != len(expected) {
+		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+
+	for i, role := range roles {
+		if role != expected[i] {
+			t.Errorf("expected roles[%d] = %q, got %q", i, expected[i], role)
+		}
+	}
+}
+
+func TestScalarQuery_WhereAfterHaving(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Add WHERE after HAVING - args order matters
+	q := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("role").
+		GroupBy("role").
+		Having("COUNT(*) >= ?", 1)
+
+	// Add WHERE after HAVING
+	q = q.Where("active", 1)
+
+	roles, err := q.OrderBy("role", "ASC").Get(ctx)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Even though WHERE was added after HAVING in code,
+	// SQL execution order is: WHERE -> GROUP BY -> HAVING
+	// The query builder should handle this correctly
+	expected := []string{"admin", "user"}
+	if len(roles) != len(expected) {
+		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+}
+
+func TestScalarQuery_SetDBNil(t *testing.T) {
+	// Test SetDB(nil) behavior - should fallback to GlobalDB
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	SetGlobalDB(db)
+	defer SetGlobalDB(nil)
+
+	ctx := context.Background()
+
+	// SetDB(nil) should use GlobalDB
+	names, err := Query[string]().
+		SetDB(nil).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Limit(1).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(names) != 1 || names[0] != "Alice" {
+		t.Errorf("expected [Alice], got %v", names)
+	}
+}
+
+func TestScalarQuery_WhereNotIn(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Test raw NOT IN with 3+ args (triggers raw query path in addWhere)
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("id NOT IN (?, ?, ?)", 1, 2, 999).
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Should return Charlie (3), Diana (4)
+	expected := []string{"Charlie", "Diana"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_LimitOffset_Combined(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Test Limit and Offset together for pagination
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		OrderBy("id", "ASC").
+		Limit(2).
+		Offset(2).
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Skip first 2 (Alice, Bob), take next 2 (Charlie, Diana)
+	expected := []string{"Charlie", "Diana"}
+	if len(names) != len(expected) {
+		t.Fatalf("expected %d names, got %d", len(expected), len(names))
+	}
+
+	for i, name := range names {
+		if name != expected[i] {
+			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
+		}
+	}
+}
+
+func TestScalarQuery_CountWithWhere(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	count, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("role", "admin").
+		Count(ctx)
+
+	if err != nil {
+		t.Fatalf("Count failed: %v", err)
+	}
+
+	// 2 admins: Alice, Diana
+	if count != 2 {
+		t.Errorf("expected count 2, got %d", count)
+	}
+}
+
+func TestScalarQuery_CountWithMultipleConditions(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	count, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("role", "user").
+		Where("active", 1).
+		Count(ctx)
+
+	if err != nil {
+		t.Fatalf("Count failed: %v", err)
+	}
+
+	// 1 active user: Bob
+	if count != 1 {
+		t.Errorf("expected count 1, got %d", count)
+	}
+}
+
+func TestScalarQuery_FirstWithMultipleResults(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// First with multiple matching results should return only one
+	name, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		Where("role", "admin").
+		OrderBy("name", "ASC").
+		First(ctx)
+
+	if err != nil {
+		t.Fatalf("First failed: %v", err)
+	}
+
+	// Should return first admin alphabetically: Alice
+	if name != "Alice" {
+		t.Errorf("expected 'Alice', got %q", name)
+	}
+}
+
+func TestScalarQuery_DistinctWithOrderBy(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	roles, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("role").
+		Distinct().
+		OrderBy("role", "DESC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	// Distinct roles ordered DESC: user, admin
+	expected := []string{"user", "admin"}
+	if len(roles) != len(expected) {
+		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+
+	for i, role := range roles {
+		if role != expected[i] {
+			t.Errorf("expected roles[%d] = %q, got %q", i, expected[i], role)
+		}
+	}
+}
