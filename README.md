@@ -136,6 +136,15 @@ err = zorm.New[User]().
     Where("active", false).
     UpdateMany(ctx, map[string]any{"status": "inactive"})
 
+// UpdateManyByKey - Update multiple records by matching lookup column to map keys
+// Each map key is matched against the lookup column, and its value is set in the target column
+updates := map[string]string{
+    "REF001": "pending",
+    "REF002": "approved",
+    "REF003": "rejected",
+}
+err = zorm.New[Order]().UpdateManyByKey(ctx, "reference_number", "status", updates)
+
 // DeleteMany - Delete multiple records matching query
 err = zorm.New[User]().Where("status", "inactive").DeleteMany(ctx)
 ```
@@ -157,6 +166,47 @@ err := zorm.New[User]().CreateMany(ctx, largeDataset)
 // Automatically split into multiple INSERT statements within a transaction
 ```
 
+**UpdateManyByKey** - Efficient batch updates using CASE WHEN syntax:
+
+```go
+// Example 1: Update order statuses by reference number
+statusUpdates := map[string]string{
+    "ORD-001": "shipped",
+    "ORD-002": "delivered",
+    "ORD-003": "cancelled",
+}
+err := zorm.New[Order]().UpdateManyByKey(ctx, "reference_number", "status", statusUpdates)
+// Generates: UPDATE orders SET status = CASE reference_number
+//            WHEN 'ORD-001' THEN 'shipped' WHEN 'ORD-002' THEN 'delivered' ... END
+//            WHERE reference_number IN ('ORD-001', 'ORD-002', 'ORD-003')
+
+// Example 2: Update product quantities by product code (int keys, int values)
+quantityUpdates := map[int]int{
+    100: 50,   // product code 100 -> quantity 50
+    200: 75,   // product code 200 -> quantity 75
+    300: 100,  // product code 300 -> quantity 100
+}
+err = zorm.New[Product]().UpdateManyByKey(ctx, "code", "quantity", quantityUpdates)
+
+// Example 3: Combine with WHERE clause for conditional updates
+// Only update orders that are in 'pending' status
+statusUpdates := map[string]string{
+    "ORD-001": "processing",
+    "ORD-002": "processing",
+}
+err = zorm.New[Order]().
+    Where("status", "pending").
+    UpdateManyByKey(ctx, "reference_number", "status", statusUpdates)
+// Only updates if both: reference_number matches AND status = 'pending'
+```
+
+**UpdateManyByKey Features:**
+- Uses efficient CASE WHEN syntax (single query for all updates)
+- Supports any map key/value types (string, int, float64, bool, etc.)
+- Automatically chunks large maps (500+ entries) with transaction safety
+- Combines with existing WHERE conditions
+- Auto-updates `updated_at` timestamp if the column exists
+
 ---
 
 ## API Reference
@@ -177,16 +227,17 @@ err := zorm.New[User]().CreateMany(ctx, largeDataset)
 
 ### Write Methods
 
-| Method                               | Description                            |
-| ------------------------------------ | -------------------------------------- |
-| `Create(ctx, entity)`                | Insert single record                   |
-| `CreateMany(ctx, entities)`          | Insert multiple records                |
-| `Update(ctx, entity)`                | Update single record by primary key    |
-| `UpdateMany(ctx, values)`            | Update multiple records matching query |
-| `Delete(ctx)`                        | Delete records matching query          |
-| `DeleteMany(ctx)`                    | Alias for Delete                       |
-| `FirstOrCreate(ctx, attrs, values)`  | Find first or create new               |
-| `UpdateOrCreate(ctx, attrs, values)` | Update existing or create new          |
+| Method                                              | Description                                   |
+| --------------------------------------------------- | --------------------------------------------- |
+| `Create(ctx, entity)`                               | Insert single record                          |
+| `CreateMany(ctx, entities)`                         | Insert multiple records                       |
+| `Update(ctx, entity)`                               | Update single record by primary key           |
+| `UpdateMany(ctx, values)`                           | Update multiple records matching query        |
+| `UpdateManyByKey(ctx, lookup, target, map)`         | Update records by matching lookup column keys |
+| `Delete(ctx)`                                       | Delete records matching query                 |
+| `DeleteMany(ctx)`                                   | Alias for Delete                              |
+| `FirstOrCreate(ctx, attrs, values)`                 | Find first or create new                      |
+| `UpdateOrCreate(ctx, attrs, values)`                | Update existing or create new                 |
 
 ### Query Builder Methods
 
