@@ -1614,6 +1614,178 @@ func (m *Model[T]) DeleteMany(ctx context.Context) error {
 	return m.Delete(ctx)
 }
 
+// UpdateManyByKey updates multiple records by matching a lookup column to values in a map.
+// Each map key is matched against lookupColumn, and the corresponding map value
+// is set in targetColumn. Uses CASE WHEN syntax for database portability.
+//
+// Example:
+//
+//	updates := map[string]string{"REF001": "pending", "REF002": "approved"}
+//	err := New[Text]().UpdateManyByKey(ctx, "reference_number", "status", updates)
+//
+// This generates SQL like:
+//
+//	UPDATE texts SET status = CASE reference_number
+//	    WHEN $1 THEN $2
+//	    WHEN $3 THEN $4
+//	END, updated_at = $5
+//	WHERE reference_number IN ($6, $7)
+func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColumn string, updates any) error {
+	// Validate column names
+	if err := ValidateColumnName(lookupColumn); err != nil {
+		return err
+	}
+	if err := ValidateColumnName(targetColumn); err != nil {
+		return err
+	}
+
+	// Validate updates is a map
+	mapVal := reflect.ValueOf(updates)
+	if mapVal.Kind() != reflect.Map {
+		return fmt.Errorf("zorm: updates must be a map, got %T", updates)
+	}
+
+	mapLen := mapVal.Len()
+	if mapLen == 0 {
+		return nil // Nothing to update
+	}
+
+	// Calculate chunking threshold
+	// Each entry needs: 2 params for CASE (key, value) + 1 param for WHERE IN = 3 params
+	paramsPerEntry := 3
+	maxEntriesPerBatch := (65535 - 10) / paramsPerEntry // Reserve buffer
+	if maxEntriesPerBatch > 500 {
+		maxEntriesPerBatch = 500 // Cap for reasonable batch size
+	}
+
+	// Get map keys
+	keys := mapVal.MapKeys()
+
+	// Execute in single batch or chunked
+	if len(keys) <= maxEntriesPerBatch {
+		return m.updateManyByKeyBatch(ctx, lookupColumn, targetColumn, mapVal, keys)
+	}
+	return m.updateManyByKeyChunked(ctx, lookupColumn, targetColumn, mapVal, keys, maxEntriesPerBatch)
+}
+
+// updateManyByKeyBatch performs a single batch update for UpdateManyByKey.
+func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targetColumn string, mapVal reflect.Value, keys []reflect.Value) error {
+	sb := GetStringBuilder()
+	defer PutStringBuilder(sb)
+
+	// Pre-allocate string builder capacity
+	baseSize := 50 + len(m.TableName()) + len(targetColumn) + len(lookupColumn)
+	caseSize := len(keys) * 16 // " WHEN ? THEN ?" per key
+	inSize := len(keys) * 3    // "?, " per key in IN clause
+	sb.Grow(baseSize + caseSize + inSize + 50)
+
+	// Pre-allocate args: 2 per CASE entry + 1 for updated_at + existing WHERE args + IN args
+	args := make([]any, 0, len(keys)*3+1+len(m.args))
+	lookupKeys := make([]any, 0, len(keys))
+
+	// Build: UPDATE table SET target = CASE lookup
+	sb.WriteString("UPDATE ")
+	sb.WriteString(m.TableName())
+	sb.WriteString(" SET ")
+	sb.WriteString(targetColumn)
+	sb.WriteString(" = CASE ")
+	sb.WriteString(lookupColumn)
+
+	// Build CASE WHEN clauses
+	for _, key := range keys {
+		sb.WriteString(" WHEN ? THEN ?")
+		keyVal := key.Interface()
+		args = append(args, keyVal, mapVal.MapIndex(key).Interface())
+		lookupKeys = append(lookupKeys, keyVal)
+	}
+	sb.WriteString(" END")
+
+	// Auto-update updated_at if exists
+	if _, ok := m.modelInfo.Columns["updated_at"]; ok {
+		sb.WriteString(", updated_at = ?")
+		args = append(args, time.Now())
+	}
+
+	// Build existing WHERE clause
+	m.buildWhereClause(sb)
+
+	// Add IN clause for lookup column
+	if len(m.wheres) == 0 {
+		sb.WriteString(" WHERE ")
+	} else {
+		sb.WriteString(" AND ")
+	}
+	sb.WriteString(lookupColumn)
+	sb.WriteString(" IN (")
+	writePlaceholdersWithSeparator(sb, len(lookupKeys), ", ")
+	sb.WriteString(")")
+
+	// Append existing WHERE args, then IN args
+	args = append(args, m.args...)
+	args = append(args, lookupKeys...)
+
+	query := sb.String()
+	_, err := m.queryerForWrite().ExecContext(ctx, rebind(query), args...)
+	if err != nil {
+		return WrapQueryError("UPDATE", query, args, err)
+	}
+	return nil
+}
+
+// updateManyByKeyChunked executes UpdateManyByKey in chunks for large maps.
+func (m *Model[T]) updateManyByKeyChunked(ctx context.Context, lookupColumn, targetColumn string, mapVal reflect.Value, keys []reflect.Value, chunkSize int) error {
+	var tx *sql.Tx
+	var err error
+	var committed bool
+
+	// Start transaction if not already in one
+	if m.tx == nil {
+		db := m.db
+		if db == nil {
+			db = GetGlobalDB()
+		}
+		if db == nil {
+			return ErrNilDatabase
+		}
+		tx, err = db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if !committed {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	// Process in chunks
+	for i := 0; i < len(keys); i += chunkSize {
+		end := i + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		chunkKeys := keys[i:end]
+		batchModel := m.Clone()
+		if tx != nil {
+			batchModel.tx = tx
+		}
+
+		if err := batchModel.updateManyByKeyBatch(ctx, lookupColumn, targetColumn, mapVal, chunkKeys); err != nil {
+			return err
+		}
+	}
+
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = true
+	}
+
+	return nil
+}
+
 // BulkInsert inserts multiple records using a single prepared statement.
 // This is more efficient than CreateMany for scenarios where you need
 // fine-grained control or want to handle errors per-entity.
