@@ -396,6 +396,77 @@ func TestRelations_Nested(t *testing.T) {
 	}
 }
 
+func TestRelations_NestedWithCols(t *testing.T) {
+	db := setupRelDBMorphTo(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	users, err := New[RelUser]().With("Posts.Comments:id,content,commentable_id").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	for _, u := range users {
+		if u.Name == "Alice" {
+			if len(u.Posts) == 0 {
+				t.Fatal("expected Alice to have posts")
+			}
+			for _, p := range u.Posts {
+				if p.Title == "Post 1" {
+					if len(p.Comments) == 0 {
+						t.Fatal("expected Post 1 to have comments with column selection")
+					}
+					for _, c := range p.Comments {
+						if c.Content == "" {
+							t.Error("expected Content to be populated")
+						}
+						if c.CommentableType != "" {
+							t.Errorf("expected CommentableType to be empty (not selected), got %q", c.CommentableType)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestRelations_NestedWithCols_MissingFK(t *testing.T) {
+	db := setupRelDBMorphTo(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+	// FK column (commentable_id) is omitted from column selection.
+	// The query succeeds but the FK field is zero-valued, so children
+	// cannot be mapped back to parents — resulting in empty slices.
+	users, err := New[RelUser]().With("Posts.Comments:id,content").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	for _, u := range users {
+		if u.Name == "Alice" {
+			if len(u.Posts) == 0 {
+				t.Fatal("expected Alice to have posts")
+			}
+			for _, p := range u.Posts {
+				if p.Title == "Post 1" {
+					if len(p.Comments) != 0 {
+						t.Errorf("expected 0 comments when FK not in column selection, got %d", len(p.Comments))
+					}
+				}
+			}
+		}
+	}
+}
+
 func TestRelations_LoadSlice(t *testing.T) {
 	db := setupRelDB(t)
 	defer db.Close()
@@ -724,5 +795,559 @@ func TestMorphTo_TypeNotInMap(t *testing.T) {
 
 	if comments[0].Commentable != nil {
 		t.Errorf("expected Commentable to be nil for unknown type, got %+v", comments[0].Commentable)
+	}
+}
+
+// ==================== Test 1: HasOne Eager Loading — EXPOSES BUG ====================
+
+func setupRelDBHasOne(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE rel_users_with_profile (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE rel_profiles (id INTEGER PRIMARY KEY, user_id INTEGER UNIQUE, bio TEXT);
+
+		INSERT INTO rel_users_with_profile (id, name) VALUES (1, 'Alice');
+		INSERT INTO rel_profiles (id, user_id, bio) VALUES (1, 1, 'Alice bio');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+	return db
+}
+
+func TestHasOne_EagerLoading(t *testing.T) {
+	db := setupRelDBHasOne(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	// HasOne eager loading via loadHasMany panics because reflect.MakeSlice
+	// is called on a pointer type (*RelProfile) instead of a slice type.
+	// MorphOne handles this correctly (lines 1149-1158) but HasOne reuses
+	// loadHasMany without single-value logic.
+	panicked := true
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				panicked = false
+			}
+		}()
+		_, _ = New[RelUserWithProfile]().With("Profile").Get(ctx)
+	}()
+
+	if !panicked {
+		t.Error("expected HasOne eager loading to panic due to reflect.MakeSlice on pointer type, but it did not panic")
+	}
+}
+
+// ==================== Test 2: Root-Level With Cols ====================
+
+func TestWith_ColsOnRootRelation(t *testing.T) {
+	db := setupRelDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	t.Run("WithCols", func(t *testing.T) {
+		users, err := New[RelUser]().With("Posts:id,title,user_id").Get(ctx)
+		if err != nil {
+			t.Fatalf("failed to get users: %v", err)
+		}
+
+		var alice *RelUser
+		for _, u := range users {
+			if u.Name == "Alice" {
+				alice = u
+				break
+			}
+		}
+		if alice == nil {
+			t.Fatal("Alice not found")
+		}
+
+		if len(alice.Posts) != 2 {
+			t.Errorf("expected 2 posts for Alice, got %d", len(alice.Posts))
+		}
+		for _, p := range alice.Posts {
+			if p.Title == "" {
+				t.Error("expected Title to be populated")
+			}
+		}
+	})
+
+	t.Run("MissingFK", func(t *testing.T) {
+		users, err := New[RelUser]().With("Posts:id,title").Get(ctx)
+		if err != nil {
+			t.Fatalf("failed to get users: %v", err)
+		}
+
+		var alice *RelUser
+		for _, u := range users {
+			if u.Name == "Alice" {
+				alice = u
+				break
+			}
+		}
+		if alice == nil {
+			t.Fatal("Alice not found")
+		}
+
+		// FK user_id is omitted from column selection, so posts can't be
+		// mapped back to parents — resulting in 0 posts.
+		if len(alice.Posts) != 0 {
+			t.Errorf("expected 0 posts when FK omitted from cols, got %d", len(alice.Posts))
+		}
+	})
+}
+
+// ==================== Test 3: WithCallback Not Applied — DOCUMENTS DEAD CODE ====================
+
+func TestWithCallback_NotApplied(t *testing.T) {
+	db := setupRelDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	// WithCallback stores the callback in relationCallbacks but loadRelations
+	// never reads it. Therefore the filter is NOT applied.
+	users, err := New[RelUser]().WithCallback("Posts", func(q *Model[RelPost]) {
+		q.Where("title", "=", "Post 1")
+	}).Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	var alice *RelUser
+	for _, u := range users {
+		if u.Name == "Alice" {
+			alice = u
+			break
+		}
+	}
+	if alice == nil {
+		t.Fatal("Alice not found")
+	}
+
+	// Callback is NOT applied (dead code), so Alice should have all 2 posts
+	if len(alice.Posts) != 2 {
+		t.Errorf("expected 2 posts (callback not applied), got %d", len(alice.Posts))
+	}
+}
+
+// ==================== Test 4: WithMorph TypeMap Integration ====================
+
+func TestWithMorph_TypeMapIntegration(t *testing.T) {
+	db := setupRelDBMorphTo(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	comments, err := New[RelComment]().WithMorph("Commentable", map[string][]string{
+		"RelPost":         {},
+		"RelUserExtended": {},
+	}).Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get comments: %v", err)
+	}
+
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(comments))
+	}
+
+	for _, c := range comments {
+		if c.Commentable == nil {
+			t.Errorf("comment %d: expected Commentable to be loaded", c.ID)
+		}
+	}
+}
+
+// ==================== Test 5: Nested BelongsTo Silently Skipped — EXPOSES BUG ====================
+
+func TestNested_BelongsToSilentlySkipped(t *testing.T) {
+	db := setupRelDBMorphTo(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	users, err := New[RelUser]().With("Posts.User").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	var alice *RelUser
+	for _, u := range users {
+		if u.Name == "Alice" {
+			alice = u
+			break
+		}
+	}
+	if alice == nil {
+		t.Fatal("Alice not found")
+	}
+
+	if len(alice.Posts) == 0 {
+		t.Fatal("expected Alice to have posts")
+	}
+
+	// Nested BelongsTo is silently skipped by loadRelationsDynamic because
+	// it only handles RelationHasMany (line 1252-1258 of relations.go).
+	for _, p := range alice.Posts {
+		if p.User != nil {
+			t.Errorf("post %d: expected User to be nil (nested BelongsTo silently skipped), got %+v", p.ID, p.User)
+		}
+	}
+}
+
+// ==================== Test 6: Three-Level Nested HasMany ====================
+
+type ThreeLevelAuthor struct {
+	ID    int    `zorm:"primaryKey"`
+	Name  string
+	Books []*ThreeLevelBook
+}
+
+func (a ThreeLevelAuthor) TableName() string { return "three_level_authors" }
+
+func (a ThreeLevelAuthor) BooksRelation() HasMany[ThreeLevelBook] {
+	return HasMany[ThreeLevelBook]{ForeignKey: "three_level_author_id"}
+}
+
+type ThreeLevelBook struct {
+	ID                 int    `zorm:"primaryKey"`
+	ThreeLevelAuthorID int
+	Title              string
+	Chapters           []*ThreeLevelChapter
+}
+
+func (b ThreeLevelBook) TableName() string { return "three_level_books" }
+
+func (b ThreeLevelBook) ChaptersRelation() HasMany[ThreeLevelChapter] {
+	return HasMany[ThreeLevelChapter]{ForeignKey: "three_level_book_id"}
+}
+
+type ThreeLevelChapter struct {
+	ID               int    `zorm:"primaryKey"`
+	ThreeLevelBookID int
+	Heading          string
+}
+
+func (c ThreeLevelChapter) TableName() string { return "three_level_chapters" }
+
+func setupRelDBThreeLevel(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE three_level_authors (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE three_level_books (id INTEGER PRIMARY KEY, three_level_author_id INTEGER, title TEXT);
+		CREATE TABLE three_level_chapters (id INTEGER PRIMARY KEY, three_level_book_id INTEGER, heading TEXT);
+
+		INSERT INTO three_level_authors (id, name) VALUES (1, 'Author A');
+		INSERT INTO three_level_books (id, three_level_author_id, title) VALUES (1, 1, 'Book 1'), (2, 1, 'Book 2');
+		INSERT INTO three_level_chapters (id, three_level_book_id, heading) VALUES
+			(1, 1, 'Ch 1'), (2, 1, 'Ch 2'), (3, 2, 'Ch 3');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+	return db
+}
+
+func TestNested_ThreeLevels(t *testing.T) {
+	db := setupRelDBThreeLevel(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	authors, err := New[ThreeLevelAuthor]().With("Books.Chapters").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get authors: %v", err)
+	}
+
+	if len(authors) != 1 {
+		t.Fatalf("expected 1 author, got %d", len(authors))
+	}
+
+	author := authors[0]
+	if len(author.Books) != 2 {
+		t.Fatalf("expected 2 books, got %d", len(author.Books))
+	}
+
+	for _, book := range author.Books {
+		if book.Title == "Book 1" && len(book.Chapters) != 2 {
+			t.Errorf("Book 1: expected 2 chapters, got %d", len(book.Chapters))
+		}
+		if book.Title == "Book 2" && len(book.Chapters) != 1 {
+			t.Errorf("Book 2: expected 1 chapter, got %d", len(book.Chapters))
+		}
+	}
+}
+
+// ==================== Test 7: Load Single Entity HasMany ====================
+
+func TestLoad_SingleEntity_HasMany(t *testing.T) {
+	db := setupRelDB(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	user, err := New[RelUser]().Where("id", "=", 1).First(ctx)
+	if err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+
+	err = New[RelUser]().Load(ctx, user, "Posts")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if len(user.Posts) != 2 {
+		t.Errorf("expected 2 posts, got %d", len(user.Posts))
+	}
+}
+
+// ==================== Test 8: LoadSlice BelongsToMany ====================
+
+func TestLoadSlice_BelongsToMany(t *testing.T) {
+	db := setupRelDBExtended(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	users, err := New[RelUserExtended]().Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	err = New[RelUserExtended]().LoadSlice(ctx, users, "Roles")
+	if err != nil {
+		t.Fatalf("LoadSlice failed: %v", err)
+	}
+
+	if len(users) == 0 {
+		t.Fatal("expected users")
+	}
+
+	if len(users[0].Roles) != 2 {
+		t.Errorf("expected 2 roles for Alice, got %d", len(users[0].Roles))
+	}
+}
+
+// ==================== Test 9: Chained With Calls ====================
+
+func TestWith_ChainedCalls(t *testing.T) {
+	db := setupRelDBMorphTo(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	posts, err := New[RelPost]().With("User").With("Comments").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get posts: %v", err)
+	}
+
+	if len(posts) == 0 {
+		t.Fatal("expected posts")
+	}
+
+	// Find Post 1 (Alice's post)
+	var post1 *RelPost
+	for _, p := range posts {
+		if p.Title == "Post 1" {
+			post1 = p
+			break
+		}
+	}
+	if post1 == nil {
+		t.Fatal("Post 1 not found")
+	}
+
+	// User should be loaded (BelongsTo)
+	if post1.User == nil {
+		t.Error("expected User to be loaded on Post 1")
+	} else if post1.User.Name != "Alice" {
+		t.Errorf("expected User Alice, got %q", post1.User.Name)
+	}
+
+	// Comments should be loaded (HasMany)
+	if len(post1.Comments) == 0 {
+		t.Error("expected Comments to be loaded on Post 1")
+	}
+}
+
+// ==================== Test 10: HasMany Default FK Inference ====================
+
+type InferAuthor struct {
+	ID    int    `zorm:"primaryKey"`
+	Name  string
+	Books []*InferBook
+}
+
+func (a InferAuthor) TableName() string { return "infer_authors" }
+
+func (a InferAuthor) BooksRelation() HasMany[InferBook] {
+	return HasMany[InferBook]{} // Empty — relies on default FK inference
+}
+
+type InferBook struct {
+	ID            int `zorm:"primaryKey"`
+	InferAuthorID int
+	Title         string
+}
+
+func (b InferBook) TableName() string { return "infer_books" }
+
+func setupRelDBDefaultFK(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE infer_authors (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE infer_books (id INTEGER PRIMARY KEY, infer_author_id INTEGER, title TEXT);
+
+		INSERT INTO infer_authors (id, name) VALUES (1, 'Author A');
+		INSERT INTO infer_books (id, infer_author_id, title) VALUES (1, 1, 'Book 1'), (2, 1, 'Book 2');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+	return db
+}
+
+func TestHasMany_DefaultFKInference(t *testing.T) {
+	db := setupRelDBDefaultFK(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	authors, err := New[InferAuthor]().With("Books").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get authors: %v", err)
+	}
+
+	if len(authors) != 1 {
+		t.Fatalf("expected 1 author, got %d", len(authors))
+	}
+
+	if len(authors[0].Books) != 2 {
+		t.Errorf("expected 2 books for author, got %d", len(authors[0].Books))
+	}
+}
+
+// ==================== Test 11: MorphMany Empty Results ====================
+
+func setupRelDBMorphManyEmpty(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE rel_users (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE rel_posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);
+		CREATE TABLE rel_roles (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE rel_role_user (user_id INTEGER, role_id INTEGER);
+		CREATE TABLE rel_images (id INTEGER PRIMARY KEY, url TEXT, imageable_id INTEGER, imageable_type TEXT);
+
+		INSERT INTO rel_users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+		INSERT INTO rel_images (id, url, imageable_id, imageable_type) VALUES
+			(1, 'http://alice_thumb.jpg', 1, 'RelUserExtended');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+	return db
+}
+
+func TestMorphMany_EmptyResults(t *testing.T) {
+	db := setupRelDBMorphManyEmpty(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	users, err := New[RelUserExtended]().With("Images").Get(ctx)
+	if err != nil {
+		t.Fatalf("failed to get users: %v", err)
+	}
+
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+
+	var alice, bob *RelUserExtended
+	for _, u := range users {
+		if u.Name == "Alice" {
+			alice = u
+		}
+		if u.Name == "Bob" {
+			bob = u
+		}
+	}
+
+	if alice == nil {
+		t.Fatal("Alice not found")
+	}
+	if bob == nil {
+		t.Fatal("Bob not found")
+	}
+
+	if len(alice.Images) != 1 {
+		t.Errorf("expected 1 image for Alice, got %d", len(alice.Images))
+	}
+
+	if len(bob.Images) != 0 {
+		t.Errorf("expected 0 images for Bob, got %d", len(bob.Images))
 	}
 }
