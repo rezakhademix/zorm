@@ -120,3 +120,125 @@ func TestStmtCache_Eviction(t *testing.T) {
 		t.Errorf("cache exceeded maximum possible size: got %d", cache.Len())
 	}
 }
+
+// =============================================================================
+// ISSUE #7: STMTCACHE CLOSE WITH IN-FLIGHT STATEMENTS
+// =============================================================================
+
+// TestStmtCache_CloseWithInFlightStatements verifies that Close() followed by
+// release() on a held reference does not panic or cause undefined behavior.
+func TestStmtCache_CloseWithInFlightStatements(t *testing.T) {
+	cache := NewStmtCache(100)
+
+	// PutAndGet holds a reference (refCount = 1)
+	_, release := cache.PutAndGet("SELECT 1", nil)
+	if release == nil {
+		t.Fatal("expected release function, got nil")
+	}
+
+	// Close the cache while the statement is still in-flight
+	err := cache.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Cache should be empty after Close
+	if cache.Len() != 0 {
+		t.Errorf("expected 0 entries after Close, got %d", cache.Len())
+	}
+
+	// Release should not panic even though cache is closed
+	release()
+}
+
+// TestStmtCache_ConcurrentCloseAndGet verifies no data race or panic when
+// goroutines do Get()/release() while another goroutine calls Close().
+func TestStmtCache_ConcurrentCloseAndGet(t *testing.T) {
+	cache := NewStmtCache(256)
+
+	// Pre-populate cache
+	for i := 0; i < 100; i++ {
+		cache.Put(fmt.Sprintf("SELECT %d", i), nil)
+	}
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// Goroutines doing Get/release
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					query := fmt.Sprintf("SELECT %d", id%100)
+					stmt, release := cache.Get(query)
+					if release != nil {
+						_ = stmt
+						release()
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Goroutines doing PutAndGet/release
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					query := fmt.Sprintf("SELECT new_%d", id)
+					_, release := cache.PutAndGet(query, nil)
+					if release != nil {
+						release()
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Let goroutines run briefly, then Close
+	// Use a small sleep to let goroutines start
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Close the cache while other goroutines are active
+		cache.Close()
+	}()
+
+	// Signal all goroutines to stop
+	close(done)
+	wg.Wait()
+}
+
+// TestStmtCache_ClearWithHeldReferences verifies that Clear() marks entries
+// as evicted, and subsequent release() handles cleanup properly.
+func TestStmtCache_ClearWithHeldReferences(t *testing.T) {
+	cache := NewStmtCache(100)
+
+	// PutAndGet to hold references
+	_, release1 := cache.PutAndGet("SELECT 1", nil)
+	_, release2 := cache.PutAndGet("SELECT 2", nil)
+	if release1 == nil || release2 == nil {
+		t.Fatal("expected release functions")
+	}
+
+	// Clear while references are held
+	cache.Clear()
+
+	if cache.Len() != 0 {
+		t.Errorf("expected 0 entries after Clear, got %d", cache.Len())
+	}
+
+	// Releasing held references should not panic
+	release1()
+	release2()
+}

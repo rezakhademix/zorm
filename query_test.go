@@ -1006,3 +1006,71 @@ func TestUseReplica_ResetsUsePrimary(t *testing.T) {
 		t.Error("forcePrimary should be false after UseReplica")
 	}
 }
+
+// =============================================================================
+// ISSUE #5: WHERE MAP/STRUCT buildErr TESTS
+// =============================================================================
+
+// TestWhere_MapInvalidKey_SetsBuildErr verifies that an invalid column name
+// in a map-based Where sets buildErr instead of silently producing bad SQL.
+func TestWhere_MapInvalidKey_SetsBuildErr(t *testing.T) {
+	m := New[TestModel]().Where(map[string]any{"name; DROP TABLE users": "Alice"})
+
+	if m.buildErr == nil {
+		t.Fatal("expected buildErr to be set for invalid map key with semicolon, got nil")
+	}
+	if !strings.Contains(m.buildErr.Error(), "invalid column name") {
+		t.Errorf("expected error to mention 'invalid column name', got %q", m.buildErr.Error())
+	}
+}
+
+// =============================================================================
+// ISSUE #9: WHERE STRING COLUMN VALIDATION TESTS
+// =============================================================================
+
+// TestWhere_StringColumnInjection_SetsBuildErr verifies that a SQL injection
+// attempt in a string Where column sets buildErr.
+func TestWhere_StringColumnInjection_SetsBuildErr(t *testing.T) {
+	m := New[TestModel]().Where("id; DROP TABLE users", 1)
+
+	if m.buildErr == nil {
+		t.Fatal("expected buildErr to be set for injection attempt, got nil")
+	}
+	if !strings.Contains(m.buildErr.Error(), "invalid column name") {
+		t.Errorf("expected error to mention 'invalid column name', got %q", m.buildErr.Error())
+	}
+}
+
+// TestWhere_StringWithOperator_ValidColumn verifies that valid column names
+// with operators still work correctly (no false positive).
+func TestWhere_StringWithOperator_ValidColumn(t *testing.T) {
+	m := New[TestModel]().Where("age", ">", 18)
+
+	if m.buildErr != nil {
+		t.Fatalf("unexpected buildErr for valid Where: %v", m.buildErr)
+	}
+
+	query, args := m.Print()
+	if !strings.Contains(query, "age > $1") {
+		t.Errorf("expected 'age > $1' in query, got %q", query)
+	}
+	if len(args) != 1 || args[0] != 18 {
+		t.Errorf("expected args [18], got %v", args)
+	}
+}
+
+// TestWhere_RawQuery_NoValidation verifies that raw Where strings containing
+// placeholders (?) are appended as-is without column name validation.
+// This allows expressions like "age > 28" as raw WHERE fragments.
+func TestWhere_RawQuery_NoValidation(t *testing.T) {
+	m := New[TestModel]().Where("age > 28 AND status = 'active'")
+
+	if m.buildErr != nil {
+		t.Fatalf("unexpected buildErr for raw Where expression: %v", m.buildErr)
+	}
+
+	query, _ := m.Print()
+	if !strings.Contains(query, "age > 28 AND status = 'active'") {
+		t.Errorf("expected raw expression in query, got %q", query)
+	}
+}

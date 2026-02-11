@@ -304,7 +304,12 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 			sb.WriteString("DISTINCT ")
 		}
 
-		sb.WriteString("1 FROM ")
+		if q.distinct && len(q.columns) > 0 {
+			sb.WriteString(strings.Join(q.columns, ", "))
+		} else {
+			sb.WriteString("1")
+		}
+		sb.WriteString(" FROM ")
 		sb.WriteString(tableName)
 		q.buildWhereClause(&sb)
 
