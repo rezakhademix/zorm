@@ -162,12 +162,17 @@ func TestModel_WithTx(t *testing.T) {
 	ctx := context.Background()
 	zTx := &Tx{Tx: innerTx, ctx: ctx}
 
-	m.WithTx(zTx)
+	txModel := m.WithTx(zTx)
 
-	if m.tx != zTx.Tx {
+	if txModel.tx != zTx.Tx {
 		t.Error("WithTx failed to set transaction")
 	}
-	if m.ctx != zTx.ctx {
+	if txModel.ctx != zTx.ctx {
 		t.Error("WithTx failed to set context")
+	}
+
+	// Verify original model was not mutated
+	if m.tx != nil {
+		t.Error("WithTx should not mutate original model's transaction")
 	}
 }

@@ -135,6 +135,8 @@ func (e *ValidationError) Error() string {
 // WrapQueryError wraps a database error with query context.
 // It analyzes the error to categorize it and extract relevant information
 // such as table names and constraint names where possible.
+// For PostgreSQL, it uses SQLSTATE codes for reliable error detection;
+// for other databases, it falls back to error message pattern matching.
 func WrapQueryError(operation, query string, args []any, err error) error {
 	if err == nil {
 		return nil
@@ -145,6 +147,13 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 		return ErrRecordNotFound
 	}
 
+	// Try PostgreSQL SQLSTATE codes first (more reliable)
+	sqlState := getSQLState(err)
+	if sqlState != "" {
+		return wrapBySQLState(operation, query, args, err, sqlState)
+	}
+
+	// Fall back to string-based detection for non-PostgreSQL databases
 	// Convert error to lowercase for case-insensitive matching
 	errMsg := strings.ToLower(err.Error())
 
@@ -279,6 +288,104 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 }
 
 // Error detection helpers - these check for patterns across different database systems
+
+// PostgreSQL SQLSTATE codes for more reliable error detection.
+// See: https://www.postgresql.org/docs/current/errcodes-appendix.html
+const (
+	// Class 23 — Integrity Constraint Violation
+	pgUniqueViolation     = "23505" // unique_violation
+	pgForeignKeyViolation = "23503" // foreign_key_violation
+	pgNotNullViolation    = "23502" // not_null_violation
+	pgCheckViolation      = "23514" // check_violation
+
+	// Class 40 — Transaction Rollback
+	pgDeadlockDetected     = "40P01" // deadlock_detected
+	pgSerializationFailure = "40001" // serialization_failure
+
+	// Class 08 — Connection Exception
+	pgConnectionFailure      = "08006" // connection_failure
+	pgConnectionDoesNotExist = "08003" // connection_does_not_exist
+
+	// Class 42 — Syntax Error or Access Rule Violation
+	pgUndefinedColumn = "42703" // undefined_column
+	pgUndefinedTable  = "42P01" // undefined_table
+	pgSyntaxError     = "42601" // syntax_error
+)
+
+// pgErrorCode is an interface implemented by PostgreSQL driver errors
+// that provide SQLSTATE codes. Both lib/pq and pgx implement this.
+type pgErrorCode interface {
+	SQLState() string
+}
+
+// getSQLState extracts the SQLSTATE code from an error if available.
+// Returns empty string if the error doesn't support SQLSTATE.
+func getSQLState(err error) string {
+	var pqErr pgErrorCode
+	if errors.As(err, &pqErr) {
+		return pqErr.SQLState()
+	}
+	return ""
+}
+
+// wrapBySQLState wraps errors using PostgreSQL SQLSTATE codes.
+// This is more reliable than string matching for PostgreSQL databases.
+func wrapBySQLState(operation, query string, args []any, err error, sqlState string) error {
+	var sentinelErr error
+
+	switch sqlState {
+	case pgUniqueViolation:
+		sentinelErr = ErrDuplicateKey
+	case pgForeignKeyViolation:
+		sentinelErr = ErrForeignKey
+	case pgNotNullViolation:
+		sentinelErr = ErrNotNullViolation
+	case pgCheckViolation:
+		sentinelErr = ErrCheckViolation
+	case pgDeadlockDetected:
+		sentinelErr = ErrTransactionDeadlock
+	case pgSerializationFailure:
+		sentinelErr = ErrSerializationFailure
+	case pgConnectionFailure, pgConnectionDoesNotExist:
+		sentinelErr = ErrConnectionFailed
+	case pgUndefinedColumn:
+		sentinelErr = ErrColumnNotFound
+	case pgUndefinedTable:
+		sentinelErr = ErrTableNotFound
+	case pgSyntaxError:
+		sentinelErr = ErrInvalidSyntax
+	default:
+		// Check class prefix for broader categorization
+		if len(sqlState) >= 2 {
+			switch sqlState[:2] {
+			case "23": // Integrity Constraint Violation class
+				sentinelErr = ErrDuplicateKey // Generic constraint error
+			case "08": // Connection Exception class
+				sentinelErr = ErrConnectionFailed
+			case "40": // Transaction Rollback class
+				sentinelErr = ErrTransactionDeadlock
+			case "42": // Syntax Error or Access Rule Violation class
+				sentinelErr = ErrInvalidSyntax
+			}
+		}
+	}
+
+	qe := &QueryError{
+		Query:     query,
+		Args:      args,
+		Operation: operation,
+		Err:       err,
+	}
+
+	if sentinelErr != nil {
+		qe.Err = fmt.Errorf("%w: %v", sentinelErr, err)
+	}
+
+	// Extract constraint info for all PostgreSQL errors
+	extractConstraintInfo(qe, err.Error())
+
+	return qe
+}
 
 // isUniqueViolation checks if the error is a unique constraint violation.
 // Supports PostgreSQL, MySQL, and SQLite patterns.

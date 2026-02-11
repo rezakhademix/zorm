@@ -178,16 +178,18 @@ func (c *StmtCache) evictEntry(shard *stmtCacheShard, entry *cacheEntry) {
 }
 
 // release decrements the ref count and closes if evicted and unused.
+// The lock must be acquired BEFORE decrementing refCount to prevent a TOCTOU race
+// where another goroutine could evict and close the stmt between our decrement
+// and our lock acquisition.
 func (c *StmtCache) release(shard *stmtCacheShard, entry *cacheEntry) {
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
 	newCount := atomic.AddInt32(&entry.refCount, -1)
-	if newCount == 0 {
-		shard.mu.Lock()
-		defer shard.mu.Unlock()
-		// Double check under lock (though evicted/refCount logic is mostly safe, closing should be consistent)
-		// If it was evicted while we used it, we must close it now.
-		if entry.evicted && atomic.LoadInt32(&entry.refCount) == 0 && entry.stmt != nil {
-			_ = entry.stmt.Close()
-		}
+	// If refCount is now 0 and it was evicted while we were using it, close it.
+	if newCount == 0 && entry.evicted && entry.stmt != nil {
+		_ = entry.stmt.Close()
+		entry.stmt = nil // Prevent double-close
 	}
 }
 

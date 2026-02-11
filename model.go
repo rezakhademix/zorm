@@ -64,10 +64,24 @@ func GetGlobalResolver() *DBResolver {
 // entities.
 //
 // Thread Safety: Model instances are NOT safe for concurrent modification.
-// Use Clone() to create independent copies for concurrent use, or create
-// new Model instances per goroutine. The mu field provides protection for
-// Clone() operations to safely read state while another goroutine may be
-// calling Clone() on the same model.
+// Query builder methods (Where, Select, OrderBy, etc.) mutate internal state
+// without locking and must not be called concurrently on the same Model instance.
+//
+// Safe patterns for concurrent use:
+//  1. Clone before branching: Call Clone() to create independent copies before
+//     modifying in different goroutines. Clone() uses RWMutex internally.
+//  2. Create per goroutine: Create new Model instances via New[T]() in each goroutine.
+//
+// Example:
+//
+//	base := New[User]().Where("active", true)
+//	// SAFE: Clone before concurrent use
+//	go func() { base.Clone().Where("role", "admin").Get(ctx) }()
+//	go func() { base.Clone().Where("role", "user").Get(ctx) }()
+//
+//	// UNSAFE: Concurrent mutation of same Model
+//	go func() { base.Where("role", "admin").Get(ctx) }() // DATA RACE
+//	go func() { base.Where("role", "user").Get(ctx) }()  // DATA RACE
 type Model[T any] struct {
 	mu sync.RWMutex // Protects query state for Clone() operations
 

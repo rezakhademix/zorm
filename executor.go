@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -406,7 +407,7 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = q.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
+		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -462,7 +463,7 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 
 		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
 	} else {
-		err = q.queryer().QueryRowContext(ctx, query, args...).Scan(&result)
+		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&result)
 	}
 
 	if err != nil {
@@ -913,6 +914,12 @@ func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any,
 		return result, nil
 	}
 
+	// Check if error is specifically "record not found"
+	// Any other error should be returned immediately
+	if err != nil && !errors.Is(err, ErrRecordNotFound) {
+		return nil, err
+	}
+
 	// Not found, create
 	// Merge attributes and values
 	data := make(map[string]any)
@@ -959,6 +966,12 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 			return nil, err
 		}
 		return result, nil
+	}
+
+	// Check if error is specifically "record not found"
+	// Any other error should be returned immediately
+	if err != nil && !errors.Is(err, ErrRecordNotFound) {
+		return nil, err
 	}
 
 	// Not found, create
@@ -1189,7 +1202,10 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// If entity is passed, update that entity.
 	// So add WHERE id = entity.ID
 
-	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	if !ok {
+		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
+	}
 	pkVal := val.FieldByIndex(pkField.Index).Interface()
 	sb.WriteString(" WHERE ")
 	sb.WriteString(m.modelInfo.PrimaryKey)
@@ -1536,7 +1552,10 @@ func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []str
 
 	// Scan IDs back
 	idx := 0
-	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	if !ok {
+		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
+	}
 
 	for rows.Next() {
 		if idx >= len(entities) {

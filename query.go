@@ -8,6 +8,44 @@ import (
 	"strings"
 )
 
+// validOperators is a whitelist of safe SQL operators for Where clauses.
+// Any operator not in this set will be rejected to prevent SQL injection.
+var validOperators = map[string]bool{
+	"=":       true,
+	">":       true,
+	"<":       true,
+	">=":      true,
+	"<=":      true,
+	"<>":      true,
+	"!=":      true,
+	"LIKE":    true,
+	"ILIKE":   true,
+	"IS":      true,
+	"IS NOT":  true,
+	"IN":      true,
+	"NOT IN":  true,
+	"BETWEEN": true,
+	"NOT":     true,
+	"@>":      true, // PostgreSQL array contains
+	"<@":      true, // PostgreSQL array contained by
+	"&&":      true, // PostgreSQL array overlap
+	"@@":      true, // PostgreSQL full-text search
+}
+
+// isValidOperator checks if an operator is in the whitelist.
+// Comparison is case-insensitive for SQL keywords.
+func isValidOperator(op string) bool {
+	return validOperators[strings.ToUpper(strings.TrimSpace(op))]
+}
+
+// validLockModes is a whitelist of safe SQL lock modes.
+var validLockModes = map[string]bool{
+	"UPDATE":        true,
+	"NO KEY UPDATE": true,
+	"SHARE":         true,
+	"KEY SHARE":     true,
+}
+
 // Select specifies which columns to select.
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) Select(columns ...string) *Model[T] {
@@ -32,8 +70,14 @@ func (m *Model[T]) Distinct() *Model[T] {
 // DistinctBy adds DISTINCT ON (columns) to the SELECT clause.
 // This is a PostgreSQL-specific feature that returns the first row of each set of rows
 // where the given columns match.
+// Column names are validated to prevent SQL injection.
 func (m *Model[T]) DistinctBy(columns ...string) *Model[T] {
-	m.distinctOn = append(m.distinctOn, columns...)
+	for _, col := range columns {
+		if err := ValidateColumnName(col); err != nil {
+			continue // Skip invalid column names
+		}
+		m.distinctOn = append(m.distinctOn, col)
+	}
 
 	return m
 }
@@ -77,6 +121,12 @@ func (m *Model[T]) Where(query any, args ...any) *Model[T] {
 	case 2:
 		operator = fmt.Sprint(args[0])
 		value = args[1]
+
+		// Validate operator to prevent SQL injection
+		if !isValidOperator(operator) {
+			// Invalid operator, return without adding the where clause
+			return m
+		}
 
 		sb := GetStringBuilder()
 		sb.WriteString(query.(string))
@@ -827,7 +877,13 @@ func (m *Model[T]) WithMorph(relation string, typeMap map[string][]string) *Mode
 
 // WithCTE adds a Common Table Expression (CTE) to the query.
 // query can be a string or a *Model[T].
+// CTE names are validated to prevent SQL injection.
 func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
+	// Validate CTE name to prevent SQL injection
+	if err := ValidateColumnName(name); err != nil {
+		return m // Skip invalid CTE names
+	}
+
 	m.ctes = append(m.ctes, CTE{
 		Name:  name,
 		Query: query,
@@ -838,8 +894,14 @@ func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
 // Lock adds a locking clause to the SELECT query.
 // Common modes: "UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"
 // This will generate: SELECT ... FOR [mode]
+// Lock modes are validated against a whitelist to prevent SQL injection.
 func (m *Model[T]) Lock(mode string) *Model[T] {
-	m.lockMode = mode
+	// Validate lock mode to prevent SQL injection
+	normalizedMode := strings.ToUpper(strings.TrimSpace(mode))
+	if !validLockModes[normalizedMode] {
+		return m // Skip invalid lock modes
+	}
+	m.lockMode = normalizedMode
 	return m
 }
 
@@ -1016,7 +1078,7 @@ func rebind(query string) string {
 			sb.WriteByte(c)
 		}
 	}
-	
+
 	// Clone the string to ensure it's independent of the builder's buffer.
 	// While strings.Builder.Reset() nils the buffer (making reuse safe in practice),
 	// explicitly cloning provides defense-in-depth against implementation changes.

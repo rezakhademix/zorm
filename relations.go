@@ -122,9 +122,25 @@ type BelongsToMany[T any] struct {
 // MorphTo defines a polymorphic BelongsTo relation.
 // T is usually `any` or a common interface, but in our generic system,
 // the field in the struct will likely be `any` or an interface.
-// However, `Relation` interface requires `NewRelated()`.
-// For MorphTo, `NewRelated` is dynamic.
-// We might need a special handling for MorphTo.
+//
+// Unlike other relation types, MorphTo cannot implement NewRelated() and NewModel()
+// in a meaningful way because the related type is determined dynamically at runtime
+// based on the Type column value. These methods intentionally return nil.
+// The TypeMap field maps database type strings to empty struct instances, which are
+// used during eager loading to determine and instantiate the correct related type.
+//
+// Example:
+//
+//	func (i *Image) ImageableRelation() MorphTo[any] {
+//	    return MorphTo[any]{
+//	        Type: "imageable_type",
+//	        ID:   "imageable_id",
+//	        TypeMap: map[string]any{
+//	            "posts": Post{},
+//	            "users": User{},
+//	        },
+//	    }
+//	}
 type MorphTo[T any] struct {
 	Type    string         // Column name for Type (e.g. imageable_type)
 	ID      string         // Column name for ID (e.g. imageable_id)
@@ -205,8 +221,16 @@ const (
 	RelationMorphMany RelationType = "MorphMany"
 )
 
-func (MorphTo[T]) RelationType() RelationType                   { return RelationMorphTo }
-func (MorphTo[T]) NewRelated() any                              { return nil } // Dynamic
+// MorphTo implements Relation interface.
+// RelationType returns RelationMorphTo.
+func (MorphTo[T]) RelationType() RelationType { return RelationMorphTo }
+
+// NewRelated returns nil for MorphTo because the related type is determined
+// dynamically at runtime based on the type column value. Use TypeMap instead.
+func (MorphTo[T]) NewRelated() any { return nil }
+
+// NewModel returns nil for MorphTo because the related model type is determined
+// dynamically at runtime based on the type column value.
 func (MorphTo[T]) NewModel(ctx context.Context, db *sql.DB) any { return nil }
 
 func (MorphOne[T]) RelationType() RelationType { return RelationMorphOne }
@@ -526,6 +550,11 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 			return err
 		}
 
+		// Check for errors from row iteration
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
 		// Recursive Load
 		if len(subRelations) > 0 && len(relatedResults) > 0 {
 			if err := m.loadRelationsDynamic(ctx, relatedResults, modelType, subRelations); err != nil {
@@ -764,6 +793,11 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 		}
 	}
 
+	// Check for errors from row iteration
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	if len(allRelatedIDs) == 0 {
 		return nil
 	}
@@ -861,8 +895,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	}
 
 	fks := make([]any, 0, len(results))
-	fkMap := make(map[string][]int, len(results))   // FK string key -> []ParentIndices
-	fkValues := make(map[string]any, len(results))  // FK string key -> original FK value (for query)
+	fkMap := make(map[string][]int, len(results))  // FK string key -> []ParentIndices
+	fkValues := make(map[string]any, len(results)) // FK string key -> original FK value (for query)
 
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
