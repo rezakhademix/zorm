@@ -65,9 +65,21 @@ func transaction(ctx context.Context, db *sql.DB, fn func(tx *Tx) error) (err er
 	return err
 }
 
-// WithTx sets the transaction for the model.
+// WithTx returns a clone of the model with the transaction set.
+// This ensures the original model is not mutated, allowing safe reuse.
+//
+// Example:
+//
+//	base := New[User]().Where("active", true)
+//	Transaction(ctx, func(tx *Tx) error {
+//	    // base is not mutated; txModel is a separate copy
+//	    txModel := base.WithTx(tx)
+//	    return txModel.Create(ctx, &user)
+//	})
+//	// base can still be used outside the transaction
 func (m *Model[T]) WithTx(tx *Tx) *Model[T] {
-	m.tx = tx.Tx
-	m.ctx = tx.ctx
-	return m
+	clone := m.Clone()
+	clone.tx = tx.Tx
+	clone.ctx = tx.ctx
+	return clone
 }

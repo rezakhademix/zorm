@@ -163,7 +163,7 @@ const shardCount = 256
 // Uses sharded locking to reduce contention under high concurrency.
 type lruTracker struct {
 	shards   [shardCount]*lruTrackerShard
-	capacity int // total capacity across all shards
+	capacity int          // total capacity across all shards
 	count    atomic.Int64 // total count across all shards for O(1) Len()
 }
 
@@ -297,9 +297,9 @@ func (s *lruTrackerShard) evictLRU() {
 // This is useful for processing large batches of entities where you don't want
 // tracking data to persist beyond the operation.
 type TrackingScope struct {
-	mu      sync.Mutex
-	keys    map[uintptr]struct{}
-	closed  atomic.Bool
+	mu     sync.Mutex
+	keys   map[uintptr]struct{}
+	closed atomic.Bool
 }
 
 // NewTrackingScope creates a new tracking scope.
@@ -368,7 +368,7 @@ func init() {
 
 // ConfigureDirtyTracking sets the maximum number of entities to track.
 // A capacity of 0 means unbounded (no eviction).
-// The default capacity is 10,000 entities.
+// The default capacity is 50,000 entities.
 // This function is thread-safe and can be called at any time.
 //
 // Example:

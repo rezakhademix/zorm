@@ -2,6 +2,7 @@ package zorm
 
 import (
 	"database/sql"
+	"math/rand/v2"
 	"sync/atomic"
 )
 
@@ -37,13 +38,20 @@ func (r *RoundRobinLoadBalancer) Next(replicas []*sql.DB) *sql.DB {
 	return replicas[idx%uint64(len(replicas))]
 }
 
-// RandomLoadBalancer is a placeholder for future random load balancing.
-// Currently not implemented, defaults to round-robin.
+// RandomLoadBalancer selects a replica randomly for load distribution.
+// This provides non-deterministic load balancing which can help prevent
+// hotspots when multiple clients start at the same time.
 type RandomLoadBalancer struct{}
 
+// Next returns a randomly selected replica from the pool.
 func (r *RandomLoadBalancer) Next(replicas []*sql.DB) *sql.DB {
-	// TODO: Implement random selection
-	return (&RoundRobinLoadBalancer{}).Next(replicas)
+	if len(replicas) == 0 {
+		return nil
+	}
+	if len(replicas) == 1 {
+		return replicas[0]
+	}
+	return replicas[rand.IntN(len(replicas))]
 }
 
 // ResolverOption is a functional option for configuring DBResolver.
