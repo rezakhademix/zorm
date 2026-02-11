@@ -23,6 +23,7 @@ const stmtShardCount = 64
 type StmtCache struct {
 	shards   [stmtShardCount]*stmtCacheShard
 	capacity int
+	closed   atomic.Bool // Set to true after Close/Clear to signal release() to close stmts directly
 }
 
 // stmtCacheShard represents a single shard of the cache with its own lock.
@@ -186,8 +187,8 @@ func (c *StmtCache) release(shard *stmtCacheShard, entry *cacheEntry) {
 	defer shard.mu.Unlock()
 
 	newCount := atomic.AddInt32(&entry.refCount, -1)
-	// If refCount is now 0 and it was evicted while we were using it, close it.
-	if newCount == 0 && entry.evicted && entry.stmt != nil {
+	// If refCount is now 0 and it was evicted (or cache was closed) while we were using it, close it.
+	if newCount == 0 && (entry.evicted || c.closed.Load()) && entry.stmt != nil {
 		_ = entry.stmt.Close()
 		entry.stmt = nil // Prevent double-close
 	}
@@ -213,7 +214,10 @@ func (c *StmtCache) Clear() {
 }
 
 // Close closes all cached statements and releases all resources.
+// In-flight statements (with refCount > 0) will be closed when their
+// release function is called after the last user is done.
 func (c *StmtCache) Close() error {
+	c.closed.Store(true)
 	c.Clear()
 	return nil
 }

@@ -1859,3 +1859,94 @@ func TestScalarQuery_DistinctWithOrderBy(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// ISSUE #8: SCALAR QUERY buildErr TESTS
+// =============================================================================
+
+// TestScalarQuery_InvalidTableName_ReturnsError verifies that an invalid table name
+// sets buildErr which is surfaced by Get().
+func TestScalarQuery_InvalidTableName_ReturnsError(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users; DROP TABLE").
+		Select("name").
+		Get(ctx)
+
+	if err == nil {
+		t.Fatal("expected error for invalid table name, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("expected error to mention 'invalid', got %q", err.Error())
+	}
+}
+
+// TestScalarQuery_InvalidSelectColumn_ReturnsError verifies that an invalid
+// column name in Select sets buildErr which is surfaced by Get().
+func TestScalarQuery_InvalidSelectColumn_ReturnsError(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("id; DROP").
+		Get(ctx)
+
+	if err == nil {
+		t.Fatal("expected error for invalid column name, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("expected error to mention 'invalid', got %q", err.Error())
+	}
+}
+
+// TestScalarQuery_InvalidTable_CountReturnsError verifies that buildErr is
+// also surfaced by Count(), not just Get().
+func TestScalarQuery_InvalidTable_CountReturnsError(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users; DROP TABLE").
+		Select("name").
+		Count(ctx)
+
+	if err == nil {
+		t.Fatal("expected error for invalid table name on Count(), got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("expected error to mention 'invalid', got %q", err.Error())
+	}
+}
+
+// TestScalarQuery_BuildErrPreservedInClone verifies that buildErr is
+// propagated through Clone() so cloned queries also fail.
+func TestScalarQuery_BuildErrPreservedInClone(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	original := Query[string]().
+		SetDB(db).
+		Table("users; DROP TABLE").
+		Select("name")
+
+	clone := original.Clone()
+
+	_, err := clone.Get(ctx)
+	if err == nil {
+		t.Fatal("expected cloned query to preserve buildErr, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("expected error to mention 'invalid', got %q", err.Error())
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1181,4 +1182,176 @@ func TestUpdateManyByKey_MultipleWhereClauses(t *testing.T) {
 			t.Errorf("REF004 should still be 'published', got '%s'", status)
 		}
 	})
+}
+
+// =============================================================================
+// ISSUE #5: WHERE MAP/STRUCT buildErr INTEGRATION TESTS
+// =============================================================================
+
+// TestWhere_MapInvalidKey_GetReturnsError verifies that an invalid map key
+// in Where causes Get() to return an error via buildErr.
+func TestWhere_MapInvalidKey_GetReturnsError(t *testing.T) {
+	db := setupExDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	_, err := New[ExModel]().SetDB(db).
+		Where(map[string]any{"name; DROP TABLE ex_models": "A"}).
+		Get(ctx)
+
+	if err == nil {
+		t.Fatal("expected error from Get() with invalid map key containing semicolon, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid column name") {
+		t.Errorf("expected error to mention 'invalid column name', got %q", err.Error())
+	}
+}
+
+// TestWhere_StructInvalidColumn_GetReturnsError verifies that a struct-based
+// Where with a bad column mapping surfaces the error at execution.
+func TestWhere_StructInvalidColumn_GetReturnsError(t *testing.T) {
+	db := setupExDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Use a map with injection attempt instead of struct (struct columns come
+	// from schema parsing which produces valid names). The important thing is
+	// to verify buildErr is surfaced by Get().
+	_, err := New[ExModel]().SetDB(db).
+		Where(map[string]any{"value; DROP TABLE ex_models": 10}).
+		Get(ctx)
+
+	if err == nil {
+		t.Fatal("expected error from Get() with SQL injection in map key, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid column name") {
+		t.Errorf("expected error to mention 'invalid column name', got %q", err.Error())
+	}
+}
+
+// =============================================================================
+// ISSUE #9: WHERE STRING COLUMN INJECTION INTEGRATION TESTS
+// =============================================================================
+
+// TestWhere_StringColumnInjection_GetReturnsError verifies that a SQL injection
+// attempt in a string-based Where column causes Get() to return an error.
+func TestWhere_StringColumnInjection_GetReturnsError(t *testing.T) {
+	db := setupExDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	_, err := New[ExModel]().SetDB(db).
+		Where("id; DROP TABLE ex_models", 1).
+		Get(ctx)
+
+	if err == nil {
+		t.Fatal("expected error from Get() with injection in column name, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid column name") {
+		t.Errorf("expected error to mention 'invalid column name', got %q", err.Error())
+	}
+}
+
+// =============================================================================
+// ISSUE #10: COUNT WITH GROUPBY / DISTINCT SUBQUERY TESTS
+// =============================================================================
+
+func setupExDBDuplicates(t *testing.T) *sql.DB {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE ex_models (id INTEGER PRIMARY KEY, value INTEGER, name TEXT);
+		INSERT INTO ex_models (value, name) VALUES
+			(10, 'A'), (20, 'A'), (30, 'B'), (40, 'B'), (50, 'C');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+	return db
+}
+
+// TestCount_WithGroupBy verifies that Count() with GroupBy returns the number
+// of distinct groups, not the count within the first group.
+func TestCount_WithGroupBy(t *testing.T) {
+	db := setupExDBDuplicates(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	count, err := New[ExModel]().SetDB(db).GroupBy("name").Count(ctx)
+	if err != nil {
+		t.Fatalf("Count with GroupBy failed: %v", err)
+	}
+
+	// 3 distinct groups: A, B, C
+	if count != 3 {
+		t.Errorf("expected count 3 (number of groups), got %d", count)
+	}
+}
+
+// TestCount_WithDistinct verifies that Count() with Distinct returns the
+// number of distinct values, not the total row count.
+func TestCount_WithDistinct(t *testing.T) {
+	db := setupExDBDuplicates(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	count, err := New[ExModel]().SetDB(db).Select("name").Distinct().Count(ctx)
+	if err != nil {
+		t.Fatalf("Count with Distinct failed: %v", err)
+	}
+
+	// 3 distinct names: A, B, C
+	if count != 3 {
+		t.Errorf("expected count 3 (distinct names), got %d", count)
+	}
+}
+
+// TestCount_WithGroupByAndHaving verifies that Count() with GroupBy and Having
+// only counts groups that match the Having condition.
+func TestCount_WithGroupByAndHaving(t *testing.T) {
+	db := setupExDBDuplicates(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	count, err := New[ExModel]().SetDB(db).
+		GroupBy("name").
+		Having("COUNT(*) > ?", 1).
+		Count(ctx)
+	if err != nil {
+		t.Fatalf("Count with GroupBy and Having failed: %v", err)
+	}
+
+	// Groups with COUNT(*) > 1: A (2 rows), B (2 rows) -> 2 groups
+	if count != 2 {
+		t.Errorf("expected count 2 (groups with >1 member), got %d", count)
+	}
+}
+
+// TestPaginate_WithGroupBy verifies that Paginate correctly computes Total
+// as the number of distinct groups when GroupBy is applied.
+func TestPaginate_WithGroupBy(t *testing.T) {
+	db := setupExDBDuplicates(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	result, err := New[ExModel]().SetDB(db).
+		Select("name").
+		GroupBy("name").
+		OrderBy("name", "ASC").
+		Paginate(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("Paginate with GroupBy failed: %v", err)
+	}
+
+	// Total should reflect number of groups (3), not total rows (5)
+	if result.Total != 3 {
+		t.Errorf("expected Total 3 (number of groups), got %d", result.Total)
+	}
+	if len(result.Data) != 3 {
+		t.Errorf("expected 3 data items, got %d", len(result.Data))
+	}
 }

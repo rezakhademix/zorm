@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"runtime"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -1023,5 +1024,81 @@ func TestCursorWithTrackingScope(t *testing.T) {
 		if IsTracked(user) {
 			t.Error("Expected entity to not be tracked after scope close")
 		}
+	}
+}
+
+// =============================================================================
+// ISSUE #6: DIRTY TRACKING GC FINALIZER TESTS
+// =============================================================================
+
+// TestDirtyTracking_FinalizerCleansUp verifies that when a tracked entity goes
+// out of scope and is garbage collected, the runtime finalizer automatically
+// removes its tracking data. This prevents the ABA problem where a new entity
+// could reuse the same memory address and inherit stale tracking data.
+func TestDirtyTracking_FinalizerCleansUp(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	// Track an entity in a nested scope so it can be GC'd
+	var key uintptr
+	func() {
+		user := &DirtyUser{ID: 999, Name: "Temporary", Email: "temp@example.com"}
+		trackOriginals(user, modelInfo)
+		key = getEntityKey(user)
+
+		// Verify it's tracked
+		if _, ok := globalTracker.Load().Load(key); !ok {
+			t.Fatal("expected entity to be tracked before GC")
+		}
+	}()
+	// user is now out of scope
+
+	// Force garbage collection to trigger finalizer
+	runtime.GC()
+	runtime.GC() // Run twice for reliability
+
+	// The finalizer should have cleaned up the tracking entry
+	if _, ok := globalTracker.Load().Load(key); ok {
+		t.Error("expected tracking entry to be cleaned up after GC, but it still exists")
+	}
+}
+
+// TestDirtyTracking_FinalizerNotSetTwice verifies that calling syncOriginals
+// (which re-tracks an entity) does not panic from setting a finalizer twice.
+// The fix ensures finalizers are only set on first tracking.
+func TestDirtyTracking_FinalizerNotSetTwice(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	user := &DirtyUser{ID: 100, Name: "John", Email: "john@example.com"}
+
+	// First tracking — sets finalizer
+	trackOriginals(user, modelInfo)
+
+	// Verify tracked
+	if !IsTracked(user) {
+		t.Fatal("expected entity to be tracked after first trackOriginals")
+	}
+
+	// Second tracking (simulates syncOriginals after update) — should NOT panic
+	// from "runtime.SetFinalizer: finalizer already set"
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				t.Errorf("syncOriginals panicked: %v", r)
+			}
+		}()
+		syncOriginals(user, modelInfo)
+	}()
+
+	if panicked {
+		t.Fatal("syncOriginals should not panic when re-tracking an already-tracked entity")
+	}
+
+	// Verify still tracked with updated values
+	if !IsTracked(user) {
+		t.Error("expected entity to still be tracked after syncOriginals")
 	}
 }
