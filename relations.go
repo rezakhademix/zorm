@@ -368,21 +368,33 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 
 		relConfig := retVals[0].Interface()
 
+		// Extract callback constraints if WithCallback was used for this relation
+		var constraints *relationConstraints
+		if callback, ok := m.relationCallbacks[relName]; ok {
+			if rel, ok := relConfig.(Relation); ok {
+				db := m.db
+				if db == nil {
+					db = GetGlobalDB()
+				}
+				constraints = extractRelationConstraints(rel, callback, ctx, db)
+			}
+		}
+
 		// Dispatch based on type
 		if rel, ok := relConfig.(Relation); ok {
 			switch rel.RelationType() {
 			case RelationHasMany:
 				// Pass group.Subs to loadHasMany to handle recursion
-				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs, constraints); err != nil {
 					return err
 				}
 			case RelationHasOne:
 				// HasOne uses HasMany logic but assigns single value
-				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadHasMany(ctx, results, relConfig, relName, group.Cols, group.Subs, constraints); err != nil {
 					return err
 				}
 			case RelationBelongsTo:
-				if err := m.loadBelongsTo(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadBelongsTo(ctx, results, relConfig, relName, group.Cols, group.Subs, constraints); err != nil {
 					return err
 				}
 			case RelationMorphTo:
@@ -395,15 +407,15 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 					return err
 				}
 			case RelationMorphOne:
-				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, true); err != nil {
+				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, true, constraints); err != nil {
 					return err
 				}
 			case RelationMorphMany:
-				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, false); err != nil {
+				if err := m.loadMorphOneOrMany(ctx, results, relConfig, relName, group.Cols, group.Subs, false, constraints); err != nil {
 					return err
 				}
 			case RelationBelongsToMany:
-				if err := m.loadBelongsToMany(ctx, results, relConfig, relName, group.Cols, group.Subs); err != nil {
+				if err := m.loadBelongsToMany(ctx, results, relConfig, relName, group.Cols, group.Subs, constraints); err != nil {
 					return err
 				}
 			}
@@ -586,7 +598,7 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 	return nil
 }
 
-func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, constraints *relationConstraints) error {
 	// 1. Get IDs from results
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
@@ -636,7 +648,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	relTable := valConfig.FieldByName("Table").String()
 
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols, relTable)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols, relTable, constraints)
 	if err != nil {
 		return err
 	}
@@ -689,7 +701,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	return nil
 }
 
-func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, constraints *relationConstraints) error {
 	// 1. Get Relation Config
 	valConfig := reflect.ValueOf(relConfig)
 	if valConfig.Kind() == reflect.Ptr {
@@ -820,7 +832,7 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	// Extract Table Name if overriden
 	relTable := valConfig.FieldByName("Table").String()
 
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, constraints)
 	if err != nil {
 		return err
 	}
@@ -836,6 +848,9 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	// Map: RelatedID (string key) -> RelatedInstance
 	relatedIdxMap := make(map[string]reflect.Value, len(relatedResults))
 	joinKeyFieldInfo := relatedInfo.Columns[joinKey]
+	if joinKeyFieldInfo == nil {
+		return fmt.Errorf("join key column %s not found in related model", joinKey)
+	}
 	for _, res := range relatedResults {
 		val := reflect.ValueOf(res).Elem()
 		rID := val.FieldByIndex(joinKeyFieldInfo.Index).Interface()
@@ -881,7 +896,7 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	return nil
 }
 
-func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string) error {
+func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, constraints *relationConstraints) error {
 	// 1. Get FKs from results (Parent.ForeignKey)
 	valConfig := reflect.ValueOf(relConfig)
 	if valConfig.Kind() == reflect.Ptr {
@@ -974,7 +989,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	relTable := valConfig.FieldByName("Table").String()
 
 	// Use shared helper
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable, constraints)
 	if err != nil {
 		return err
 	}
@@ -1030,8 +1045,77 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	return nil
 }
 
+// relationConstraints holds additional query constraints extracted from a WithCallback callback.
+type relationConstraints struct {
+	wheres   []string
+	args     []any
+	orderBys []string
+	limit    int
+}
+
+// extractRelationConstraints creates a model for the related type, applies the callback,
+// and extracts the accumulated query constraints.
+func extractRelationConstraints(rel Relation, callback any, ctx context.Context, db *sql.DB) *relationConstraints {
+	if callback == nil {
+		return nil
+	}
+
+	relatedModel := rel.NewModel(ctx, db)
+	if relatedModel == nil {
+		return nil
+	}
+
+	// Apply callback via reflection
+	fnVal := reflect.ValueOf(callback)
+	if fnVal.Kind() != reflect.Func {
+		return nil
+	}
+	fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
+
+	// Extract constraints from the populated model
+	rc := &relationConstraints{}
+
+	// Extract wheres and args
+	if getWheres := reflect.ValueOf(relatedModel).MethodByName("GetWheres"); getWheres.IsValid() {
+		if result := getWheres.Call(nil); len(result) > 0 {
+			if wheres, ok := result[0].Interface().([]string); ok {
+				rc.wheres = wheres
+			}
+		}
+	}
+	if getArgs := reflect.ValueOf(relatedModel).MethodByName("GetArgs"); getArgs.IsValid() {
+		if result := getArgs.Call(nil); len(result) > 0 {
+			if args, ok := result[0].Interface().([]any); ok {
+				rc.args = args
+			}
+		}
+	}
+
+	// Extract orderBys and limit via exported getter methods
+	modelReflect := reflect.ValueOf(relatedModel)
+	if getOrderBys := modelReflect.MethodByName("GetOrderBys"); getOrderBys.IsValid() {
+		if result := getOrderBys.Call(nil); len(result) > 0 {
+			if obs, ok := result[0].Interface().([]string); ok {
+				rc.orderBys = obs
+			}
+		}
+	}
+	if getLimit := modelReflect.MethodByName("GetLimit"); getLimit.IsValid() {
+		if result := getLimit.Call(nil); len(result) > 0 {
+			rc.limit = int(result[0].Int())
+		}
+	}
+
+	return rc
+}
+
 // loadRelationQuery executes a SELECT * FROM table WHERE key IN (ids)
-func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string, tableName string) ([]any, error) {
+func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string, tableName string, constraints *relationConstraints) ([]any, error) {
+	// Validate column name to prevent SQL injection
+	if err := ValidateColumnName(key); err != nil {
+		return nil, fmt.Errorf("invalid relation key column: %w", err)
+	}
+
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	if cols != "" {
@@ -1054,6 +1138,24 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 	args := make([]any, len(ids))
 	copy(args, ids)
 
+	// Apply callback constraints
+	if constraints != nil {
+		for _, w := range constraints.wheres {
+			sb.WriteString(" ")
+			sb.WriteString(w)
+		}
+		args = append(args, constraints.args...)
+
+		if len(constraints.orderBys) > 0 {
+			sb.WriteString(" ORDER BY ")
+			sb.WriteString(strings.Join(constraints.orderBys, ", "))
+		}
+		if constraints.limit > 0 {
+			sb.WriteString(" LIMIT ")
+			sb.WriteString(strconv.Itoa(constraints.limit))
+		}
+	}
+
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
 		return nil, err
@@ -1063,7 +1165,7 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 	return m.scanRowsDynamic(rows, relatedInfo)
 }
 
-func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
+func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, isOne bool, constraints *relationConstraints) error {
 	// 1. Get IDs from results
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
@@ -1111,6 +1213,14 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 		return fmt.Errorf("MorphOne/MorphMany requires Type and ID columns")
 	}
 
+	// Validate column names to prevent SQL injection
+	if err := ValidateColumnName(typeColumn); err != nil {
+		return fmt.Errorf("invalid morph type column: %w", err)
+	}
+	if err := ValidateColumnName(idColumn); err != nil {
+		return fmt.Errorf("invalid morph id column: %w", err)
+	}
+
 	// Determine Morph Type Value (Parent Model Name)
 	// We use the struct name of T
 	parentType := m.modelInfo.Type.Name()
@@ -1142,6 +1252,24 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	args := make([]any, 0, len(ids)+1)
 	args = append(args, parentType)
 	args = append(args, ids...)
+
+	// Apply callback constraints
+	if constraints != nil {
+		for _, w := range constraints.wheres {
+			sb.WriteString(" ")
+			sb.WriteString(w)
+		}
+		args = append(args, constraints.args...)
+
+		if len(constraints.orderBys) > 0 {
+			sb.WriteString(" ORDER BY ")
+			sb.WriteString(strings.Join(constraints.orderBys, ", "))
+		}
+		if constraints.limit > 0 {
+			sb.WriteString(" LIMIT ")
+			sb.WriteString(strconv.Itoa(constraints.limit))
+		}
+	}
 
 	// Execute
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
@@ -1285,8 +1413,24 @@ func (m *Model[T]) loadRelationsDynamic(ctx context.Context, results []any, mode
 
 		if rel, ok := relConfig.(Relation); ok {
 			switch rel.RelationType() {
-			case RelationHasMany:
+			case RelationHasMany, RelationHasOne:
 				if err := m.loadHasManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationBelongsTo:
+				if err := m.loadBelongsToDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationBelongsToMany:
+				if err := m.loadBelongsToManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
+					return err
+				}
+			case RelationMorphOne:
+				if err := m.loadMorphOneOrManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs, true); err != nil {
+					return err
+				}
+			case RelationMorphMany:
+				if err := m.loadMorphOneOrManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs, false); err != nil {
 					return err
 				}
 			}
@@ -1387,6 +1531,441 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 					}
 				}
 				relField.Set(slice)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
+	modelInfo := ParseModelType(modelType)
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	ownerKey := valConfig.FieldByName("OwnerKey").String()
+
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(relName) + "_id"
+	}
+
+	// Collect FK values from parent results
+	fks := make([]any, 0, len(results))
+	fkMap := make(map[string][]int, len(results))
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+
+		var fieldName string
+		if field, ok := modelInfo.Columns[foreignKey]; ok {
+			fieldName = field.Name
+		} else {
+			parts := strings.Split(foreignKey, "_")
+			for j, p := range parts {
+				if p == "id" {
+					parts[j] = "ID"
+				} else if len(p) > 0 {
+					parts[j] = strings.ToUpper(p[:1]) + p[1:]
+				}
+			}
+			fieldName = strings.Join(parts, "")
+		}
+
+		fieldVal := val.FieldByName(fieldName)
+		if !fieldVal.IsValid() {
+			continue
+		}
+
+		var fkVal any
+		if fieldVal.Kind() == reflect.Pointer {
+			if fieldVal.IsNil() {
+				continue
+			}
+			fkVal = fieldVal.Elem().Interface()
+		} else {
+			fkVal = fieldVal.Interface()
+		}
+
+		if isZero(fkVal) {
+			continue
+		}
+
+		fkKey := anyToKeyString(fkVal)
+		if _, exists := fkMap[fkKey]; exists {
+			fkMap[fkKey] = append(fkMap[fkKey], i)
+		} else {
+			fks = append(fks, fkVal)
+			fkMap[fkKey] = []int{i}
+		}
+	}
+
+	if len(fks) == 0 {
+		return nil
+	}
+
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("loadBelongsToDynamic: expected Relation interface, got %T", relConfig)
+	}
+
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	if ownerKey == "" {
+		ownerKey = relatedInfo.PrimaryKey
+	}
+
+	relTable := valConfig.FieldByName("Table").String()
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable, nil)
+	if err != nil {
+		return err
+	}
+
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	relatedByPK := make(map[string]reflect.Value, len(relatedResults))
+	ownerKeyFieldInfo, hasOwnerKeyField := relatedInfo.Columns[ownerKey]
+
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		var resPK any
+		if hasOwnerKeyField {
+			resPK = val.FieldByIndex(ownerKeyFieldInfo.Index).Interface()
+		} else {
+			resPK = val.FieldByName("ID").Interface()
+		}
+		pkKey := anyToKeyString(resPK)
+		relatedByPK[pkKey] = reflect.ValueOf(res)
+	}
+
+	for fkKey, indices := range fkMap {
+		relatedRecord, found := relatedByPK[fkKey]
+		if !found || !relatedRecord.IsValid() {
+			continue
+		}
+		for _, idx := range indices {
+			parent := results[idx]
+			parentVal := reflect.ValueOf(parent).Elem()
+			relField := modelInfo.GetRelationField(parentVal, relName)
+			if relField.IsValid() && relField.CanSet() {
+				if relField.Kind() == reflect.Pointer {
+					relField.Set(relatedRecord)
+				} else {
+					relField.Set(relatedRecord.Elem())
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
+	modelInfo := ParseModelType(modelType)
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
+
+	pivotTable := valConfig.FieldByName("PivotTable").String()
+	foreignKey := valConfig.FieldByName("ForeignKey").String()
+	relatedKey := valConfig.FieldByName("RelatedKey").String()
+	localKey := valConfig.FieldByName("LocalKey").String()
+	relatedPK := valConfig.FieldByName("RelatedPK").String()
+
+	if pivotTable == "" {
+		return fmt.Errorf("BelongsToMany requires PivotTable")
+	}
+
+	// Get IDs from results
+	ids := make([]any, len(results))
+	pkField := modelInfo.PrimaryKey
+
+	localKeyField := pkField
+	if localKey != "" {
+		if field, ok := modelInfo.Columns[localKey]; ok {
+			localKeyField = field.Name
+		} else {
+			localKeyField = localKey
+		}
+	} else {
+		if field, ok := modelInfo.Columns[pkField]; ok {
+			localKeyField = field.Name
+		}
+	}
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		fVal := val.FieldByName(localKeyField)
+		if fVal.IsValid() {
+			ids[i] = fVal.Interface()
+		} else {
+			ids[i] = nil
+		}
+	}
+
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(modelType.Name()) + "_id"
+	}
+	if relatedKey == "" {
+		rel, ok := relConfig.(Relation)
+		if !ok {
+			return fmt.Errorf("BelongsToMany: expected Relation interface, got %T", relConfig)
+		}
+		relatedPtr := rel.NewRelated()
+		relatedType := reflect.TypeOf(relatedPtr).Elem()
+		relatedKey = ToSnakeCase(relatedType.Name()) + "_id"
+	}
+
+	// Query Pivot Table
+	var pivotSb strings.Builder
+	pivotSb.WriteString("SELECT ")
+	pivotSb.WriteString(foreignKey)
+	pivotSb.WriteString(", ")
+	pivotSb.WriteString(relatedKey)
+	pivotSb.WriteString(" FROM ")
+	pivotSb.WriteString(pivotTable)
+	pivotSb.WriteString(" WHERE ")
+	pivotSb.WriteString(foreignKey)
+	pivotSb.WriteString(" IN (")
+	writePlaceholders(&pivotSb, len(ids))
+	pivotSb.WriteString(")")
+
+	args := make([]any, len(ids))
+	copy(args, ids)
+
+	rows, err := m.queryer().QueryContext(ctx, rebind(pivotSb.String()), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	pivotMap := make(map[string][]string, len(results))
+	allRelatedIDs := make([]any, 0, len(results))
+	relatedIDSet := make(map[string]bool, len(results))
+
+	for rows.Next() {
+		var fID, rID any
+		if err := rows.Scan(&fID, &rID); err != nil {
+			return err
+		}
+		fKey := anyToKeyString(fID)
+		rKey := anyToKeyString(rID)
+		pivotMap[fKey] = append(pivotMap[fKey], rKey)
+		if !relatedIDSet[rKey] {
+			relatedIDSet[rKey] = true
+			allRelatedIDs = append(allRelatedIDs, rID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(allRelatedIDs) == 0 {
+		return nil
+	}
+
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("BelongsToMany: expected Relation interface, got %T", relConfig)
+	}
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	joinKey := relatedPK
+	if joinKey == "" {
+		joinKey = relatedInfo.PrimaryKey
+	}
+
+	relTable := valConfig.FieldByName("Table").String()
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, nil)
+	if err != nil {
+		return err
+	}
+
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	relatedIdxMap := make(map[string]reflect.Value, len(relatedResults))
+	joinKeyFieldInfo := relatedInfo.Columns[joinKey]
+	if joinKeyFieldInfo == nil {
+		return fmt.Errorf("join key column %s not found in related model", joinKey)
+	}
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		rID := val.FieldByIndex(joinKeyFieldInfo.Index).Interface()
+		rKey := anyToKeyString(rID)
+		relatedIdxMap[rKey] = reflect.ValueOf(res)
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+		parentKey := anyToKeyString(parentID)
+
+		rIDs, found := pivotMap[parentKey]
+		if !found {
+			continue
+		}
+
+		children := make([]reflect.Value, 0, len(rIDs))
+		for _, rKey := range rIDs {
+			if child, ok := relatedIdxMap[rKey]; ok {
+				children = append(children, child)
+			}
+		}
+
+		if len(children) > 0 {
+			relField := modelInfo.GetRelationField(parentVal, relName)
+			if relField.IsValid() && relField.CanSet() {
+				sliceType := relField.Type()
+				slice := reflect.MakeSlice(sliceType, 0, len(children))
+				for _, child := range children {
+					if sliceType.Elem().Kind() == reflect.Pointer {
+						slice = reflect.Append(slice, child)
+					} else {
+						slice = reflect.Append(slice, child.Elem())
+					}
+				}
+				relField.Set(slice)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string, isOne bool) error {
+	modelInfo := ParseModelType(modelType)
+
+	ids := make([]any, len(results))
+	pkField := modelInfo.PrimaryKey
+
+	for i, res := range results {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := modelInfo.Columns[pkField]; ok {
+			ids[i] = val.FieldByIndex(field.Index).Interface()
+		} else {
+			ids[i] = val.FieldByName("ID").Interface()
+		}
+	}
+
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("loadMorphOneOrManyDynamic: expected Relation interface, got %T", relConfig)
+	}
+
+	relatedPtr := rel.NewRelated()
+	relatedType := reflect.TypeOf(relatedPtr).Elem()
+	relatedInfo := ParseModelType(relatedType)
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
+	typeColumn := valConfig.FieldByName("Type").String()
+	idColumn := valConfig.FieldByName("ID").String()
+
+	if typeColumn == "" || idColumn == "" {
+		return fmt.Errorf("MorphOne/MorphMany requires Type and ID columns")
+	}
+
+	parentType := modelType.Name()
+
+	relTable := valConfig.FieldByName("Table").String()
+	tableName := relatedInfo.TableName
+	if relTable != "" {
+		tableName = relTable
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	if cols != "" {
+		sb.WriteString(cols)
+	} else {
+		sb.WriteString("*")
+	}
+	sb.WriteString(" FROM ")
+	sb.WriteString(tableName)
+	sb.WriteString(" WHERE ")
+	sb.WriteString(typeColumn)
+	sb.WriteString(" = ? AND ")
+	sb.WriteString(idColumn)
+	sb.WriteString(" IN (")
+	writePlaceholders(&sb, len(ids))
+	sb.WriteString(")")
+
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, parentType)
+	args = append(args, ids...)
+
+	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	if err != nil {
+		return err
+	}
+
+	if len(subRelations) > 0 && len(relatedResults) > 0 {
+		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+			return err
+		}
+	}
+
+	relatedMap := make(map[any][]reflect.Value, len(relatedResults))
+	for _, res := range relatedResults {
+		val := reflect.ValueOf(res).Elem()
+		if field, ok := relatedInfo.Columns[idColumn]; ok {
+			fkVal := val.FieldByIndex(field.Index).Interface()
+			relatedMap[fkVal] = append(relatedMap[fkVal], reflect.ValueOf(res))
+		}
+	}
+
+	for i, parent := range results {
+		parentVal := reflect.ValueOf(parent).Elem()
+		parentID := ids[i]
+
+		if children, ok := relatedMap[parentID]; ok {
+			relField := modelInfo.GetRelationField(parentVal, relName)
+			if relField.IsValid() && relField.CanSet() {
+				if isOne {
+					if len(children) > 0 {
+						child := children[0]
+						if relField.Kind() == reflect.Ptr {
+							relField.Set(child)
+						} else {
+							relField.Set(child.Elem())
+						}
+					}
+				} else {
+					sliceType := relField.Type()
+					slice := reflect.MakeSlice(sliceType, 0, len(children))
+					for _, child := range children {
+						if sliceType.Elem().Kind() == reflect.Ptr {
+							slice = reflect.Append(slice, child)
+						} else {
+							slice = reflect.Append(slice, child.Elem())
+						}
+					}
+					relField.Set(slice)
+				}
 			}
 		}
 	}

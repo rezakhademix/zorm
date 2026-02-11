@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -31,6 +32,7 @@ type ScalarQuery[T any] struct {
 	distinct  bool
 	limit     int
 	offset    int
+	buildErr  error // Accumulated validation errors surfaced at execution time
 }
 
 // Query creates a new scalar query builder for type T.
@@ -46,6 +48,7 @@ func Query[T any]() *ScalarQuery[T] {
 // Table names are validated to prevent SQL injection.
 func (q *ScalarQuery[T]) Table(name string) *ScalarQuery[T] {
 	if err := ValidateColumnName(name); err != nil {
+		q.buildErr = fmt.Errorf("ScalarQuery.Table: invalid table name %q: %w", name, err)
 		return q
 	}
 	q.tableName = name
@@ -55,6 +58,7 @@ func (q *ScalarQuery[T]) Table(name string) *ScalarQuery[T] {
 // Select sets the column to select (single column only).
 func (q *ScalarQuery[T]) Select(column string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("ScalarQuery.Select: invalid column name %q: %w", column, err)
 		return q
 	}
 	q.column = column
@@ -252,6 +256,9 @@ func (q *ScalarQuery[T]) WithTx(tx *Tx) *ScalarQuery[T] {
 
 // Get executes the query and returns all matching values.
 func (q *ScalarQuery[T]) Get(ctx context.Context) ([]T, error) {
+	if q.buildErr != nil {
+		return nil, q.buildErr
+	}
 	query := q.buildQuery()
 
 	rows, err := q.queryer().QueryContext(ctx, rebind(query), q.args...)
@@ -303,6 +310,9 @@ func (q *ScalarQuery[T]) First(ctx context.Context) (T, error) {
 // Count returns the count of matching rows.
 // This ignores the Select column and uses COUNT(*).
 func (q *ScalarQuery[T]) Count(ctx context.Context) (int64, error) {
+	if q.buildErr != nil {
+		return 0, q.buildErr
+	}
 	sb := GetStringBuilder()
 	defer PutStringBuilder(sb)
 
@@ -394,6 +404,7 @@ func (q *ScalarQuery[T]) Clone() *ScalarQuery[T] {
 		distinct:  q.distinct,
 		limit:     q.limit,
 		offset:    q.offset,
+		buildErr:  q.buildErr,
 	}
 
 	// Copy slices

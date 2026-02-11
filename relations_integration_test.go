@@ -912,7 +912,7 @@ func TestWith_ColsOnRootRelation(t *testing.T) {
 	})
 }
 
-// ==================== Test 3: WithCallback Not Applied — DOCUMENTS DEAD CODE ====================
+// ==================== Test 3: WithCallback Applied — Verifies Callback Filtering ====================
 
 func TestWithCallback_NotApplied(t *testing.T) {
 	db := setupRelDB(t)
@@ -924,8 +924,8 @@ func TestWithCallback_NotApplied(t *testing.T) {
 
 	ctx := context.Background()
 
-	// WithCallback stores the callback in relationCallbacks but loadRelations
-	// never reads it. Therefore the filter is NOT applied.
+	// WithCallback stores the callback in relationCallbacks and loadRelations
+	// applies it to filter the relation query.
 	users, err := New[RelUser]().WithCallback("Posts", func(q *Model[RelPost]) {
 		q.Where("title", "=", "Post 1")
 	}).Get(ctx)
@@ -944,9 +944,12 @@ func TestWithCallback_NotApplied(t *testing.T) {
 		t.Fatal("Alice not found")
 	}
 
-	// Callback is NOT applied (dead code), so Alice should have all 2 posts
-	if len(alice.Posts) != 2 {
-		t.Errorf("expected 2 posts (callback not applied), got %d", len(alice.Posts))
+	// Callback IS applied, so Alice should have only 1 post matching "Post 1"
+	if len(alice.Posts) != 1 {
+		t.Errorf("expected 1 post (callback applied filtering to 'Post 1'), got %d", len(alice.Posts))
+	}
+	if len(alice.Posts) == 1 && alice.Posts[0].Title != "Post 1" {
+		t.Errorf("expected post title 'Post 1', got %q", alice.Posts[0].Title)
 	}
 }
 
@@ -981,7 +984,7 @@ func TestWithMorph_TypeMapIntegration(t *testing.T) {
 	}
 }
 
-// ==================== Test 5: Nested BelongsTo Silently Skipped — EXPOSES BUG ====================
+// ==================== Test 5: Nested BelongsTo Loaded — Verifies Dynamic Loader ====================
 
 func TestNested_BelongsToSilentlySkipped(t *testing.T) {
 	db := setupRelDBMorphTo(t)
@@ -1013,11 +1016,10 @@ func TestNested_BelongsToSilentlySkipped(t *testing.T) {
 		t.Fatal("expected Alice to have posts")
 	}
 
-	// Nested BelongsTo is silently skipped by loadRelationsDynamic because
-	// it only handles RelationHasMany (line 1252-1258 of relations.go).
+	// Nested BelongsTo is now correctly loaded by loadRelationsDynamic.
 	for _, p := range alice.Posts {
-		if p.User != nil {
-			t.Errorf("post %d: expected User to be nil (nested BelongsTo silently skipped), got %+v", p.ID, p.User)
+		if p.User == nil {
+			t.Errorf("post %d: expected User to be loaded (nested BelongsTo), got nil", p.ID)
 		}
 	}
 }

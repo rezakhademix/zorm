@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"maps"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -400,9 +401,9 @@ func getEntityKey[T any](entity *T) uintptr {
 // trackOriginals stores the current field values of an entity as originals.
 // Called automatically by Get, First, Find when loading from database.
 //
-// Note: This uses the entity's pointer address as a key. If the entity is
-// garbage collected and another entity reuses the same address, tracking
-// data may become stale. Always call ClearOriginals when done with an entity.
+// A runtime finalizer is set on the entity so that when it is garbage collected,
+// its tracking data is automatically cleaned up. This prevents the ABA problem
+// where a new entity could reuse the same memory address and inherit stale data.
 func trackOriginals[T any](entity *T, modelInfo *ModelInfo) {
 	trackOriginalsWithScope(entity, modelInfo, nil)
 }
@@ -422,7 +423,19 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 	}
 
 	key := getEntityKey(entity)
-	globalTracker.Load().Store(key, originals)
+	tracker := globalTracker.Load()
+
+	// Only set a finalizer on first tracking (not on subsequent updates like syncOriginals).
+	// This prevents the ABA problem where a new allocation reuses the same
+	// memory address and inherits stale tracking data from a previous entity.
+	_, alreadyTracked := tracker.Load(key)
+	tracker.Store(key, originals)
+
+	if !alreadyTracked {
+		runtime.SetFinalizer(entity, func(e *T) {
+			globalTracker.Load().Delete(reflect.ValueOf(e).Pointer())
+		})
+	}
 
 	// Register with scope if provided
 	if scope != nil {

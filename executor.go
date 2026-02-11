@@ -162,6 +162,9 @@ func (m *Model[T]) prepareStmtForWrite(ctx context.Context, query string) (*sql.
 
 // Get executes the query and returns a slice of results.
 func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
+	if m.buildErr != nil {
+		return nil, m.buildErr
+	}
 	query, args := m.buildSelectQuery()
 
 	var rows *sql.Rows
@@ -270,7 +273,12 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 
 // Count returns the number of records matching the query.
 // This method is safe for concurrent use - it clones the model before modification.
+// When the query includes GROUP BY, DISTINCT, or DISTINCT ON, the count is wrapped
+// in a subquery to return the correct total number of rows.
 func (m *Model[T]) Count(ctx context.Context) (int64, error) {
+	if m.buildErr != nil {
+		return 0, m.buildErr
+	}
 	// Clone to avoid mutating shared state (thread-safe)
 	q := m.Clone()
 	q.limit, q.offset = 0, 0
@@ -280,10 +288,42 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	var sb strings.Builder
 	cteArgs := q.buildWithClause(&sb)
 
-	sb.WriteString("SELECT COUNT(*) FROM ")
-	sb.WriteString(tableName)
+	// When GROUP BY, DISTINCT, or DISTINCT ON is present, a simple COUNT(*)
+	// returns per-group counts (or is redundant for DISTINCT). Wrap the inner
+	// query in a subquery to get the correct total row count.
+	needsSubquery := len(q.groupBys) > 0 || q.distinct || len(q.distinctOn) > 0
 
-	q.buildWhereClause(&sb)
+	if needsSubquery {
+		sb.WriteString("SELECT COUNT(*) FROM (SELECT ")
+
+		if len(q.distinctOn) > 0 {
+			sb.WriteString("DISTINCT ON (")
+			sb.WriteString(strings.Join(q.distinctOn, ", "))
+			sb.WriteString(") ")
+		} else if q.distinct {
+			sb.WriteString("DISTINCT ")
+		}
+
+		sb.WriteString("1 FROM ")
+		sb.WriteString(tableName)
+		q.buildWhereClause(&sb)
+
+		if len(q.groupBys) > 0 {
+			sb.WriteString(" GROUP BY ")
+			sb.WriteString(strings.Join(q.groupBys, ", "))
+		}
+
+		if len(q.havings) > 0 {
+			sb.WriteString(" HAVING ")
+			sb.WriteString(strings.Join(q.havings, " AND "))
+		}
+
+		sb.WriteString(") AS _count_subquery")
+	} else {
+		sb.WriteString("SELECT COUNT(*) FROM ")
+		sb.WriteString(tableName)
+		q.buildWhereClause(&sb)
+	}
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
@@ -1369,6 +1409,9 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 // Delete deletes records matching the current query conditions.
 // WARNING: Without WHERE conditions, this will delete ALL records in the table.
 func (m *Model[T]) Delete(ctx context.Context) error {
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	var sb strings.Builder
 	cteArgs := m.buildWithClause(&sb)
 

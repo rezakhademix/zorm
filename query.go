@@ -175,7 +175,8 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	if conditionMap, ok := query.(map[string]any); ok {
 		for k, v := range conditionMap {
 			if err := ValidateColumnName(k); err != nil {
-				continue
+				m.buildErr = fmt.Errorf("Where map: invalid column name %q: %w", k, err)
+				return m
 			}
 			m.wheres = append(m.wheres, typ+" "+k+" = ?")
 			m.args = append(m.args, v)
@@ -200,7 +201,8 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 			fVal := val.FieldByName(field.Name)
 			if !fVal.IsZero() {
 				if err := ValidateColumnName(field.Column); err != nil {
-					continue
+					m.buildErr = fmt.Errorf("Where struct: invalid column name %q: %w", field.Column, err)
+					return m
 				}
 				m.wheres = append(m.wheres, typ+" "+field.Column+" = ?")
 				m.args = append(m.args, val.FieldByIndex(field.Index).Interface())
@@ -228,6 +230,14 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 			}
 			if operators[op] {
 				hasOperator = true
+			}
+		}
+
+		// Validate the column name portion (first word) to prevent SQL injection
+		if len(parts) > 0 {
+			if err := ValidateColumnName(parts[0]); err != nil {
+				m.buildErr = fmt.Errorf("Where: invalid column name %q: %w", parts[0], err)
+				return m
 			}
 		}
 
@@ -831,6 +841,16 @@ func (m *Model[T]) GetWheres() []string {
 // GetArgs returns the arguments.
 func (m *Model[T]) GetArgs() []any {
 	return m.args
+}
+
+// GetOrderBys returns the order by clauses.
+func (m *Model[T]) GetOrderBys() []string {
+	return m.orderBys
+}
+
+// GetLimit returns the limit value.
+func (m *Model[T]) GetLimit() int {
+	return m.limit
 }
 
 // With adds relations to eager load.

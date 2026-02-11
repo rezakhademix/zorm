@@ -128,6 +128,10 @@ type Model[T any] struct {
 
 	// Tracking scope for batch operations with automatic cleanup
 	trackingScope *TrackingScope
+
+	// buildErr accumulates errors from query builder methods (e.g., invalid column names)
+	// that are surfaced at execution time (Get, First, Count, etc.)
+	buildErr error
 }
 
 // CTE represents a Common Table Expression.
@@ -271,6 +275,7 @@ func (m *Model[T]) reset() {
 
 	m.omitColumns = nil
 	m.trackingScope = nil
+	m.buildErr = nil
 }
 
 // Clone creates a deep copy of the Model.
@@ -311,6 +316,7 @@ func (m *Model[T]) Clone() *Model[T] {
 		lockMode:     m.lockMode,
 		forcePrimary: m.forcePrimary,
 		forceReplica: m.forceReplica,
+		buildErr:     m.buildErr,
 	}
 
 	// Copy slices
