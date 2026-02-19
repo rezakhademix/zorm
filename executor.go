@@ -88,39 +88,21 @@ func (m *Model[T]) queryerForWrite() interface {
 	return GetGlobalDB()
 }
 
-// prepareStmtWithQueryer is the internal implementation for statement preparation.
+// prepareStmtWithQueryer prepares a statement using the cache.
+// Callers must only invoke this when m.stmtCache != nil.
 // It takes a queryer interface to allow reuse between read and write operations.
 func (m *Model[T]) prepareStmtWithQueryer(ctx context.Context, query string, q interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }) (*sql.Stmt, func(), error) {
-	// If caching is not enabled, prepare directly
-	if m.stmtCache == nil {
-		var stmt *sql.Stmt
-		var err error
-		// We need the underlying *sql.DB or *sql.Tx to prepare
-		if db, ok := q.(*sql.DB); ok {
-			stmt, err = db.PrepareContext(ctx, query)
-		} else if tx, ok := q.(*sql.Tx); ok {
-			stmt, err = tx.PrepareContext(ctx, query)
-		} else {
-			return nil, nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
-		}
-
-		if err != nil {
-			return nil, nil, err
-		}
-		// Return a release function that closes the statement
-		return stmt, func() { stmt.Close() }, nil
-	}
-
 	// Try to get from cache
 	if stmt, release := m.stmtCache.Get(query); stmt != nil {
 		return stmt, release, nil
 	}
 
-	// Not in cache, prepare it
+	// Not in cache — prepare and store atomically to avoid a race between
+	// a concurrent Put and the subsequent Get.
 	var stmt *sql.Stmt
 	var err error
 
@@ -136,8 +118,8 @@ func (m *Model[T]) prepareStmtWithQueryer(ctx context.Context, query string, q i
 		return nil, nil, err
 	}
 
-	// Store in cache and get with incremented ref count atomically
-	// This avoids race conditions where the statement could be evicted between Put and Get
+	// PutAndGet atomically stores and returns the statement with an incremented
+	// ref count, preventing eviction between Put and Get.
 	cachedStmt, release := m.stmtCache.PutAndGet(query, stmt)
 	return cachedStmt, release, nil
 }
@@ -444,7 +426,7 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = q.prepareStmt(ctx, query)
+		stmt, release, err = q.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -500,7 +482,7 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	if q.stmtCache != nil {
 		var stmt *sql.Stmt
 		var release func()
-		stmt, release, err = q.prepareStmt(ctx, query)
+		stmt, release, err = q.prepareStmt(ctx, rebind(query))
 		if err != nil {
 			return 0, WrapQueryError("PREPARE", query, args, err)
 		}
@@ -862,7 +844,15 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 
 // Cursor returns a cursor for iterating over results one by one.
 // Useful for large datasets to avoid loading everything into memory.
+//
+// Relation loading (With, WithCallback, WithMorph) is not supported with Cursor
+// because it requires all rows to be available for batch loading. Use Get() instead
+// when relation loading is needed.
 func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
+	if len(m.relations) > 0 || len(m.relationCallbacks) > 0 || len(m.morphRelations) > 0 {
+		return nil, fmt.Errorf("zorm: Cursor does not support eager relation loading (With/WithCallback/WithMorph); use Get() instead")
+	}
+
 	query, args := m.buildSelectQuery()
 	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
@@ -921,13 +911,6 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 
 	// Load Accessors (using single-entity version to avoid slice allocation)
 	c.model.loadAccessorsSingle(entity)
-
-	// Load Relations if any are configured
-	if len(c.model.relations) > 0 {
-		if err := c.model.loadRelations(ctx, []*T{entity}); err != nil {
-			return nil, err
-		}
-	}
 
 	return entity, nil
 }
@@ -1412,11 +1395,36 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 }
 
 // Delete deletes records matching the current query conditions.
-// WARNING: Without WHERE conditions, this will delete ALL records in the table.
+// At least one WHERE condition is required to prevent accidental full-table deletes.
+// To intentionally delete all records use ForceDeleteAll().
 func (m *Model[T]) Delete(ctx context.Context) error {
 	if m.buildErr != nil {
 		return m.buildErr
 	}
+	if len(m.wheres) == 0 && m.rawQuery == "" {
+		return fmt.Errorf("zorm: %w: Delete requires at least one WHERE condition to prevent accidental full-table deletes; use ForceDeleteAll() to delete all records", ErrInvalidModel)
+	}
+	return m.execDelete(ctx)
+}
+
+// DeleteMany deletes records matching the current query conditions.
+// Alias for Delete(). At least one WHERE condition is required.
+// To intentionally delete all records use ForceDeleteAll().
+func (m *Model[T]) DeleteMany(ctx context.Context) error {
+	return m.Delete(ctx)
+}
+
+// ForceDeleteAll deletes ALL records in the table without any WHERE conditions.
+// Use this only when a full-table delete is intentional.
+func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
+	if m.buildErr != nil {
+		return m.buildErr
+	}
+	return m.execDelete(ctx)
+}
+
+// execDelete is the shared implementation for Delete and ForceDeleteAll.
+func (m *Model[T]) execDelete(ctx context.Context) error {
 	var sb strings.Builder
 	cteArgs := m.buildWithClause(&sb)
 
@@ -1471,18 +1479,37 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	columns := make([]string, 0, numFields)
 
 	// We need to identify which columns to insert.
-	// We skip AutoIncrement PK if zero.
+	// We skip the auto-increment PK only when NO entity in the batch has it set.
+	// Checking only entities[0] would silently produce wrong results when later
+	// entities have a non-zero PK (or vice versa).
+
+	// Find the auto PK field (if any) to decide whether to include it.
+	var autoPKField *FieldInfo
+	for _, field := range m.modelInfo.Fields {
+		if field.IsPrimary && field.IsAuto {
+			autoPKField = field
+			break
+		}
+	}
+
+	// Include the auto PK column only if at least one entity has it set.
+	includeAutoPK := false
+	if autoPKField != nil {
+		for _, entity := range entities {
+			val := reflect.ValueOf(entity).Elem()
+			if !val.FieldByIndex(autoPKField.Index).IsZero() {
+				includeAutoPK = true
+				break
+			}
+		}
+	}
 
 	// Prepare columns list
 	fieldsToInsert := make([][]int, 0, numFields) // Field indices in struct
 
-	val0 := reflect.ValueOf(entities[0]).Elem()
 	for _, field := range m.modelInfo.Fields {
-		fVal := val0.FieldByIndex(field.Index)
-		if field.IsPrimary && field.IsAuto {
-			if fVal.IsZero() {
-				continue
-			}
+		if field.IsPrimary && field.IsAuto && !includeAutoPK {
+			continue
 		}
 		columns = append(columns, field.Column)
 		fieldsToInsert = append(fieldsToInsert, field.Index)
@@ -1629,6 +1656,11 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 		return nil
 	}
 
+	// Copy the map to avoid mutating the caller's map when we inject updated_at.
+	valuesCopy := make(map[string]any, len(values)+1)
+	maps.Copy(valuesCopy, values)
+	values = valuesCopy
+
 	// Auto-update updated_at if it exists and not provided
 	if _, ok := m.modelInfo.Columns["updated_at"]; ok {
 		if _, exists := values["updated_at"]; !exists {
@@ -1676,10 +1708,6 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	return nil
 }
 
-// DeleteMany deletes records matching the query.
-func (m *Model[T]) DeleteMany(ctx context.Context) error {
-	return m.Delete(ctx)
-}
 
 // UpdateManyByKey updates multiple records by matching a lookup column to values in a map.
 // Each map key is matched against lookupColumn, and the corresponding map value

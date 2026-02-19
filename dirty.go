@@ -4,7 +4,6 @@ import (
 	"container/list"
 	"maps"
 	"reflect"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -400,15 +399,18 @@ func getEntityKey[T any](entity *T) uintptr {
 
 // trackOriginals stores the current field values of an entity as originals.
 // Called automatically by Get, First, Find when loading from database.
-//
-// A runtime finalizer is set on the entity so that when it is garbage collected,
-// its tracking data is automatically cleaned up. This prevents the ABA problem
-// where a new entity could reuse the same memory address and inherit stale data.
+// Tracking data is bounded by the LRU capacity (default 10,000 entities).
 func trackOriginals[T any](entity *T, modelInfo *ModelInfo) {
 	trackOriginalsWithScope(entity, modelInfo, nil)
 }
 
 // trackOriginalsWithScope stores originals and optionally registers with a scope.
+//
+// Memory management: The LRU tracker is capacity-bounded (default 10,000 entries)
+// and evicts the least-recently-used entry when full. For long-running services
+// that process more entities than the capacity, callers should use TrackingScope
+// (defer scope.Close()) or call ClearOriginals(entity) explicitly when the entity
+// is no longer needed.
 func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *TrackingScope) {
 	if entity == nil {
 		return
@@ -424,18 +426,7 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 
 	key := getEntityKey(entity)
 	tracker := globalTracker.Load()
-
-	// Only set a finalizer on first tracking (not on subsequent updates like syncOriginals).
-	// This prevents the ABA problem where a new allocation reuses the same
-	// memory address and inherits stale tracking data from a previous entity.
-	_, alreadyTracked := tracker.Load(key)
 	tracker.Store(key, originals)
-
-	if !alreadyTracked {
-		runtime.SetFinalizer(entity, func(e *T) {
-			globalTracker.Load().Delete(reflect.ValueOf(e).Pointer())
-		})
-	}
 
 	// Register with scope if provided
 	if scope != nil {

@@ -48,12 +48,13 @@ var validLockModes = map[string]bool{
 
 // Select specifies which columns to select.
 // Column names are validated to prevent SQL injection.
+// Returns the model with buildErr set if any column name is invalid; the error
+// is surfaced when a terminal method (Get, First, etc.) is called.
 func (m *Model[T]) Select(columns ...string) *Model[T] {
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			// In strict mode, we could return an error
-			// For now, skip invalid columns to maintain API compatibility
-			continue
+			m.buildErr = fmt.Errorf("zorm: Select: invalid column %q: %w", col, err)
+			return m
 		}
 		m.columns = append(m.columns, col)
 	}
@@ -74,7 +75,8 @@ func (m *Model[T]) Distinct() *Model[T] {
 func (m *Model[T]) DistinctBy(columns ...string) *Model[T] {
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			continue // Skip invalid column names
+			m.buildErr = fmt.Errorf("zorm: DistinctBy: invalid column %q: %w", col, err)
+			return m
 		}
 		m.distinctOn = append(m.distinctOn, col)
 	}
@@ -124,7 +126,7 @@ func (m *Model[T]) Where(query any, args ...any) *Model[T] {
 
 		// Validate operator to prevent SQL injection
 		if !isValidOperator(operator) {
-			// Invalid operator, return without adding the where clause
+			m.buildErr = fmt.Errorf("zorm: Where: invalid operator %q; use one of =, >, <, >=, <=, <>, !=, LIKE, ILIKE, IS, IS NOT, IN, NOT IN, BETWEEN", operator)
 			return m
 		}
 
@@ -246,11 +248,32 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		} else {
 			queryStr = trimmed + " = ?"
 		}
+	} else if len(args) == 0 {
+		// Raw string with no args: check for the most dangerous injection patterns.
+		// SQL comments and multi-statement separators are blocked.
+		// Subqueries (SELECT, EXISTS) and expressions are allowed for legitimate use.
+		if err := validateWhereRawString(queryStr); err != nil {
+			m.buildErr = fmt.Errorf("zorm: Where: %w", err)
+			return m
+		}
 	}
 
 	m.wheres = append(m.wheres, typ+" "+queryStr)
 	m.args = append(m.args, args...)
 	return m
+}
+
+// validateWhereRawString checks a raw WHERE string fragment for the most
+// dangerous SQL injection patterns (comments, multi-statement) without
+// blocking legitimate expressions such as subqueries or IS TRUE / IS FALSE.
+func validateWhereRawString(s string) error {
+	if strings.Contains(s, "--") || strings.Contains(s, "/*") || strings.Contains(s, "*/") {
+		return fmt.Errorf("%w: SQL comments are not allowed in raw WHERE strings", ErrInvalidSyntax)
+	}
+	if strings.Contains(s, ";") {
+		return fmt.Errorf("%w: multiple statements are not allowed in raw WHERE strings", ErrInvalidSyntax)
+	}
+	return nil
 }
 
 // WhereNull adds an AND condition that checks whether the given column is NULL.
@@ -262,7 +285,8 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 //	// WHERE deleted_at IS NULL
 func (m *Model[T]) WhereNull(column string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereNull: invalid column %q: %w", column, err)
+		return m
 	}
 	m.wheres = append(m.wheres, "AND "+column+" IS NULL")
 	return m
@@ -277,7 +301,8 @@ func (m *Model[T]) WhereNull(column string) *Model[T] {
 //	// OR deleted_at IS NULL
 func (m *Model[T]) OrWhereNull(column string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: OrWhereNull: invalid column %q: %w", column, err)
+		return m
 	}
 	m.wheres = append(m.wheres, "OR "+column+" IS NULL")
 	return m
@@ -292,7 +317,8 @@ func (m *Model[T]) OrWhereNull(column string) *Model[T] {
 //	// WHERE verified_at IS NOT NULL
 func (m *Model[T]) WhereNotNull(column string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereNotNull: invalid column %q: %w", column, err)
+		return m
 	}
 	m.wheres = append(m.wheres, "AND "+column+" IS NOT NULL")
 	return m
@@ -307,7 +333,8 @@ func (m *Model[T]) WhereNotNull(column string) *Model[T] {
 //	// OR verified_at IS NOT NULL
 func (m *Model[T]) OrWhereNotNull(column string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: OrWhereNotNull: invalid column %q: %w", column, err)
+		return m
 	}
 	m.wheres = append(m.wheres, "OR "+column+" IS NOT NULL")
 	return m
@@ -350,7 +377,8 @@ func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) erro
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereIn: invalid column %q: %w", column, err)
+		return m
 	}
 	if len(args) == 0 {
 		// Optimization: 1=0 to return nothing
