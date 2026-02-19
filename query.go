@@ -881,6 +881,72 @@ func (m *Model[T]) GetLimit() int {
 	return m.limit
 }
 
+// Join adds an INNER JOIN clause.
+// Both table and column names are validated to prevent SQL injection.
+// Returns the model with buildErr set on invalid input; the error is surfaced
+// when a terminal method (Get, First, etc.) is called.
+//
+// Example:
+//
+//	New[Order]().Join("users", "orders.user_id", "=", "users.id").Get(ctx)
+func (m *Model[T]) Join(table, col1, op, col2 string) *Model[T] {
+	return m.addJoin("INNER JOIN", table, col1, op, col2)
+}
+
+// LeftJoin adds a LEFT JOIN clause.
+// Returns all rows from the left table and matching rows from the right table.
+// Column names are validated to prevent SQL injection.
+func (m *Model[T]) LeftJoin(table, col1, op, col2 string) *Model[T] {
+	return m.addJoin("LEFT JOIN", table, col1, op, col2)
+}
+
+// RightJoin adds a RIGHT JOIN clause.
+// Returns all rows from the right table and matching rows from the left table.
+// Column names are validated to prevent SQL injection.
+func (m *Model[T]) RightJoin(table, col1, op, col2 string) *Model[T] {
+	return m.addJoin("RIGHT JOIN", table, col1, op, col2)
+}
+
+// CrossJoin adds a CROSS JOIN clause, producing a Cartesian product of both tables.
+// No ON condition is required.
+// Table name is validated to prevent SQL injection.
+func (m *Model[T]) CrossJoin(table string) *Model[T] {
+	if err := ValidateColumnName(table); err != nil {
+		m.buildErr = fmt.Errorf("zorm: CrossJoin: invalid table %q: %w", table, err)
+		return m
+	}
+	m.joins = append(m.joins, joinClause{joinType: "CROSS JOIN", table: table})
+	return m
+}
+
+// addJoin is the shared implementation for Join, LeftJoin, and RightJoin.
+func (m *Model[T]) addJoin(joinType, table, col1, op, col2 string) *Model[T] {
+	if err := ValidateColumnName(table); err != nil {
+		m.buildErr = fmt.Errorf("zorm: %s: invalid table %q: %w", joinType, table, err)
+		return m
+	}
+	if err := ValidateColumnName(col1); err != nil {
+		m.buildErr = fmt.Errorf("zorm: %s: invalid column %q: %w", joinType, col1, err)
+		return m
+	}
+	if err := ValidateColumnName(col2); err != nil {
+		m.buildErr = fmt.Errorf("zorm: %s: invalid column %q: %w", joinType, col2, err)
+		return m
+	}
+	if !isValidOperator(op) {
+		m.buildErr = fmt.Errorf("zorm: %s: invalid operator %q; use one of =, >, <, >=, <=, <>, !=", joinType, op)
+		return m
+	}
+	m.joins = append(m.joins, joinClause{
+		joinType: joinType,
+		table:    table,
+		col1:     col1,
+		op:       op,
+		col2:     col2,
+	})
+	return m
+}
+
 // With adds relations to eager load.
 // Multiple relation names can be specified, including nested relations.
 //

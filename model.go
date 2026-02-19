@@ -121,6 +121,9 @@ type Model[T any] struct {
 	// CTE State
 	ctes []CTE
 
+	// JOIN State
+	joins []joinClause
+
 	// Statement Cache (optional)
 	stmtCache *StmtCache
 
@@ -140,6 +143,15 @@ type CTE struct {
 	Name  string
 	Query any // string or *Model[T]
 	Args  []any
+}
+
+// joinClause represents a single SQL JOIN clause.
+type joinClause struct {
+	joinType string // "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "CROSS JOIN"
+	table    string
+	col1     string // left side of ON condition (empty for CROSS JOIN)
+	op       string // operator (e.g., "=")
+	col2     string // right side of ON condition (empty for CROSS JOIN)
 }
 
 // New creates a new Model instance for type T.
@@ -253,6 +265,7 @@ func (m *Model[T]) reset() {
 	m.limit = 0
 	m.offset = 0
 	m.relations = nil
+	m.joins = nil
 	m.lockMode = ""
 	m.forcePrimary = false
 	m.forceReplica = -1
@@ -350,6 +363,10 @@ func (m *Model[T]) Clone() *Model[T] {
 	if len(m.relations) > 0 {
 		newModel.relations = make([]string, len(m.relations))
 		copy(newModel.relations, m.relations)
+	}
+	if len(m.joins) > 0 {
+		newModel.joins = make([]joinClause, len(m.joins))
+		copy(newModel.joins, m.joins)
 	}
 	if len(m.rawArgs) > 0 {
 		newModel.rawArgs = make([]any, len(m.rawArgs))

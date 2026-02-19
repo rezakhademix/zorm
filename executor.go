@@ -581,6 +581,22 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	sb.WriteString(" FROM ")
 	sb.WriteString(m.TableName())
 
+	// Emit JOIN clauses (before WHERE)
+	for _, j := range m.joins {
+		sb.WriteByte(' ')
+		sb.WriteString(j.joinType)
+		sb.WriteByte(' ')
+		sb.WriteString(j.table)
+		if j.col1 != "" {
+			sb.WriteString(" ON ")
+			sb.WriteString(j.col1)
+			sb.WriteByte(' ')
+			sb.WriteString(j.op)
+			sb.WriteByte(' ')
+			sb.WriteString(j.col2)
+		}
+	}
+
 	m.buildWhereClause(sb)
 
 	if len(m.groupBys) > 0 {
@@ -833,6 +849,13 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 		// Track originals for dirty tracking (with optional scope)
 		trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
 
+		// AfterFind Hook
+		if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
+			if err := hook.AfterFind(m.ctx); err != nil {
+				return nil, err
+			}
+		}
+
 		results = append(results, entity)
 	}
 
@@ -908,6 +931,13 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 
 	// Track originals for dirty tracking (with optional scope)
 	trackOriginalsWithScope(entity, c.model.modelInfo, c.model.trackingScope)
+
+	// AfterFind Hook
+	if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
+		if err := hook.AfterFind(ctx); err != nil {
+			return nil, err
+		}
+	}
 
 	// Load Accessors (using single-entity version to avoid slice allocation)
 	c.model.loadAccessorsSingle(entity)
@@ -1156,6 +1186,13 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 	// Track the newly created entity so it can be used with dirty tracking
 	trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
+
+	// AfterCreate Hook
+	if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
+		if err := hook.AfterCreate(ctx); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -1424,7 +1461,22 @@ func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
 }
 
 // execDelete is the shared implementation for Delete and ForceDeleteAll.
+//
+// Hook Behavior: If T implements BeforeDelete(context.Context) error, it is called
+// on a zero-value *T before the DELETE executes. If T implements AfterDelete, it is
+// called after a successful DELETE. Because Delete() is a WHERE-based batch operation
+// (not per-entity), the hooks receive a zero-value instance — they are best used for
+// model-level concerns (audit logging, cache invalidation, access control) rather than
+// per-record state inspection.
 func (m *Model[T]) execDelete(ctx context.Context) error {
+	// BeforeDelete Hook (called on a zero-value instance, not per-entity row)
+	hookEntity := new(T)
+	if hook, ok := any(hookEntity).(interface{ BeforeDelete(context.Context) error }); ok {
+		if err := hook.BeforeDelete(ctx); err != nil {
+			return err
+		}
+	}
+
 	var sb strings.Builder
 	cteArgs := m.buildWithClause(&sb)
 
@@ -1454,6 +1506,14 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 	if err != nil {
 		return WrapQueryError("DELETE", query, m.args, err)
 	}
+
+	// AfterDelete Hook
+	if hook, ok := any(hookEntity).(interface{ AfterDelete(context.Context) error }); ok {
+		if err := hook.AfterDelete(ctx); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -1980,6 +2040,13 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 			_, err = stmt.ExecContext(ctx, args...)
 			if err != nil {
 				return WrapQueryError("INSERT", insertQuery, args, err)
+			}
+		}
+
+		// AfterCreate Hook (per-entity)
+		if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
+			if err := hook.AfterCreate(ctx); err != nil {
+				return err
 			}
 		}
 	}
