@@ -68,20 +68,21 @@ func GetGlobalResolver() *DBResolver {
 // without locking and must not be called concurrently on the same Model instance.
 //
 // Safe patterns for concurrent use:
-//  1. Clone before branching: Call Clone() to create independent copies before
-//     modifying in different goroutines. Clone() uses RWMutex internally.
-//  2. Create per goroutine: Create new Model instances via New[T]() in each goroutine.
+//  1. Build a base model in a single goroutine, then clone it for concurrent
+//     handlers. The base model must not be modified after the setup phase.
+//     Clone() on a read-only base is safe from multiple goroutines.
+//  2. Create a fresh Model via New[T]() inside each goroutine.
 //
 // Example:
 //
-//	base := New[User]().Where("active", true)
-//	// SAFE: Clone before concurrent use
+//	base := New[User]().Where("active", true) // setup phase — single goroutine
+//	// SAFE: base is never written again; clones get independent state
 //	go func() { base.Clone().Where("role", "admin").Get(ctx) }()
 //	go func() { base.Clone().Where("role", "user").Get(ctx) }()
 //
-//	// UNSAFE: Concurrent mutation of same Model
-//	go func() { base.Where("role", "admin").Get(ctx) }() // DATA RACE
-//	go func() { base.Where("role", "user").Get(ctx) }()  // DATA RACE
+//	// UNSAFE: Concurrent mutation of same Model — DATA RACE
+//	go func() { base.Where("role", "admin").Get(ctx) }()
+//	go func() { base.Where("role", "user").Get(ctx) }()
 type Model[T any] struct {
 	mu sync.RWMutex // Protects query state for Clone() operations
 
@@ -281,23 +282,21 @@ func (m *Model[T]) reset() {
 // Clone creates a deep copy of the Model.
 // This is useful for creating new queries based on an existing one without modifying it.
 //
-// Thread Safety: Clone() acquires a read lock to safely copy state. Multiple goroutines
-// can call Clone() concurrently on the same model. However, calling Clone() while another
-// goroutine is modifying the model (via Where, Select, etc.) requires the modification
-// methods to also acquire locks, which they do not for performance reasons.
+// Thread Safety: Model instances are NOT safe for concurrent modification.
+// Clone() itself is safe to call from multiple goroutines on a model that is no longer
+// being modified (e.g., a base model built in a setup phase). It is NOT safe to call
+// Clone() concurrently with any mutating method (Where, Select, OrderBy, etc.) on the
+// same instance — those methods do not acquire any lock.
 //
-// Recommended usage patterns:
+// Safe patterns:
 //
-//	// Pattern 1: Create base query once, then clone for each request
-//	base := New[User]().Where("active", true)  // Setup phase, single goroutine
-//	// ... later, in request handlers (multiple goroutines)
-//	handler1 := base.Clone().Where("age >", 18).Get(ctx)
-//	handler2 := base.Clone().Where("verified", true).Get(ctx)
+//	// Build base in a single goroutine, then clone concurrently (no further writes to base)
+//	base := New[User]().Where("active", true) // single-goroutine setup
+//	go func() { base.Clone().Where("role", "admin").Get(ctx) }()
+//	go func() { base.Clone().Where("role", "user").Get(ctx) }()
 //
-//	// Pattern 2: Create new model per goroutine
-//	go func() {
-//	    m := New[User]().Where("active", true).Get(ctx)
-//	}()
+//	// Or create a fresh model per goroutine
+//	go func() { New[User]().Where("active", true).Get(ctx) }()
 func (m *Model[T]) Clone() *Model[T] {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

@@ -1028,60 +1028,57 @@ func TestCursorWithTrackingScope(t *testing.T) {
 }
 
 // =============================================================================
-// ISSUE #6: DIRTY TRACKING GC FINALIZER TESTS
+// DIRTY TRACKING MEMORY MANAGEMENT TESTS
 // =============================================================================
 
-// TestDirtyTracking_FinalizerCleansUp verifies that when a tracked entity goes
-// out of scope and is garbage collected, the runtime finalizer automatically
-// removes its tracking data. This prevents the ABA problem where a new entity
-// could reuse the same memory address and inherit stale tracking data.
-func TestDirtyTracking_FinalizerCleansUp(t *testing.T) {
+// TestDirtyTracking_NoFinalizerAutoCleanup documents that dirty tracking does NOT
+// use runtime finalizers. Tracking data persists until either the LRU capacity
+// evicts it, ClearOriginals is called explicitly, or a TrackingScope is closed.
+// This avoids the ABA problem where a finalizer for a GC'd entity could fire after
+// a new entity reuses the same address, incorrectly clearing the new entity's data.
+func TestDirtyTracking_NoFinalizerAutoCleanup(t *testing.T) {
 	ClearAllOriginals()
 	modelInfo := ParseModel[DirtyUser]()
 
-	// Track an entity in a nested scope so it can be GC'd
 	var key uintptr
 	func() {
 		user := &DirtyUser{ID: 999, Name: "Temporary", Email: "temp@example.com"}
 		trackOriginals(user, modelInfo)
 		key = getEntityKey(user)
 
-		// Verify it's tracked
 		if _, ok := globalTracker.Load().Load(key); !ok {
-			t.Fatal("expected entity to be tracked before GC")
+			t.Fatal("expected entity to be tracked before going out of scope")
 		}
 	}()
-	// user is now out of scope
 
-	// Force garbage collection to trigger finalizer
+	// Without finalizers, GC does NOT remove tracking data.
 	runtime.GC()
-	runtime.GC() // Run twice for reliability
+	runtime.GC()
 
-	// The finalizer should have cleaned up the tracking entry
+	if _, ok := globalTracker.Load().Load(key); !ok {
+		t.Error("tracking entry was unexpectedly removed; no finalizer should be running")
+	}
+
+	// Explicit cleanup is the correct approach.
+	globalTracker.Load().Delete(key)
 	if _, ok := globalTracker.Load().Load(key); ok {
-		t.Error("expected tracking entry to be cleaned up after GC, but it still exists")
+		t.Error("expected tracking entry to be gone after explicit Delete")
 	}
 }
 
-// TestDirtyTracking_FinalizerNotSetTwice verifies that calling syncOriginals
-// (which re-tracks an entity) does not panic from setting a finalizer twice.
-// The fix ensures finalizers are only set on first tracking.
-func TestDirtyTracking_FinalizerNotSetTwice(t *testing.T) {
+// TestDirtyTracking_RetrackDoesNotPanic verifies that calling syncOriginals on
+// an already-tracked entity does not panic.
+func TestDirtyTracking_RetrackDoesNotPanic(t *testing.T) {
 	ClearAllOriginals()
 	modelInfo := ParseModel[DirtyUser]()
 
 	user := &DirtyUser{ID: 100, Name: "John", Email: "john@example.com"}
-
-	// First tracking — sets finalizer
 	trackOriginals(user, modelInfo)
 
-	// Verify tracked
 	if !IsTracked(user) {
-		t.Fatal("expected entity to be tracked after first trackOriginals")
+		t.Fatal("expected entity to be tracked after trackOriginals")
 	}
 
-	// Second tracking (simulates syncOriginals after update) — should NOT panic
-	// from "runtime.SetFinalizer: finalizer already set"
 	panicked := false
 	func() {
 		defer func() {
@@ -1097,7 +1094,6 @@ func TestDirtyTracking_FinalizerNotSetTwice(t *testing.T) {
 		t.Fatal("syncOriginals should not panic when re-tracking an already-tracked entity")
 	}
 
-	// Verify still tracked with updated values
 	if !IsTracked(user) {
 		t.Error("expected entity to still be tracked after syncOriginals")
 	}
