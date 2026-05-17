@@ -21,7 +21,7 @@ ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern
 - **Database Splitting**: Automatic read/write split with replica support
 - **Context Support**: All operations respect `context.Context` for cancellation & timeout
 - **Debugging**: `Print()` method to inspect generated SQL without executing
-- **Lifecycle Hooks**: BeforeCreate, BeforeUpdate, AfterUpdate hooks
+- **Lifecycle Hooks**: BeforeCreate / AfterCreate, BeforeUpdate / AfterUpdate, BeforeDelete / AfterDelete, AfterFind
 - **Accessors**: Computed attributes via getter methods
 
   
@@ -296,11 +296,12 @@ zorm.New[User]().Where(map[string]any{
 // Struct (non-zero fields)
 zorm.New[User]().Where(&User{Name: "John", Age: 25}).Get(ctx)
 
-// Nested/Grouped conditions
+// Nested/Grouped conditions — single-predicate grouping wraps the
+// callback's predicate in parentheses
 zorm.New[User]().Where(func(q *zorm.Model[User]) {
-    q.Where("role", "admin").OrWhere("role", "manager")
+    q.Where("age", ">", 18)
 }).Where("active", true).Get(ctx)
-// WHERE (role = 'admin' OR role = 'manager') AND active = true
+// WHERE (age > ?) AND active = ?
 
 // NULL checks
 zorm.New[User]().WhereNull("deleted_at").Get(ctx)
@@ -454,11 +455,15 @@ ZORM supports lifecycle hooks that are automatically called during CRUD operatio
 
 ### Available Hooks
 
-| Hook                | When Called   |
-| ------------------- | ------------- |
-| `BeforeCreate(ctx)` | Before INSERT |
-| `BeforeUpdate(ctx)` | Before UPDATE |
-| `AfterUpdate(ctx)`  | After UPDATE  |
+| Hook                | When Called             |
+| ------------------- | ----------------------- |
+| `BeforeCreate(ctx)` | Before INSERT           |
+| `AfterCreate(ctx)`  | After INSERT            |
+| `BeforeUpdate(ctx)` | Before UPDATE           |
+| `AfterUpdate(ctx)`  | After UPDATE            |
+| `BeforeDelete(ctx)` | Before DELETE           |
+| `AfterDelete(ctx)`  | After DELETE            |
+| `AfterFind(ctx)`    | After SELECT (per row)  |
 
 ### Implementing Hooks
 
@@ -1039,6 +1044,36 @@ users, _ := zorm.New[User]().
     Scope(RecentlyActive).
     Get(ctx)
 ```
+
+#### Parameterized Scopes
+
+Scopes can also take arguments. Return a closure that matches the
+`func(*zorm.Model[T]) *zorm.Model[T]` signature expected by `Scope(...)`:
+
+```go
+func Role(role string) func(*zorm.Model[User]) *zorm.Model[User] {
+    return func(q *zorm.Model[User]) *zorm.Model[User] {
+        return q.Where("role", role)
+    }
+}
+
+func RegisteredBetween(from, to time.Time) func(*zorm.Model[User]) *zorm.Model[User] {
+    return func(q *zorm.Model[User]) *zorm.Model[User] {
+        return q.
+            Where("created_at", ">=", from).
+            Where("created_at", "<=", to)
+    }
+}
+
+// Apply via Scope(...) just like parameter-less scopes
+zorm.New[User]().
+    Scope(Role("admin")).
+    Scope(RegisteredBetween(from, to)).
+    Get(ctx)
+```
+
+Scopes are plain functions, not methods on `Model[T]` — they cannot be
+chained directly (`.Role("admin")`); pass them to `Scope(...)`.
 
 ### Query Debugging
 
