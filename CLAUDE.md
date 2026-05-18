@@ -131,7 +131,17 @@ go test -v -run TestRelations ./...
 - `BeforeDelete`, `AfterDelete`
 - `AfterFind`
 
-Note: README's hooks table only lists three — the code supports all seven. Gotcha: if `BeforeCreate` mutates state but the INSERT fails, hook side effects are **not** rolled back. Wrap multi-step work in `Transaction(...)` for atomicity.
+Note: README's hooks table only lists three — the code supports all seven.
+
+**Transactional hooks (`*Tx` variants)**: each of the six **write** hooks has a parallel `Tx` variant that receives the active `*zorm.Tx`:
+
+- `BeforeCreateTx(ctx, *Tx) error`, `AfterCreateTx(ctx, *Tx) error`
+- `BeforeUpdateTx(ctx, *Tx) error`, `AfterUpdateTx(ctx, *Tx) error`
+- `BeforeDeleteTx(ctx, *Tx) error`, `AfterDeleteTx(ctx, *Tx) error`
+
+If both the plain and `Tx` variant exist on a model, **only the `Tx` variant fires** (no double-dispatch). When a model implements any `Tx` variant and the operation is called outside an existing transaction, the executor auto-opens one for that call so DB work performed through the passed `*Tx` (e.g. `tx.Tx.ExecContext(...)` or `model.WithTx(tx).<...>`) rolls back atomically with the parent SQL on error. `AfterFind` intentionally has no `Tx` variant — reads don't participate in write transactions.
+
+Gotcha: in-memory mutations to entity fields are **never** rolled back regardless of variant — only DB writes via the passed `*Tx` are. Plain hooks (`BeforeCreate` etc.) still run on a separate connection from the parent SQL, so their DB side effects are not atomic; migrate to the `Tx` variant when atomicity matters.
 
 **Accessors** (`schema.go` + `executor.go`): methods named `Get<Name>` with zero arguments returning exactly one value are treated as computed attributes. The attribute key is the snake_case of the name after `Get` (`GetFullName()` → `attributes["full_name"]`). Requires the struct to declare `Attributes map[string]any`; without that field, accessors silently no-op.
 

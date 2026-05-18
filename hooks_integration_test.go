@@ -701,3 +701,555 @@ func TestHook_Hooks_WorkInTransaction(t *testing.T) {
 		t.Errorf("expected 0 rows after committed transaction (create+delete), got %d", count)
 	}
 }
+
+// ============================================================================
+// *Tx hook variants
+// ============================================================================
+
+// setupHooksTxDB extends setupHooksDB with an `audit` table used to prove that
+// hook-side DB writes done via the passed *Tx roll back atomically.
+//
+// SQLite :memory: behaves correctly here because *sql.DB pins a single
+// connection for sequential operations and the same DSN sees the same DB.
+func setupHooksTxDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db := setupHooksDB(t)
+	if _, err := db.Exec(`CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT)`); err != nil {
+		t.Fatalf("failed to create audit table: %v", err)
+	}
+	// Pin to one connection so all tx work and post-tx assertions hit the same
+	// in-memory database.
+	db.SetMaxOpenConns(1)
+	return db
+}
+
+// ---- BeforeCreateTx: auto-opened tx ----
+
+// HookCreateTxItem captures the *sql.Tx that BeforeCreateTx received so the
+// test can assert it is non-nil (i.e., an auto-tx was opened).
+type HookCreateTxItem struct {
+	ID     int `zorm:"primaryKey"`
+	Name   string
+	Value  int
+	HookTx *sql.Tx `zorm:"-"`
+}
+
+func (h *HookCreateTxItem) TableName() string { return "hook_items" }
+
+func (h *HookCreateTxItem) BeforeCreateTx(ctx context.Context, tx *Tx) error {
+	h.HookTx = tx.Tx
+	return nil
+}
+
+func TestHook_BeforeCreateTx_ReceivesAutoOpenedTx(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	item := &HookCreateTxItem{Name: "auto", Value: 1}
+
+	if err := New[HookCreateTxItem]().SetDB(db).Create(ctx, item); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if item.HookTx == nil {
+		t.Fatal("expected BeforeCreateTx to receive a non-nil *sql.Tx (auto-tx)")
+	}
+	if item.ID == 0 {
+		t.Error("expected ID to be set after Create")
+	}
+}
+
+// ---- BeforeCreateTx: existing tx is reused ----
+
+func TestHook_BeforeCreateTx_ReceivesActiveTx(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	item := &HookCreateTxItem{Name: "active", Value: 2}
+
+	model := New[HookCreateTxItem]().SetDB(db)
+	var outerTx *sql.Tx
+	err := model.Transaction(ctx, func(tx *Tx) error {
+		outerTx = tx.Tx
+		return model.WithTx(tx).Create(ctx, item)
+	})
+	if err != nil {
+		t.Fatalf("Transaction failed: %v", err)
+	}
+	if item.HookTx == nil {
+		t.Fatal("expected BeforeCreateTx to receive a non-nil *sql.Tx")
+	}
+	if item.HookTx != outerTx {
+		t.Errorf("expected hook to receive the outer transaction (same *sql.Tx); got different pointer")
+	}
+}
+
+// ---- AfterCreateTx error rolls back the INSERT (auto-tx path) ----
+
+// HookCreateTxRollback writes an audit row in BeforeCreateTx via the passed *Tx
+// and returns an error from AfterCreateTx. Both the hook_items row and the
+// audit row must be rolled back.
+type HookCreateTxRollback struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookCreateTxRollback) TableName() string { return "hook_items" }
+
+func (h *HookCreateTxRollback) BeforeCreateTx(ctx context.Context, tx *Tx) error {
+	_, err := tx.Tx.ExecContext(ctx, `INSERT INTO audit (note) VALUES (?)`, "creating "+h.Name)
+	return err
+}
+
+func (h *HookCreateTxRollback) AfterCreateTx(ctx context.Context, tx *Tx) error {
+	return errors.New("after-create-tx rejection")
+}
+
+func TestHook_AfterCreateTx_RollsBackInsertAndSideEffect(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	item := &HookCreateTxRollback{Name: "rollback-me", Value: 7}
+
+	err := New[HookCreateTxRollback]().SetDB(db).Create(ctx, item)
+	if err == nil {
+		t.Fatal("expected error from AfterCreateTx, got nil")
+	}
+
+	var itemCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hook_items WHERE name = ?`, "rollback-me").Scan(&itemCount); err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if itemCount != 0 {
+		t.Errorf("expected INSERT to roll back (0 rows), got %d", itemCount)
+	}
+
+	var auditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("audit count failed: %v", err)
+	}
+	if auditCount != 0 {
+		t.Errorf("expected hook-side audit row to roll back (0 rows), got %d", auditCount)
+	}
+}
+
+// ---- Tx variant takes precedence over plain hook ----
+
+// HookCreateTxPrecedence implements both BeforeCreate and BeforeCreateTx; only
+// the Tx variant must fire.
+type HookCreateTxPrecedence struct {
+	ID         int `zorm:"primaryKey"`
+	Name       string
+	Value      int
+	PlainFired bool `zorm:"-"`
+	TxFired    bool `zorm:"-"`
+}
+
+func (h *HookCreateTxPrecedence) TableName() string { return "hook_items" }
+
+func (h *HookCreateTxPrecedence) BeforeCreate(ctx context.Context) error {
+	h.PlainFired = true
+	return nil
+}
+
+func (h *HookCreateTxPrecedence) BeforeCreateTx(ctx context.Context, tx *Tx) error {
+	h.TxFired = true
+	return nil
+}
+
+func TestHook_BeforeCreateTx_TakesPrecedenceOverPlain(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	item := &HookCreateTxPrecedence{Name: "precedence", Value: 1}
+
+	if err := New[HookCreateTxPrecedence]().SetDB(db).Create(ctx, item); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if !item.TxFired {
+		t.Error("expected BeforeCreateTx to fire")
+	}
+	if item.PlainFired {
+		t.Error("expected plain BeforeCreate NOT to fire when *Tx variant exists")
+	}
+}
+
+// ---- BeforeUpdateTx rolls back UPDATE + side effect ----
+
+// HookUpdateTxRollback writes audit in BeforeUpdateTx, then AfterUpdateTx
+// errors so the whole transaction rolls back.
+type HookUpdateTxRollback struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookUpdateTxRollback) TableName() string { return "hook_items" }
+
+func (h *HookUpdateTxRollback) BeforeUpdateTx(ctx context.Context, tx *Tx) error {
+	_, err := tx.Tx.ExecContext(ctx, `INSERT INTO audit (note) VALUES (?)`, "updating "+h.Name)
+	return err
+}
+
+func (h *HookUpdateTxRollback) AfterUpdateTx(ctx context.Context, tx *Tx) error {
+	return errors.New("after-update-tx rejection")
+}
+
+func TestHook_AfterUpdateTx_RollsBackUpdateAndSideEffect(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO hook_items (id, name, value) VALUES (700, 'before', 1)`); err != nil {
+		t.Fatalf("seed insert failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err := New[HookUpdateTxRollback]().SetDB(db).Update(ctx, &HookUpdateTxRollback{ID: 700, Name: "after", Value: 2})
+	if err == nil {
+		t.Fatal("expected error from AfterUpdateTx, got nil")
+	}
+
+	var name string
+	if err := db.QueryRow(`SELECT name FROM hook_items WHERE id = 700`).Scan(&name); err != nil {
+		t.Fatalf("select failed: %v", err)
+	}
+	if name != "before" {
+		t.Errorf("expected UPDATE to roll back (name=before), got %q", name)
+	}
+
+	var auditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("audit count failed: %v", err)
+	}
+	if auditCount != 0 {
+		t.Errorf("expected audit row to roll back (0 rows), got %d", auditCount)
+	}
+}
+
+// ---- BeforeDeleteTx rolls back DELETE + side effect ----
+
+// HookDeleteTxRollback inserts audit in BeforeDeleteTx, then AfterDeleteTx
+// errors. Delete hooks fire on a zero-value *T, so this type has no per-row
+// state besides identity.
+type HookDeleteTxRollback struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookDeleteTxRollback) TableName() string { return "hook_items" }
+
+func (h *HookDeleteTxRollback) BeforeDeleteTx(ctx context.Context, tx *Tx) error {
+	_, err := tx.Tx.ExecContext(ctx, `INSERT INTO audit (note) VALUES (?)`, "deleting")
+	return err
+}
+
+func (h *HookDeleteTxRollback) AfterDeleteTx(ctx context.Context, tx *Tx) error {
+	return errors.New("after-delete-tx rejection")
+}
+
+func TestHook_AfterDeleteTx_RollsBackDeleteAndSideEffect(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO hook_items (id, name, value) VALUES (800, 'keepme', 1)`); err != nil {
+		t.Fatalf("seed insert failed: %v", err)
+	}
+
+	ctx := context.Background()
+	err := New[HookDeleteTxRollback]().SetDB(db).Where("id", 800).Delete(ctx)
+	if err == nil {
+		t.Fatal("expected error from AfterDeleteTx, got nil")
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hook_items WHERE id = 800`).Scan(&count); err != nil {
+		t.Fatalf("count failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected DELETE to roll back (row still present), got count=%d", count)
+	}
+
+	var auditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("audit count failed: %v", err)
+	}
+	if auditCount != 0 {
+		t.Errorf("expected audit row to roll back (0 rows), got %d", auditCount)
+	}
+}
+
+// ---- BulkInsert: per-row AfterCreateTx receives the same *Tx ----
+
+// HookBulkTxItem captures the *sql.Tx for each entity; all entities in a single
+// BulkInsert must see the same tx pointer.
+type HookBulkTxItem struct {
+	ID     int `zorm:"primaryKey"`
+	Name   string
+	Value  int
+	HookTx *sql.Tx `zorm:"-"`
+}
+
+func (h *HookBulkTxItem) TableName() string { return "hook_items" }
+
+func (h *HookBulkTxItem) AfterCreateTx(ctx context.Context, tx *Tx) error {
+	h.HookTx = tx.Tx
+	return nil
+}
+
+func TestHook_AfterCreateTx_BulkInsert_SharesTx(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	items := []*HookBulkTxItem{
+		{Name: "a", Value: 1},
+		{Name: "b", Value: 2},
+		{Name: "c", Value: 3},
+	}
+
+	if err := New[HookBulkTxItem]().SetDB(db).BulkInsert(ctx, items); err != nil {
+		t.Fatalf("BulkInsert failed: %v", err)
+	}
+
+	first := items[0].HookTx
+	if first == nil {
+		t.Fatal("expected AfterCreateTx to receive non-nil *sql.Tx for the first row")
+	}
+	for i, item := range items {
+		if item.HookTx != first {
+			t.Errorf("item[%d]: expected the same *sql.Tx across all rows, got different pointer", i)
+		}
+	}
+}
+
+// ---- Regression: plain BeforeCreate still works after Tx-variant changes ----
+
+// HookPlainOnly intentionally implements ONLY the plain BeforeCreate to prove
+// existing hook signatures keep firing and do NOT trigger auto-tx.
+type HookPlainOnly struct {
+	ID         int `zorm:"primaryKey"`
+	Name       string
+	Value      int
+	PlainFired bool `zorm:"-"`
+}
+
+func (h *HookPlainOnly) TableName() string { return "hook_items" }
+
+func (h *HookPlainOnly) BeforeCreate(ctx context.Context) error {
+	h.PlainFired = true
+	return nil
+}
+
+func TestHook_PlainBeforeCreate_StillWorks(t *testing.T) {
+	db := setupHooksDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	item := &HookPlainOnly{Name: "plain", Value: 1}
+
+	if err := New[HookPlainOnly]().SetDB(db).Create(ctx, item); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if !item.PlainFired {
+		t.Error("expected plain BeforeCreate to fire")
+	}
+	if item.ID == 0 {
+		t.Error("expected ID to be set after Create")
+	}
+}
+
+// ============================================================================
+// Complex *Tx hook scenarios
+// ============================================================================
+
+// ---- C1: BulkInsert mid-batch hook error rolls back ALL rows + ALL audit writes ----
+
+// HookBulkTxFail audits every per-row INSERT via the passed *Tx and rejects the
+// row whose Value == 3. The atomicity contract: when the third hook returns an
+// error, the first two INSERTs AND their hook-side audit writes must be rolled
+// back together with the row that triggered the error.
+type HookBulkTxFail struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookBulkTxFail) TableName() string { return "hook_items" }
+
+func (h *HookBulkTxFail) AfterCreateTx(ctx context.Context, tx *Tx) error {
+	if _, err := tx.Tx.ExecContext(ctx, `INSERT INTO audit (note) VALUES (?)`, "bulk:"+h.Name); err != nil {
+		return err
+	}
+	if h.Value == 3 {
+		return errors.New("bulk hook rejected row 3")
+	}
+	return nil
+}
+
+func TestHook_AfterCreateTx_BulkInsert_MidBatchRollback(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	items := []*HookBulkTxFail{
+		{Name: "a", Value: 1},
+		{Name: "b", Value: 2},
+		{Name: "c", Value: 3}, // triggers hook error
+		{Name: "d", Value: 4}, // never reached
+	}
+
+	err := New[HookBulkTxFail]().SetDB(db).BulkInsert(ctx, items)
+	if err == nil {
+		t.Fatal("expected mid-batch hook error, got nil")
+	}
+
+	var itemCount, auditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hook_items`).Scan(&itemCount); err != nil {
+		t.Fatalf("hook_items count failed: %v", err)
+	}
+	if itemCount != 0 {
+		t.Errorf("expected 0 hook_items after mid-batch rollback, got %d", itemCount)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("audit count failed: %v", err)
+	}
+	if auditCount != 0 {
+		t.Errorf("expected 0 audit rows (all per-row hook writes rolled back), got %d", auditCount)
+	}
+}
+
+// ---- C2: User-managed Transaction spans Create + Update; downstream hook error rolls back everything ----
+
+// HookSpanCreate writes an audit row from AfterCreateTx so a later rollback
+// must wipe it.
+type HookSpanCreate struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookSpanCreate) TableName() string { return "hook_items" }
+
+func (h *HookSpanCreate) AfterCreateTx(ctx context.Context, tx *Tx) error {
+	_, err := tx.Tx.ExecContext(ctx, `INSERT INTO audit (note) VALUES (?)`, "create:"+h.Name)
+	return err
+}
+
+// HookSpanUpdate rejects all updates from BeforeUpdateTx so the outer tx fails
+// after HookSpanCreate has already done its INSERT + audit write.
+type HookSpanUpdate struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookSpanUpdate) TableName() string { return "hook_items" }
+
+func (h *HookSpanUpdate) BeforeUpdateTx(ctx context.Context, tx *Tx) error {
+	return errors.New("update rejected by BeforeUpdateTx")
+}
+
+func TestHook_TxVariants_AtomicAcrossMultipleOps(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO hook_items (id, name, value) VALUES (900, 'preexisting', 10)`); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	ctx := context.Background()
+	createModel := New[HookSpanCreate]().SetDB(db)
+	updateModel := New[HookSpanUpdate]().SetDB(db)
+
+	err := createModel.Transaction(ctx, func(tx *Tx) error {
+		if err := createModel.WithTx(tx).Create(ctx, &HookSpanCreate{Name: "new", Value: 1}); err != nil {
+			return err
+		}
+		return updateModel.WithTx(tx).Update(ctx, &HookSpanUpdate{ID: 900, Name: "modified", Value: 11})
+	})
+	if err == nil {
+		t.Fatal("expected BeforeUpdateTx error to propagate, got nil")
+	}
+
+	// 1. Create-side INSERT must roll back.
+	var newCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hook_items WHERE name = 'new'`).Scan(&newCount); err != nil {
+		t.Fatalf("new-row count failed: %v", err)
+	}
+	if newCount != 0 {
+		t.Errorf("expected Create to roll back (0 'new' rows), got %d", newCount)
+	}
+
+	// 2. Pre-existing row must be unchanged (Update was rejected).
+	var preName string
+	if err := db.QueryRow(`SELECT name FROM hook_items WHERE id = 900`).Scan(&preName); err != nil {
+		t.Fatalf("pre-existing row select failed: %v", err)
+	}
+	if preName != "preexisting" {
+		t.Errorf("expected pre-existing row untouched, got name=%q", preName)
+	}
+
+	// 3. AfterCreateTx's audit write must roll back too (same tx).
+	var auditCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("audit count failed: %v", err)
+	}
+	if auditCount != 0 {
+		t.Errorf("expected audit row to roll back (0 rows), got %d", auditCount)
+	}
+}
+
+// ---- C3: AfterCreateTx uses zorm itself (model.WithTx) to insert a related row atomically ----
+
+// HookParentChild inserts a child row via zorm in AfterCreateTx using the same
+// transaction. The recursive insert is guarded by Value >= 100 sentinel so the
+// child hook short-circuits instead of recursing infinitely.
+type HookParentChild struct {
+	ID    int `zorm:"primaryKey"`
+	Name  string
+	Value int
+}
+
+func (h *HookParentChild) TableName() string { return "hook_items" }
+
+func (h *HookParentChild) AfterCreateTx(ctx context.Context, tx *Tx) error {
+	if h.Value >= 100 {
+		return nil // child sentinel — stop recursing
+	}
+	child := &HookParentChild{Name: h.Name + "-child", Value: 100}
+	return New[HookParentChild]().WithTx(tx).Create(ctx, child)
+}
+
+func TestHook_AfterCreateTx_NestedZormCallSharesTx(t *testing.T) {
+	db := setupHooksTxDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	parent := &HookParentChild{Name: "parent", Value: 1}
+	if err := New[HookParentChild]().SetDB(db).Create(ctx, parent); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// Both rows must be present — they were inserted under the same auto-opened
+	// transaction that wrapped the outer Create.
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM hook_items`).Scan(&count); err != nil {
+		t.Fatalf("count failed: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected parent + child rows persisted (2), got %d", count)
+	}
+
+	var childName string
+	if err := db.QueryRow(`SELECT name FROM hook_items WHERE id != ?`, parent.ID).Scan(&childName); err != nil {
+		t.Fatalf("child select failed: %v", err)
+	}
+	if childName != "parent-child" {
+		t.Errorf("expected child name 'parent-child', got %q", childName)
+	}
+}

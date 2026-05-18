@@ -167,7 +167,6 @@ func TestGetDirty(t *testing.T) {
 	}
 }
 
-
 func TestUpdateColumns(t *testing.T) {
 	db := setupDirtyDB(t)
 	defer db.Close()
@@ -604,7 +603,6 @@ func setupDirtyDBWithUnique(t *testing.T) *sql.DB {
 	}
 	return db
 }
-
 
 // TestUpdateWithOmitPreventsUniqueConflict demonstrates that even with
 // the regular Update() method, using Omit() can prevent unique constraint issues.

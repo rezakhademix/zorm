@@ -1095,13 +1095,190 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 	return results, rows.Err()
 }
 
+// withAutoTx opens a transaction, runs op against a tx-bound clone of the model, and
+// commits on success or rolls back on error/panic. Used by write operations when the
+// entity implements a *Tx hook variant so the hook can do additional DB work that
+// rolls back atomically with the parent SQL.
+func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) (err error) {
+	db := m.db
+	if db == nil {
+		db = GetGlobalDB()
+	}
+	if db == nil {
+		return ErrNilDatabase
+	}
+	sqlTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	txModel := m.WithTx(&Tx{Tx: sqlTx, ctx: ctx})
+	defer func() {
+		if p := recover(); p != nil {
+			_ = sqlTx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			if rbErr := sqlTx.Rollback(); rbErr != nil {
+				err = fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
+			}
+			return
+		}
+		err = sqlTx.Commit()
+	}()
+	err = op(txModel)
+	return
+}
+
+// needsCreateTx reports whether T implements any *Tx hook variant fired by Create.
+func needsCreateTx[T any](entity *T) bool {
+	if _, ok := any(entity).(interface {
+		BeforeCreateTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	if _, ok := any(entity).(interface {
+		AfterCreateTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	return false
+}
+
+// needsUpdateTx reports whether T implements any *Tx hook variant fired by Update.
+func needsUpdateTx[T any](entity *T) bool {
+	if _, ok := any(entity).(interface {
+		BeforeUpdateTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	if _, ok := any(entity).(interface {
+		AfterUpdateTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	return false
+}
+
+// needsDeleteTx reports whether T implements any *Tx hook variant fired by Delete.
+func needsDeleteTx[T any]() bool {
+	zero := new(T)
+	if _, ok := any(zero).(interface {
+		BeforeDeleteTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	if _, ok := any(zero).(interface {
+		AfterDeleteTx(context.Context, *Tx) error
+	}); ok {
+		return true
+	}
+	return false
+}
+
+// callBeforeCreate dispatches BeforeCreateTx if implemented, else BeforeCreate.
+// Never both.
+func (m *Model[T]) callBeforeCreate(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		BeforeCreateTx(context.Context, *Tx) error
+	}); ok {
+		return hook.BeforeCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		BeforeCreate(context.Context) error
+	}); ok {
+		return hook.BeforeCreate(ctx)
+	}
+	return nil
+}
+
+// callAfterCreate dispatches AfterCreateTx if implemented, else AfterCreate.
+func (m *Model[T]) callAfterCreate(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		AfterCreateTx(context.Context, *Tx) error
+	}); ok {
+		return hook.AfterCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		AfterCreate(context.Context) error
+	}); ok {
+		return hook.AfterCreate(ctx)
+	}
+	return nil
+}
+
+// callBeforeUpdate dispatches BeforeUpdateTx if implemented, else BeforeUpdate.
+func (m *Model[T]) callBeforeUpdate(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		BeforeUpdateTx(context.Context, *Tx) error
+	}); ok {
+		return hook.BeforeUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		BeforeUpdate(context.Context) error
+	}); ok {
+		return hook.BeforeUpdate(ctx)
+	}
+	return nil
+}
+
+// callAfterUpdate dispatches AfterUpdateTx if implemented, else AfterUpdate.
+func (m *Model[T]) callAfterUpdate(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		AfterUpdateTx(context.Context, *Tx) error
+	}); ok {
+		return hook.AfterUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		AfterUpdate(context.Context) error
+	}); ok {
+		return hook.AfterUpdate(ctx)
+	}
+	return nil
+}
+
+// callBeforeDelete dispatches BeforeDeleteTx if implemented, else BeforeDelete.
+// Delete hooks fire on a zero-value *T because Delete is a WHERE-based batch op.
+func (m *Model[T]) callBeforeDelete(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		BeforeDeleteTx(context.Context, *Tx) error
+	}); ok {
+		return hook.BeforeDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		BeforeDelete(context.Context) error
+	}); ok {
+		return hook.BeforeDelete(ctx)
+	}
+	return nil
+}
+
+// callAfterDelete dispatches AfterDeleteTx if implemented, else AfterDelete.
+func (m *Model[T]) callAfterDelete(ctx context.Context, entity *T) error {
+	if hook, ok := any(entity).(interface {
+		AfterDeleteTx(context.Context, *Tx) error
+	}); ok {
+		return hook.AfterDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+	}
+	if hook, ok := any(entity).(interface {
+		AfterDelete(context.Context) error
+	}); ok {
+		return hook.AfterDelete(ctx)
+	}
+	return nil
+}
+
 // Create inserts a new record.
 //
 // Hook Behavior: If the entity implements BeforeCreate(context.Context) error,
 // it will be called before the INSERT. If BeforeCreate succeeds but INSERT fails,
 // any side effects from BeforeCreate are NOT rolled back automatically.
 //
-// For atomic operations with hooks that have side effects, wrap in a transaction:
+// For atomic side effects across hooks and the INSERT, implement the *Tx variants
+// (BeforeCreateTx / AfterCreateTx). When either is implemented and Create is called
+// outside a transaction, Create auto-opens one so the hook's DB work via the passed
+// *Tx rolls back with the INSERT on error.
+//
+// Manual alternative: wrap the call in Transaction:
 //
 //	err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
 //	    return model.WithTx(tx).Create(ctx, entity)
@@ -1112,13 +1289,19 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		return ErrNilPointer
 	}
 
-	// 1. BeforeCreate Hook
-	// Note: If this succeeds but INSERT fails, hook side effects are not rolled back.
-	// Use transactions for atomic operations with hooks that have side effects.
-	if hook, ok := any(entity).(interface{ BeforeCreate(context.Context) error }); ok {
-		if err := hook.BeforeCreate(ctx); err != nil {
-			return err
-		}
+	// Auto-tx: if the entity uses a *Tx hook variant and we're not already in a
+	// transaction, open one so hook DB work rolls back atomically with the INSERT.
+	if m.tx == nil && needsCreateTx(entity) {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.Create(ctx, entity)
+		})
+	}
+
+	// 1. BeforeCreate Hook (prefers BeforeCreateTx when implemented).
+	// If this succeeds but INSERT fails and the plain BeforeCreate is used,
+	// hook side effects are not rolled back. Use the *Tx variants for atomicity.
+	if err := m.callBeforeCreate(ctx, entity); err != nil {
+		return err
 	}
 
 	// 2. Build Insert Query
@@ -1187,11 +1370,9 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Track the newly created entity so it can be used with dirty tracking
 	trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
 
-	// AfterCreate Hook
-	if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
-		if err := hook.AfterCreate(ctx); err != nil {
-			return err
-		}
+	// AfterCreate Hook (prefers AfterCreateTx when implemented).
+	if err := m.callAfterCreate(ctx, entity); err != nil {
+		return err
 	}
 
 	return nil
@@ -1217,6 +1398,13 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		return ErrNilPointer
 	}
 
+	// Auto-tx: see Create for rationale.
+	if m.tx == nil && needsUpdateTx(entity) {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.Update(ctx, entity)
+		})
+	}
+
 	// Auto-update updated_at if it exists
 	if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
 		val := reflect.ValueOf(entity).Elem()
@@ -1227,12 +1415,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		}
 	}
 
-	// Hooks - Note: If BeforeUpdate succeeds but UPDATE fails, hook side effects
-	// are not rolled back. Use transactions for atomic operations.
-	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
-		if err := hook.BeforeUpdate(ctx); err != nil {
-			return err
-		}
+	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
+	if err := m.callBeforeUpdate(ctx, entity); err != nil {
+		return err
 	}
 
 	// Build Update Query
@@ -1305,10 +1490,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// Sync originals after successful update to mark entity as clean
 	syncOriginals(entity, m.modelInfo)
 
-	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
-		if err := hook.AfterUpdate(ctx); err != nil {
-			return err
-		}
+	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
+	if err := m.callAfterUpdate(ctx, entity); err != nil {
+		return err
 	}
 
 	return nil
@@ -1331,6 +1515,13 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		return nil // Nothing to update
 	}
 
+	// Auto-tx: see Create for rationale.
+	if m.tx == nil && needsUpdateTx(entity) {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.UpdateColumns(ctx, entity, columns...)
+		})
+	}
+
 	// Auto-update updated_at if it exists and not explicitly specified
 	hasUpdatedAt := false
 	for _, col := range columns {
@@ -1351,11 +1542,9 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		}
 	}
 
-	// BeforeUpdate Hook
-	if hook, ok := any(entity).(interface{ BeforeUpdate(context.Context) error }); ok {
-		if err := hook.BeforeUpdate(ctx); err != nil {
-			return err
-		}
+	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
+	if err := m.callBeforeUpdate(ctx, entity); err != nil {
+		return err
 	}
 
 	// Build UPDATE with specified columns
@@ -1421,11 +1610,9 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	// Sync originals after successful update
 	syncOriginals(entity, m.modelInfo)
 
-	// AfterUpdate Hook
-	if hook, ok := any(entity).(interface{ AfterUpdate(context.Context) error }); ok {
-		if err := hook.AfterUpdate(ctx); err != nil {
-			return err
-		}
+	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
+	if err := m.callAfterUpdate(ctx, entity); err != nil {
+		return err
 	}
 
 	return nil
@@ -1469,12 +1656,19 @@ func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
 // model-level concerns (audit logging, cache invalidation, access control) rather than
 // per-record state inspection.
 func (m *Model[T]) execDelete(ctx context.Context) error {
-	// BeforeDelete Hook (called on a zero-value instance, not per-entity row)
+	// Auto-tx: see Create for rationale. Delete hooks fire on a zero-value *T,
+	// so we probe T (not an entity) for *Tx variants.
+	if m.tx == nil && needsDeleteTx[T]() {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.execDelete(ctx)
+		})
+	}
+
+	// BeforeDelete Hook (called on a zero-value instance, not per-entity row).
+	// Prefers BeforeDeleteTx when implemented.
 	hookEntity := new(T)
-	if hook, ok := any(hookEntity).(interface{ BeforeDelete(context.Context) error }); ok {
-		if err := hook.BeforeDelete(ctx); err != nil {
-			return err
-		}
+	if err := m.callBeforeDelete(ctx, hookEntity); err != nil {
+		return err
 	}
 
 	var sb strings.Builder
@@ -1507,11 +1701,9 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 		return WrapQueryError("DELETE", query, m.args, err)
 	}
 
-	// AfterDelete Hook
-	if hook, ok := any(hookEntity).(interface{ AfterDelete(context.Context) error }); ok {
-		if err := hook.AfterDelete(ctx); err != nil {
-			return err
-		}
+	// AfterDelete Hook (prefers AfterDeleteTx when implemented).
+	if err := m.callAfterDelete(ctx, hookEntity); err != nil {
+		return err
 	}
 
 	return nil
@@ -1768,7 +1960,6 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	return nil
 }
 
-
 // UpdateManyByKey updates multiple records by matching a lookup column to values in a map.
 // Each map key is matched against lookupColumn, and the corresponding map value
 // is set in targetColumn. Uses CASE WHEN syntax for database portability.
@@ -1955,6 +2146,15 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 		return nil
 	}
 
+	// Auto-tx: if entities use a *Tx hook variant (AfterCreateTx) and we're not
+	// already in a transaction, open one so per-row hook DB work rolls back
+	// atomically with the batch INSERT on error.
+	if m.tx == nil && needsCreateTx(entities[0]) {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.BulkInsert(ctx, entities)
+		})
+	}
+
 	// Determine columns from first entity
 	var columns []string
 	var fieldsToInsert []*FieldInfo
@@ -2043,11 +2243,9 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 			}
 		}
 
-		// AfterCreate Hook (per-entity)
-		if hook, ok := any(entity).(interface{ AfterCreate(context.Context) error }); ok {
-			if err := hook.AfterCreate(ctx); err != nil {
-				return err
-			}
+		// AfterCreate Hook (per-entity, prefers AfterCreateTx when implemented).
+		if err := m.callAfterCreate(ctx, entity); err != nil {
+			return err
 		}
 	}
 

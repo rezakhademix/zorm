@@ -1027,7 +1027,7 @@ func TestNested_BelongsToSilentlySkipped(t *testing.T) {
 // ==================== Test 6: Three-Level Nested HasMany ====================
 
 type ThreeLevelAuthor struct {
-	ID    int    `zorm:"primaryKey"`
+	ID    int `zorm:"primaryKey"`
 	Name  string
 	Books []*ThreeLevelBook
 }
@@ -1039,7 +1039,7 @@ func (a ThreeLevelAuthor) BooksRelation() HasMany[ThreeLevelBook] {
 }
 
 type ThreeLevelBook struct {
-	ID                 int    `zorm:"primaryKey"`
+	ID                 int `zorm:"primaryKey"`
 	ThreeLevelAuthorID int
 	Title              string
 	Chapters           []*ThreeLevelChapter
@@ -1052,7 +1052,7 @@ func (b ThreeLevelBook) ChaptersRelation() HasMany[ThreeLevelChapter] {
 }
 
 type ThreeLevelChapter struct {
-	ID               int    `zorm:"primaryKey"`
+	ID               int `zorm:"primaryKey"`
 	ThreeLevelBookID int
 	Heading          string
 }
@@ -1222,7 +1222,7 @@ func TestWith_ChainedCalls(t *testing.T) {
 // ==================== Test 10: HasMany Default FK Inference ====================
 
 type InferAuthor struct {
-	ID    int    `zorm:"primaryKey"`
+	ID    int `zorm:"primaryKey"`
 	Name  string
 	Books []*InferBook
 }
