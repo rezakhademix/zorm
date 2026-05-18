@@ -220,17 +220,17 @@ err = zorm.New[Order]().
 
 ### Write Methods
 
-| Method                                              | Description                                   |
-| --------------------------------------------------- | --------------------------------------------- |
-| `Create(ctx, entity)`                               | Insert single record                          |
-| `CreateMany(ctx, entities)`                         | Insert multiple records                       |
-| `Update(ctx, entity)`                               | Update single record by primary key           |
-| `UpdateMany(ctx, values)`                           | Update multiple records matching query        |
-| `UpdateManyByKey(ctx, lookup, target, map)`         | Update records by matching lookup column keys |
-| `Delete(ctx)`                                       | Delete records matching query                 |
-| `DeleteMany(ctx)`                                   | Alias for Delete                              |
-| `FirstOrCreate(ctx, attrs, values)`                 | Find first or create new                      |
-| `UpdateOrCreate(ctx, attrs, values)`                | Update existing or create new                 |
+| Method                                      | Description                                   |
+| ------------------------------------------- | --------------------------------------------- |
+| `Create(ctx, entity)`                       | Insert single record                          |
+| `CreateMany(ctx, entities)`                 | Insert multiple records                       |
+| `Update(ctx, entity)`                       | Update single record by primary key           |
+| `UpdateMany(ctx, values)`                   | Update multiple records matching query        |
+| `UpdateManyByKey(ctx, lookup, target, map)` | Update records by matching lookup column keys |
+| `Delete(ctx)`                               | Delete records matching query                 |
+| `DeleteMany(ctx)`                           | Alias for Delete                              |
+| `FirstOrCreate(ctx, attrs, values)`         | Find first or create new                      |
+| `UpdateOrCreate(ctx, attrs, values)`        | Update existing or create new                 |
 
 ### Query Builder Methods
 
@@ -455,15 +455,15 @@ ZORM supports lifecycle hooks that are automatically called during CRUD operatio
 
 ### Available Hooks
 
-| Hook                | When Called             | `*Tx` Variant                   |
-| ------------------- | ----------------------- | ------------------------------- |
-| `BeforeCreate(ctx)` | Before INSERT           | `BeforeCreateTx(ctx, tx *Tx)`   |
-| `AfterCreate(ctx)`  | After INSERT            | `AfterCreateTx(ctx, tx *Tx)`    |
-| `BeforeUpdate(ctx)` | Before UPDATE           | `BeforeUpdateTx(ctx, tx *Tx)`   |
-| `AfterUpdate(ctx)`  | After UPDATE            | `AfterUpdateTx(ctx, tx *Tx)`    |
-| `BeforeDelete(ctx)` | Before DELETE           | `BeforeDeleteTx(ctx, tx *Tx)`   |
-| `AfterDelete(ctx)`  | After DELETE            | `AfterDeleteTx(ctx, tx *Tx)`    |
-| `AfterFind(ctx)`    | After SELECT (per row)  | —                               |
+| Hook                | When Called            | `*Tx` Variant                 |
+| ------------------- | ---------------------- | ----------------------------- |
+| `BeforeCreate(ctx)` | Before INSERT          | `BeforeCreateTx(ctx, tx *Tx)` |
+| `AfterCreate(ctx)`  | After INSERT           | `AfterCreateTx(ctx, tx *Tx)`  |
+| `BeforeUpdate(ctx)` | Before UPDATE          | `BeforeUpdateTx(ctx, tx *Tx)` |
+| `AfterUpdate(ctx)`  | After UPDATE           | `AfterUpdateTx(ctx, tx *Tx)`  |
+| `BeforeDelete(ctx)` | Before DELETE          | `BeforeDeleteTx(ctx, tx *Tx)` |
+| `AfterDelete(ctx)`  | After DELETE           | `AfterDeleteTx(ctx, tx *Tx)`  |
+| `AfterFind(ctx)`    | After SELECT (per row) | —                             |
 
 If both a plain hook and its `*Tx` variant are defined on a model, **only the `*Tx` variant fires** — they never both run.
 
@@ -1244,13 +1244,6 @@ func main() {
 ```
 
 ---
-
-## AI-Assisted Development
-
-This project was developed with the help of AI tools, using **Claude Code**. While AI contributed to code suggestions and ideas, **all AI-generated code was reviewed by humans**, and nothing was automatically approved.
-
-This repository is **not entirely AI-written** or **vibe coded**; it reflects modern programming practices enhanced by AI assistance. AI was used as a tool to accelerate development, not replace human judgment and you can see **Claude Code** as a contributor
-
 
 ## Contributing
 
