@@ -33,6 +33,7 @@ type ScalarQuery[T any] struct {
 	limit     int
 	offset    int
 	buildErr  error // Accumulated validation errors surfaced at execution time
+	dialect   Dialect
 }
 
 // Query creates a new scalar query builder for type T.
@@ -41,7 +42,22 @@ func Query[T any]() *ScalarQuery[T] {
 		db:     GetGlobalDB(),
 		wheres: make([]string, 0, 4),
 		args:   make([]any, 0, 4),
+		// dialect resolved lazily by effectiveDialect()
 	}
+}
+
+// effectiveDialect resolves the dialect to use for SQL generation, honoring
+// (in order): an explicit override on the query, the package-wide override,
+// and finally driver-based detection on the configured *sql.DB.
+func (q *ScalarQuery[T]) effectiveDialect() Dialect {
+	if q.dialect != DialectAuto {
+		return q.dialect
+	}
+	db := q.db
+	if db == nil {
+		db = GetGlobalDB()
+	}
+	return detectDialect(db)
 }
 
 // Table sets the table name for the query.
@@ -139,26 +155,16 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 // WhereIn adds a WHERE column IN (...) condition.
 func (q *ScalarQuery[T]) WhereIn(column string, values []any) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereIn: invalid column %q: %w", column, err)
 		return q
 	}
-	if len(values) == 0 {
-		q.wheres = append(q.wheres, "AND 1=0")
+	frag, outArgs, err := buildInClause(column, values, q.effectiveDialect())
+	if err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereIn: %w", err)
 		return q
 	}
-
-	sb := GetStringBuilder()
-	sb.WriteString(column)
-	sb.WriteString(" IN (")
-	for i := range values {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteByte('?')
-	}
-	sb.WriteByte(')')
-	q.wheres = append(q.wheres, "AND "+sb.String())
-	PutStringBuilder(sb)
-	q.args = append(q.args, values...)
+	q.wheres = append(q.wheres, "AND "+frag)
+	q.args = append(q.args, outArgs...)
 	return q
 }
 
@@ -405,6 +411,7 @@ func (q *ScalarQuery[T]) Clone() *ScalarQuery[T] {
 		limit:     q.limit,
 		offset:    q.offset,
 		buildErr:  q.buildErr,
+		dialect:   q.dialect,
 	}
 
 	// Copy slices

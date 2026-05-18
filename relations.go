@@ -539,17 +539,15 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 
 		// Let's duplicate the query logic here, it's safer.
 
+		inFrag, args, err := buildInClause(pk, ids, m.effectiveDialect())
+		if err != nil {
+			return err
+		}
 		var sb strings.Builder
 		sb.WriteString("SELECT * FROM ")
 		sb.WriteString(relatedInfo.TableName)
 		sb.WriteString(" WHERE ")
-		sb.WriteString(pk)
-		sb.WriteString(" IN (")
-		writePlaceholders(&sb, len(ids))
-		sb.WriteString(")")
-
-		args := make([]any, len(ids))
-		copy(args, ids)
+		sb.WriteString(inFrag)
 
 		rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 		if err != nil {
@@ -772,13 +770,11 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	pivotSb.WriteString(" FROM ")
 	pivotSb.WriteString(pivotTable)
 	pivotSb.WriteString(" WHERE ")
-	pivotSb.WriteString(foreignKey)
-	pivotSb.WriteString(" IN (")
-	writePlaceholders(&pivotSb, len(ids))
-	pivotSb.WriteString(")")
-
-	args := make([]any, len(ids))
-	copy(args, ids)
+	inFrag, args, err := buildInClause(foreignKey, ids, m.effectiveDialect())
+	if err != nil {
+		return err
+	}
+	pivotSb.WriteString(inFrag)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(pivotSb.String()), args...)
 	if err != nil {
@@ -1130,13 +1126,11 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 		sb.WriteString(relatedInfo.TableName)
 	}
 	sb.WriteString(" WHERE ")
-	sb.WriteString(key)
-	sb.WriteString(" IN (")
-	writePlaceholders(&sb, len(ids))
-	sb.WriteString(")")
-
-	args := make([]any, len(ids))
-	copy(args, ids)
+	inFrag, args, err := buildInClause(key, ids, m.effectiveDialect())
+	if err != nil {
+		return nil, err
+	}
+	sb.WriteString(inFrag)
 
 	// Apply callback constraints
 	if constraints != nil {
@@ -1244,14 +1238,15 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	sb.WriteString(" WHERE ")
 	sb.WriteString(typeColumn)
 	sb.WriteString(" = ? AND ")
-	sb.WriteString(idColumn)
-	sb.WriteString(" IN (")
-	writePlaceholders(&sb, len(ids))
-	sb.WriteString(")")
+	inFrag, inArgs, err := buildInClause(idColumn, ids, m.effectiveDialect())
+	if err != nil {
+		return err
+	}
+	sb.WriteString(inFrag)
 
-	args := make([]any, 0, len(ids)+1)
+	args := make([]any, 0, len(inArgs)+1)
 	args = append(args, parentType)
-	args = append(args, ids...)
+	args = append(args, inArgs...)
 
 	// Apply callback constraints
 	if constraints != nil {
@@ -1478,16 +1473,14 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	sb.WriteString(" FROM ")
 	sb.WriteString(relatedInfo.TableName)
 	sb.WriteString(" WHERE ")
-	sb.WriteString(foreignKey)
-	sb.WriteString(" IN (")
-	writePlaceholders(&sb, len(ids))
-	sb.WriteString(")")
-
-	args := make([]any, len(ids))
-	copy(args, ids)
+	inFrag, args, err := buildInClause(foreignKey, ids, m.effectiveDialect())
+	if err != nil {
+		return err
+	}
+	sb.WriteString(inFrag)
 
 	// Execute
-	rows, err := m.queryer().QueryContext(ctx, sb.String(), args...)
+	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
 		return err
 	}
@@ -1735,13 +1728,11 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 	pivotSb.WriteString(" FROM ")
 	pivotSb.WriteString(pivotTable)
 	pivotSb.WriteString(" WHERE ")
-	pivotSb.WriteString(foreignKey)
-	pivotSb.WriteString(" IN (")
-	writePlaceholders(&pivotSb, len(ids))
-	pivotSb.WriteString(")")
-
-	args := make([]any, len(ids))
-	copy(args, ids)
+	inFrag, args, err := buildInClause(foreignKey, ids, m.effectiveDialect())
+	if err != nil {
+		return err
+	}
+	pivotSb.WriteString(inFrag)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(pivotSb.String()), args...)
 	if err != nil {
@@ -1903,14 +1894,15 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 	sb.WriteString(" WHERE ")
 	sb.WriteString(typeColumn)
 	sb.WriteString(" = ? AND ")
-	sb.WriteString(idColumn)
-	sb.WriteString(" IN (")
-	writePlaceholders(&sb, len(ids))
-	sb.WriteString(")")
+	inFrag, inArgs, err := buildInClause(idColumn, ids, m.effectiveDialect())
+	if err != nil {
+		return err
+	}
+	sb.WriteString(inFrag)
 
-	args := make([]any, 0, len(ids)+1)
+	args := make([]any, 0, len(inArgs)+1)
 	args = append(args, parentType)
-	args = append(args, ids...)
+	args = append(args, inArgs...)
 
 	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
 	if err != nil {
@@ -2177,11 +2169,12 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 			return fmt.Errorf("invalid related key name: %w", err)
 		}
 		sb.WriteString(" AND ")
-		sb.WriteString(relatedKey)
-		sb.WriteString(" IN (")
-		writePlaceholders(&sb, len(ids))
-		sb.WriteByte(')')
-		args = append(args, ids...)
+		inFrag, inArgs, err := buildInClause(relatedKey, ids, m.effectiveDialect())
+		if err != nil {
+			return err
+		}
+		sb.WriteString(inFrag)
+		args = append(args, inArgs...)
 	}
 
 	_, err := m.queryer().ExecContext(ctx, rebind(sb.String()), args...)

@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -593,4 +594,37 @@ func TestMethodChaining_AllConfigMethods(t *testing.T) {
 	if m.stmtCache != cache {
 		t.Error("StmtCache should be set during chaining")
 	}
+}
+
+// TestAcquireRelease_PoolMayAliasDocumented intentionally exercises the
+// documented footgun in Acquire/Release: the sync.Pool may return the same
+// *Model[T] memory to a fresh Acquire() after Release(), so callers that
+// retain a pointer past Release() can observe state belonging to another
+// caller. This test surfaces the aliasing under typical hot-loop usage so
+// future contributors can see the hazard. The check is probabilistic —
+// failure to observe aliasing skips, but does not prove safety.
+//
+// See model.go (Acquire / Release / reset) for the contract: callers MUST
+// drop the pointer at Release() time.
+func TestAcquireRelease_PoolMayAliasDocumented(t *testing.T) {
+	runtime.GC() // give the pool a chance to drain
+
+	const iters = 500
+	aliased := false
+	for i := 0; i < iters && !aliased; i++ {
+		m1 := Acquire[TestModel]()
+		ptr1 := m1
+		m1.Release()
+
+		m2 := Acquire[TestModel]()
+		if m2 == ptr1 {
+			aliased = true
+		} else {
+			m2.Release()
+		}
+	}
+	if !aliased {
+		t.Skip("did not observe aliasing in this run; sync.Pool behaviour is non-deterministic. The hazard still exists by design — see model.go Acquire/Release.")
+	}
+	t.Log("Acquire returned the same *Model memory after Release — retained references would alias.")
 }

@@ -155,12 +155,17 @@ func TestOrWhere(t *testing.T) {
 	}
 }
 
-// TestWhereIn tests the WhereIn method
+// TestWhereIn tests the WhereIn method under the SQLite dialect, which
+// produces the classic spread-placeholder form. The PostgreSQL dialect emits
+// `= ANY($1)` instead and is covered by TestWhereIn_LargeListUsesANYOnPostgres.
 func TestWhereIn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
 	m := New[TestModel]().WhereIn("id", []any{1, 2, 3})
 	query, args := m.Print()
 
-	expected := "id IN ($1, $2, $3)"
+	expected := "id IN ($1,$2,$3)"
 	if !strings.Contains(query, expected) {
 		t.Errorf("expected query to contain %q, got %q", expected, query)
 	}
@@ -708,8 +713,83 @@ func TestOrderBy_ValidatesDirection(t *testing.T) {
 	}
 }
 
+// TestWhereIn_LargeListUsesANYOnPostgres verifies that on the PostgreSQL
+// dialect WhereIn collapses an arbitrarily large IN list to a single
+// `= ANY($1)` placeholder backed by one typed-slice argument. This sidesteps
+// PostgreSQL's hard 65535-parameter limit and proves the previously-silent
+// overflow can no longer occur.
+func TestWhereIn_LargeListUsesANYOnPostgres(t *testing.T) {
+	SetDialect(DialectPostgres)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	const n = 70000
+	args := make([]any, n)
+	for i := range args {
+		args[i] = int64(i)
+	}
+
+	m := New[TestModel]().WhereIn("id", args)
+	sql, outArgs := m.Print()
+
+	if !strings.Contains(sql, "id = ANY($1)") {
+		t.Fatalf("expected ANY shortcut in SQL, got: %s", sql[:min(len(sql), 200)])
+	}
+	if len(outArgs) != 1 {
+		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
+	}
+	if _, ok := outArgs[0].([]int64); !ok {
+		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
+	}
+}
+
+// TestWhereIn_SQLitePlaceholdersAreSequential verifies that on the SQLite
+// dialect WhereIn falls back to spread placeholders, that they are numbered
+// sequentially after rebind, and that the arg count matches the input.
+func TestWhereIn_SQLitePlaceholdersAreSequential(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	const n = 1000
+	args := make([]any, n)
+	for i := range args {
+		args[i] = i
+	}
+
+	sql, outArgs := New[TestModel]().WhereIn("id", args).Print()
+
+	if got := strings.Count(sql, "$"); got != n {
+		t.Fatalf("expected %d $-placeholders, got %d", n, got)
+	}
+	if len(outArgs) != n {
+		t.Fatalf("expected %d outgoing args, got %d", n, len(outArgs))
+	}
+}
+
+// TestWhereIn_SQLiteRejectsOverflow verifies the SQLite/fallback path
+// surfaces a clear error when the IN list exceeds the PostgreSQL parameter
+// limit, instead of generating an invalid query.
+func TestWhereIn_SQLiteRejectsOverflow(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	args := make([]any, maxInArgs+1)
+	for i := range args {
+		args[i] = i
+	}
+	m := New[TestModel]().WhereIn("id", args)
+	if m.buildErr == nil {
+		t.Fatalf("expected buildErr for IN list of %d args, got nil", len(args))
+	}
+	if !strings.Contains(m.buildErr.Error(), "exceeds PostgreSQL parameter limit") {
+		t.Fatalf("expected limit error, got: %v", m.buildErr)
+	}
+}
+
 // TestWhereIn_ValidatesColumn verifies WhereIn validates column name
 func TestWhereIn_ValidatesColumn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
 	// Valid column
 	m1 := New[TestModel]().WhereIn("id", []any{1, 2, 3})
 	query1, _ := m1.Print()
