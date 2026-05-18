@@ -21,7 +21,7 @@ ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern
 - **Database Splitting**: Automatic read/write split with replica support
 - **Context Support**: All operations respect `context.Context` for cancellation & timeout
 - **Debugging**: `Print()` method to inspect generated SQL without executing
-- **Lifecycle Hooks**: BeforeCreate / AfterCreate, BeforeUpdate / AfterUpdate, BeforeDelete / AfterDelete, AfterFind
+- **Lifecycle Hooks**: BeforeCreate / AfterCreate, BeforeUpdate / AfterUpdate, BeforeDelete / AfterDelete, AfterFind — plus `*Tx` variants for atomic side effects
 - **Accessors**: Computed attributes via getter methods
 
   
@@ -455,15 +455,17 @@ ZORM supports lifecycle hooks that are automatically called during CRUD operatio
 
 ### Available Hooks
 
-| Hook                | When Called             |
-| ------------------- | ----------------------- |
-| `BeforeCreate(ctx)` | Before INSERT           |
-| `AfterCreate(ctx)`  | After INSERT            |
-| `BeforeUpdate(ctx)` | Before UPDATE           |
-| `AfterUpdate(ctx)`  | After UPDATE            |
-| `BeforeDelete(ctx)` | Before DELETE           |
-| `AfterDelete(ctx)`  | After DELETE            |
-| `AfterFind(ctx)`    | After SELECT (per row)  |
+| Hook                | When Called             | `*Tx` Variant                   |
+| ------------------- | ----------------------- | ------------------------------- |
+| `BeforeCreate(ctx)` | Before INSERT           | `BeforeCreateTx(ctx, tx *Tx)`   |
+| `AfterCreate(ctx)`  | After INSERT            | `AfterCreateTx(ctx, tx *Tx)`    |
+| `BeforeUpdate(ctx)` | Before UPDATE           | `BeforeUpdateTx(ctx, tx *Tx)`   |
+| `AfterUpdate(ctx)`  | After UPDATE            | `AfterUpdateTx(ctx, tx *Tx)`    |
+| `BeforeDelete(ctx)` | Before DELETE           | `BeforeDeleteTx(ctx, tx *Tx)`   |
+| `AfterDelete(ctx)`  | After DELETE            | `AfterDeleteTx(ctx, tx *Tx)`    |
+| `AfterFind(ctx)`    | After SELECT (per row)  | —                               |
+
+If both a plain hook and its `*Tx` variant are defined on a model, **only the `*Tx` variant fires** — they never both run.
 
 ### Implementing Hooks
 
@@ -533,6 +535,67 @@ err := zorm.New[User]().Create(ctx, user)
 user.Name = "Jane"
 err = zorm.New[User]().Update(ctx, user)
 ```
+
+### Transactional Hooks (`*Tx` variants)
+
+Plain hooks receive only `context.Context`, so any DB work they do runs on a separate connection from the parent INSERT/UPDATE/DELETE. If the parent SQL fails, the hook's writes are **not** rolled back.
+
+To do hook-side DB work atomically with the parent operation, implement the `*Tx` variant instead. It receives the active `*zorm.Tx` for the running operation:
+
+```go
+type User struct {
+    ID    int64
+    Email string
+    Name  string
+}
+
+// AfterCreateTx writes an audit row through the SAME transaction as the INSERT.
+// If anything later fails and the transaction rolls back, the audit row
+// disappears with the user row.
+func (u *User) AfterCreateTx(ctx context.Context, tx *zorm.Tx) error {
+    _, err := tx.Tx.ExecContext(ctx,
+        `INSERT INTO audit_log (entity, entity_id, action) VALUES (?, ?, ?)`,
+        "user", u.ID, "created",
+    )
+    return err
+}
+```
+
+#### Auto-opened transactions
+
+If a model implements **any** `*Tx` variant relevant to the operation, and the call is made outside an existing transaction, ZORM **auto-opens one** for that call:
+
+```go
+// No outer transaction — ZORM opens one because User has AfterCreateTx.
+// The INSERT and the hook's audit-log write commit together, or roll back together.
+err := zorm.New[User]().Create(ctx, &User{Email: "a@b.com", Name: "Ada"})
+```
+
+Inside an existing transaction (`Transaction(...)` + `WithTx(tx)`), no extra transaction is opened — the hook receives the outer `*Tx` so several operations can share one atomic boundary:
+
+```go
+err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
+    if err := zorm.New[User]().WithTx(tx).Create(ctx, user); err != nil {
+        return err
+    }
+    return zorm.New[Order]().WithTx(tx).Create(ctx, order)
+})
+// AfterCreateTx on both User and Order see the same *Tx.
+// If either fails, both inserts and both hook side-effects roll back together.
+```
+
+#### Calling ZORM from inside a `*Tx` hook
+
+A `*Tx` hook can call ZORM itself bound to the same transaction. This is the idiomatic way to insert a related row atomically:
+
+```go
+func (u *User) AfterCreateTx(ctx context.Context, tx *zorm.Tx) error {
+    profile := &Profile{UserID: u.ID, DisplayName: u.Name}
+    return zorm.New[Profile]().WithTx(tx).Create(ctx, profile)
+}
+```
+
+Note: in-memory mutations to Go fields are **never** rolled back regardless of variant. Only DB writes performed through the passed `*Tx` are atomic with the parent SQL.
 
 ---
 

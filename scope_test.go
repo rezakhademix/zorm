@@ -144,7 +144,6 @@ func TestScope_SearchActiveAdmins(t *testing.T) {
 	}
 }
 
-
 // TestScope_ChainedWithOtherBuilders verifies the parameterised scopes compose
 // with regular builder methods on either side of the Scope call.
 func TestScope_ChainedWithOtherBuilders(t *testing.T) {

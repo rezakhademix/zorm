@@ -80,9 +80,9 @@ type RelatedModel struct {
 
 // ModelWithRelations tests that relation fields are excluded from columns
 type ModelWithRelations struct {
-	ID        int
-	Name      string
-	Related   *RelatedModel   // Should be skipped (pointer to struct)
+	ID          int
+	Name        string
+	Related     *RelatedModel   // Should be skipped (pointer to struct)
 	RelatedMany []*RelatedModel // Should be skipped (slice of pointers to structs)
 }
 

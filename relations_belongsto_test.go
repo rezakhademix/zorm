@@ -1103,7 +1103,7 @@ func TestBelongsTo_UserBranch_DataIntegrity(t *testing.T) {
 // ==================== Nullable FK Edge Cases ====================
 
 type BookNullableFK struct {
-	ID       int  `zorm:"primaryKey"`
+	ID       int `zorm:"primaryKey"`
 	Title    string
 	AuthorID *int
 	Author   *AuthorInt

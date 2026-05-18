@@ -620,12 +620,12 @@ type TestPost struct {
 
 // TestUserWithRelations is a model with relation fields that should be excluded from queries
 type TestUserWithRelations struct {
-	ID        int
-	Name      string
-	Email     string
-	BranchID  *int         // This is a foreign key - should be included
-	Branch    *TestBranch  // This is a relation - should be excluded
-	Posts     []*TestPost  // This is a relation - should be excluded
+	ID       int
+	Name     string
+	Email    string
+	BranchID *int        // This is a foreign key - should be included
+	Branch   *TestBranch // This is a relation - should be excluded
+	Posts    []*TestPost // This is a relation - should be excluded
 }
 
 // TestUpdate_ExcludesRelationFields verifies that Update query doesn't include relation columns
@@ -782,9 +782,9 @@ func TestModelInfo_MultipleRelationsExcluded(t *testing.T) {
 	info := ParseModel[TestUserWithRelations]()
 
 	tests := []struct {
-		name     string
-		field    string
-		column   string
+		name        string
+		field       string
+		column      string
 		shouldExist bool
 	}{
 		{"ID field", "ID", "id", true},

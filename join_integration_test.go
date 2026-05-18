@@ -405,4 +405,3 @@ func TestJoin_Print_MultipleJoins(t *testing.T) {
 		t.Errorf("JOIN clauses are out of order in Print() output: %s", query)
 	}
 }
-

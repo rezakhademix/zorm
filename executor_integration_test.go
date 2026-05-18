@@ -414,8 +414,8 @@ func TestUpdateManyByKey_WithTransaction(t *testing.T) {
 
 // TextModelWithTimestamp for testing auto-update of updated_at
 type TextModelWithTimestamp struct {
-	ID              int       `zorm:"primaryKey"`
-	ReferenceNumber string    `zorm:"column:reference_number"`
+	ID              int    `zorm:"primaryKey"`
+	ReferenceNumber string `zorm:"column:reference_number"`
 	Status          string
 	UpdatedAt       time.Time `zorm:"column:updated_at"`
 }
@@ -498,7 +498,7 @@ func TestUpdateManyByKey_Chunking(t *testing.T) {
 	}
 
 	type BulkText struct {
-		ID     int    `zorm:"primaryKey"`
+		ID     int `zorm:"primaryKey"`
 		Code   string
 		Status string
 	}
@@ -577,7 +577,7 @@ func TestUpdateManyByKey_ConcurrentAccess(t *testing.T) {
 	}
 
 	type ConcurrentText struct {
-		ID     int    `zorm:"primaryKey"`
+		ID     int `zorm:"primaryKey"`
 		Code   string
 		Status string
 	}
@@ -740,9 +740,9 @@ func TestUpdateManyByKey_MixedTypes(t *testing.T) {
 	}
 
 	type TypedRecord struct {
-		ID       int     `zorm:"primaryKey"`
+		ID       int `zorm:"primaryKey"`
 		Code     string
-		IntCode  int     `zorm:"column:int_code"`
+		IntCode  int `zorm:"column:int_code"`
 		Quantity int
 		Price    float64
 		Active   bool
@@ -907,7 +907,7 @@ func TestUpdateManyByKey_ChunkFailureRollback(t *testing.T) {
 	}
 
 	type ChunkText struct {
-		ID     int    `zorm:"primaryKey"`
+		ID     int `zorm:"primaryKey"`
 		Code   string
 		Status string
 	}
