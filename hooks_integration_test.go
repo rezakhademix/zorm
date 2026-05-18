@@ -1253,3 +1253,89 @@ func TestHook_AfterCreateTx_NestedZormCallSharesTx(t *testing.T) {
 		t.Errorf("expected child name 'parent-child', got %q", childName)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Audit regression tests for the *Tx hook dispatch path.
+//
+// An earlier audit claimed two bugs that turned out not to exist:
+//   - that *Tx hooks could receive a Tx wrapping a nil *sql.Tx, and
+//   - that withAutoTx leaked the auto-opened transaction on hook panic.
+//
+// Inspection of executor.go (withAutoTx, callBeforeCreate, callAfterCreate)
+// showed both claims were wrong: the auto-opened *sql.Tx is threaded through
+// WithTx before any hook fires, and the auto-tx defer correctly recovers,
+// rolls back, and re-panics. The two tests below lock that behaviour in.
+// -----------------------------------------------------------------------------
+
+// txHookProbeUser asserts that its *Tx hook receives a non-nil *sql.Tx so
+// callers can safely do `tx.Tx.ExecContext(...)` inside the hook.
+type txHookProbeUser struct {
+	ID       int64
+	Name     string
+	sawTxNil bool
+}
+
+func (u *txHookProbeUser) BeforeCreateTx(_ context.Context, tx *Tx) error {
+	if tx == nil || tx.Tx == nil {
+		u.sawTxNil = true
+		return errors.New("tx was nil")
+	}
+	return nil
+}
+
+func TestTxHook_AutoOpenedTxIsNonNil(t *testing.T) {
+	db := setupHooksDB(t)
+	if _, err := db.Exec(`CREATE TABLE tx_hook_probe_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	SetGlobalDB(db)
+	t.Cleanup(func() { SetGlobalDB(nil) })
+
+	u := &txHookProbeUser{Name: "alice"}
+	if err := New[txHookProbeUser]().Create(context.Background(), u); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if u.sawTxNil {
+		t.Fatal("hook observed nil *sql.Tx — withAutoTx wiring is broken")
+	}
+}
+
+// txHookPanicUser deliberately panics in AfterCreateTx. The auto-opened
+// transaction must be rolled back so the row never lands in the table.
+type txHookPanicUser struct {
+	ID   int64
+	Name string
+}
+
+func (u *txHookPanicUser) AfterCreateTx(_ context.Context, _ *Tx) error {
+	panic("intentional panic from AfterCreateTx for audit regression test")
+}
+
+func TestTxHook_AutoTxRollsBackOnPanic(t *testing.T) {
+	db := setupHooksDB(t)
+	if _, err := db.Exec(`CREATE TABLE tx_hook_panic_users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	SetGlobalDB(db)
+	t.Cleanup(func() { SetGlobalDB(nil) })
+
+	ctx := context.Background()
+	u := &txHookPanicUser{Name: "bob"}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected re-panic from withAutoTx")
+			}
+		}()
+		_ = New[txHookPanicUser]().Create(ctx, u)
+	}()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tx_hook_panic_users`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 rows after panic+rollback; got %d (auto-tx leaked the insert)", count)
+	}
+}

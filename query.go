@@ -380,24 +380,13 @@ func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 		m.buildErr = fmt.Errorf("zorm: WhereIn: invalid column %q: %w", column, err)
 		return m
 	}
-	if len(args) == 0 {
-		// Optimization: 1=0 to return nothing
-		m.wheres = append(m.wheres, "AND 1=0")
+	frag, outArgs, err := buildInClause(column, args, m.effectiveDialect())
+	if err != nil {
+		m.buildErr = fmt.Errorf("zorm: WhereIn: %w", err)
 		return m
 	}
-	// Optimized placeholder building using strings.Builder
-	var sb strings.Builder
-	sb.WriteString(column)
-	sb.WriteString(" IN (")
-	for i := range args {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteByte('?')
-	}
-	sb.WriteByte(')')
-	m.wheres = append(m.wheres, "AND "+sb.String())
-	m.args = append(m.args, args...)
+	m.wheres = append(m.wheres, "AND "+frag)
+	m.args = append(m.args, outArgs...)
 	return m
 }
 
@@ -1167,34 +1156,170 @@ func (m *Model[T]) Omit(columns ...string) *Model[T] {
 	return m
 }
 
-// rebind replaces ? placeholders with $1, $2, etc.
+// rebind rewrites `?` placeholders to PostgreSQL `$N` form while preserving
+// every syntactic context where a `?` is NOT a placeholder:
+//
+//   - single-quoted strings: 'text', with ” as an in-string escape
+//   - double-quoted identifiers: "col", with "" as an in-string escape
+//   - dollar-quoted strings: $$body$$ and $tag$body$tag$
+//   - line comments: -- to end of line
+//   - block comments: /* ... */, with Postgres-style nesting
+//
+// Two escape conventions are honored to let users write Raw() queries that
+// use PostgreSQL's JSON operators (which collide with `?`):
+//
+//   - `??`  → emits a single literal `?` (escape for the JSON `?` operator)
+//   - `?|`  → emitted verbatim (JSON "any key exists" operator)
+//   - `?&`  → emitted verbatim (JSON "all keys exist" operator)
+//
+// Every other unquoted `?` is replaced with `$N` where N is a running counter.
 func rebind(query string) string {
 	sb := GetStringBuilder()
 	defer PutStringBuilder(sb)
-
-	// Pre-allocate assuming similar length plus some extra for placeholders
 	sb.Grow(len(query) + 16)
 
-	questionMarkCount := 0
-	inQuote := false
-
-	for i := 0; i < len(query); i++ {
+	n := 0
+	i := 0
+	for i < len(query) {
 		c := query[i]
-		if c == '\'' {
-			inQuote = !inQuote
-		}
-
-		if c == '?' && !inQuote {
-			questionMarkCount++
+		switch {
+		case c == '\'':
+			sb.WriteByte('\'')
+			i++
+			for i < len(query) {
+				if query[i] == '\'' {
+					sb.WriteByte('\'')
+					i++
+					if i < len(query) && query[i] == '\'' {
+						sb.WriteByte('\'')
+						i++
+						continue
+					}
+					break
+				}
+				sb.WriteByte(query[i])
+				i++
+			}
+		case c == '"':
+			sb.WriteByte('"')
+			i++
+			for i < len(query) {
+				if query[i] == '"' {
+					sb.WriteByte('"')
+					i++
+					if i < len(query) && query[i] == '"' {
+						sb.WriteByte('"')
+						i++
+						continue
+					}
+					break
+				}
+				sb.WriteByte(query[i])
+				i++
+			}
+		case c == '$' && i+1 < len(query) && isDollarQuoteStart(query, i):
+			tag := dollarQuoteTag(query, i)
+			sb.WriteString(tag)
+			i += len(tag)
+			for i < len(query) {
+				if i+len(tag) <= len(query) && query[i:i+len(tag)] == tag {
+					sb.WriteString(tag)
+					i += len(tag)
+					break
+				}
+				sb.WriteByte(query[i])
+				i++
+			}
+		case c == '-' && i+1 < len(query) && query[i+1] == '-':
+			for i < len(query) && query[i] != '\n' {
+				sb.WriteByte(query[i])
+				i++
+			}
+		case c == '/' && i+1 < len(query) && query[i+1] == '*':
+			sb.WriteByte('/')
+			sb.WriteByte('*')
+			i += 2
+			depth := 1
+			for i < len(query) && depth > 0 {
+				if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
+					sb.WriteByte('/')
+					sb.WriteByte('*')
+					i += 2
+					depth++
+					continue
+				}
+				if i+1 < len(query) && query[i] == '*' && query[i+1] == '/' {
+					sb.WriteByte('*')
+					sb.WriteByte('/')
+					i += 2
+					depth--
+					continue
+				}
+				sb.WriteByte(query[i])
+				i++
+			}
+		case c == '?':
+			if i+1 < len(query) {
+				switch query[i+1] {
+				case '?':
+					sb.WriteByte('?')
+					i += 2
+					continue
+				case '|', '&':
+					sb.WriteByte('?')
+					sb.WriteByte(query[i+1])
+					i += 2
+					continue
+				}
+			}
+			n++
 			sb.WriteByte('$')
-			sb.WriteString(strconv.Itoa(questionMarkCount))
-		} else {
+			sb.WriteString(strconv.Itoa(n))
+			i++
+		default:
 			sb.WriteByte(c)
+			i++
 		}
 	}
 
-	// Clone the string to ensure it's independent of the builder's buffer.
-	// While strings.Builder.Reset() nils the buffer (making reuse safe in practice),
-	// explicitly cloning provides defense-in-depth against implementation changes.
+	// Clone to detach from the pooled builder's buffer.
 	return strings.Clone(sb.String())
+}
+
+// isDollarQuoteStart reports whether query[i] begins a Postgres dollar-quoted
+// string opener: `$$` or `$tag$` where tag matches [A-Za-z_][A-Za-z_0-9]*.
+// It returns false for bare `$N` placeholder references.
+func isDollarQuoteStart(query string, i int) bool {
+	if query[i] != '$' {
+		return false
+	}
+	j := i + 1
+	if j < len(query) && query[j] == '$' {
+		return true
+	}
+	if j >= len(query) || !isIdentStart(query[j]) {
+		return false
+	}
+	for j < len(query) && isIdentCont(query[j]) {
+		j++
+	}
+	return j < len(query) && query[j] == '$'
+}
+
+// dollarQuoteTag returns the opening tag for a dollar-quoted string starting
+// at query[i]. Caller must have verified via isDollarQuoteStart.
+func dollarQuoteTag(query string, i int) string {
+	j := i + 1
+	for j < len(query) && query[j] != '$' {
+		j++
+	}
+	return query[i : j+1]
+}
+
+func isIdentStart(b byte) bool {
+	return b == '_' || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+func isIdentCont(b byte) bool {
+	return isIdentStart(b) || (b >= '0' && b <= '9')
 }

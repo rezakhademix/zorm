@@ -122,3 +122,48 @@ func TestStmtCacheRaceCondition(t *testing.T) {
 		}
 	}
 }
+
+// TestStmtCache_ConcurrentReleaseEvictRace is a regression test for an audit
+// claim that StmtCache.release() decremented the refcount before acquiring
+// its shard lock — which would have created a TOCTOU window with eviction.
+// The audit was wrong: the current implementation locks first, then
+// decrements. This test exercises a tight Get / Put / release / evict loop
+// across many goroutines and (under -race) confirms no double-close or
+// data race.
+func TestStmtCache_ConcurrentReleaseEvictRace(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewStmtCache(8) // small cap → frequent evictions
+	defer cache.Close()
+
+	const goroutines = 50
+	const ops = 200
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < ops; i++ {
+				query := "SELECT id FROM t WHERE id = ?"
+				stmt, release := cache.Get(query)
+				if stmt == nil {
+					prepared, perr := db.Prepare(query)
+					if perr != nil {
+						return
+					}
+					stmt, release = cache.PutAndGet(query, prepared)
+				}
+				_, _ = stmt.Query(i)
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+}

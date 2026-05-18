@@ -136,6 +136,10 @@ type Model[T any] struct {
 	// buildErr accumulates errors from query builder methods (e.g., invalid column names)
 	// that are surfaced at execution time (Get, First, Count, etc.)
 	buildErr error
+
+	// dialect controls dialect-specific SQL generation (notably IN-list rewriting).
+	// Populated from the configured *sql.DB at New[T]() / Acquire[T]() time.
+	dialect Dialect
 }
 
 // CTE represents a Common Table Expression.
@@ -165,7 +169,23 @@ func New[T any]() *Model[T] {
 		forceReplica:      -1, // -1 means auto-select
 		wheres:            make([]string, 0, 4),
 		args:              make([]any, 0, 4),
+		// dialect intentionally left as DialectAuto; resolved lazily via
+		// effectiveDialect() so SetDB / GlobalDB swaps after construction work.
 	}
+}
+
+// effectiveDialect resolves the dialect to use for SQL generation, honoring
+// (in order): an explicit override on the model, the package-wide override,
+// and finally driver-based detection on the configured *sql.DB.
+func (m *Model[T]) effectiveDialect() Dialect {
+	if m.dialect != DialectAuto {
+		return m.dialect
+	}
+	db := m.db
+	if db == nil {
+		db = GetGlobalDB()
+	}
+	return detectDialect(db)
 }
 
 // getModelPool returns the sync.Pool for the given model type T.
@@ -215,6 +235,7 @@ func Acquire[T any]() *Model[T] {
 	m.db = GetGlobalDB()
 	m.modelInfo = modelInfo
 	m.forceReplica = -1
+	m.dialect = DialectAuto
 	return m
 }
 
@@ -290,6 +311,7 @@ func (m *Model[T]) reset() {
 	m.omitColumns = nil
 	m.trackingScope = nil
 	m.buildErr = nil
+	m.dialect = DialectAuto
 }
 
 // Clone creates a deep copy of the Model.
@@ -329,6 +351,7 @@ func (m *Model[T]) Clone() *Model[T] {
 		forcePrimary: m.forcePrimary,
 		forceReplica: m.forceReplica,
 		buildErr:     m.buildErr,
+		dialect:      m.dialect,
 	}
 
 	// Copy slices
