@@ -425,8 +425,8 @@ func TestParseModel_PrimaryKeyKeyword(t *testing.T) {
 	if !f.IsPrimary {
 		t.Error("UUID should be marked primary")
 	}
-	// `primaryKey` implies auto-increment only for integer kinds (GORM
-	// behavior). A string PK like a UUID must NOT be flagged auto, otherwise
+	// `primaryKey` implies auto-increment only for integer kinds.
+	//  A string PK like a UUID must NOT be flagged auto, otherwise
 	// caller-supplied values would be dropped on insert.
 	if f.IsAuto {
 		t.Error("primaryKey shorthand on a string PK must NOT imply auto-increment")
