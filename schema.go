@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"database/sql"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -417,15 +418,27 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 				case "auto":
 					isAuto = true
 				case "primaryKey":
+					// GORM-style alias for `primary`. Implies auto-increment
+					// only for integer kinds — string/UUID PKs are left
+					// non-auto so callers can supply their own value.
 					isPrimary = true
-					isAuto = true
+					if isIntegerKind(field.Type.Kind()) {
+						isAuto = true
+					}
 				case "version":
 					isVersion = true
 				default:
 					// Bare-form shorthand: `zorm:"full_name"` overrides the
-					// column name. Only fires when the token has no `:` so
-					// unknown `key:value` pairs stay no-ops (forward-compat).
+					// column name. Only fires when the token has no `:` and
+					// the value is a valid bare column identifier (no commas,
+					// spaces, dots, parens, etc.) so common typos like
+					// `zorm:"primary,auto"` panic loudly instead of silently
+					// renaming the column to garbage.
 					if key != "" && !strings.Contains(part, ":") {
+						if err := validateBareColumnTag(key); err != nil {
+							panic(fmt.Sprintf("zorm: field %q on %s: invalid bare-form tag %q: %v (use `column:%s` for explicit column override, or `;` to separate multiple tag tokens)",
+								field.Name, typ.Name(), key, err, key))
+						}
 						dbCol = key
 					}
 				}
@@ -484,15 +497,95 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 	}
 }
 
-// isVersionableKind reports whether kind is a supported integer kind for an
-// optimistic-lock version column.
-func isVersionableKind(k reflect.Kind) bool {
+// isIntegerKind reports whether the kind is a signed or unsigned integer.
+// Used by the `primaryKey` shorthand to decide whether to imply auto-increment.
+func isIntegerKind(k reflect.Kind) bool {
 	switch k {
-	case reflect.Int, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint32, reflect.Uint64:
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return true
 	}
 	return false
+}
+
+// validateBareColumnTag enforces that a bare-form `zorm:"name"` value is a
+// plain SQL identifier: ASCII letters/digits/underscore, starting with a
+// letter or underscore. Rejects commas, spaces, dots, parens, and other
+// characters that ValidateColumnName permits in SELECT lists but that are
+// meaningless as a column-rename target. Catches typos like
+// `zorm:"primary,auto"` (which should have been semicolon-separated).
+func validateBareColumnTag(s string) error {
+	if s == "" {
+		return fmt.Errorf("empty column name")
+	}
+	for i, r := range s {
+		ok := r == '_' ||
+			(r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(i > 0 && r >= '0' && r <= '9')
+		if !ok {
+			return fmt.Errorf("invalid character %q at position %d", r, i)
+		}
+	}
+	return nil
+}
+
+// versionKindTable is the single source of truth for which reflect.Kind
+// values are accepted as optimistic-lock `version` columns and what their
+// safe upper bound is. Adding a new supported kind here automatically wires
+// it through isVersionableKind, maxVersionForKind, toInt64Version, and
+// setInt64Version — eliminating the four-parallel-switch hazard the
+// previous implementation had.
+var versionKindTable = map[reflect.Kind]int64{
+	reflect.Int:    math.MaxInt64,
+	reflect.Int32:  math.MaxInt32,
+	reflect.Int64:  math.MaxInt64,
+	reflect.Uint:   math.MaxInt64, // toInt64Version casts uint→int64
+	reflect.Uint32: math.MaxUint32,
+	reflect.Uint64: math.MaxInt64, // values above MaxInt64 already broken upstream
+}
+
+// isVersionableKind reports whether kind is a supported integer kind for an
+// optimistic-lock version column.
+func isVersionableKind(k reflect.Kind) bool {
+	_, ok := versionKindTable[k]
+	return ok
+}
+
+// maxVersionForKind returns the largest int64 value that can be safely
+// stored in the given reflect.Kind without overflow when written back via
+// setInt64Version. Returns math.MaxInt64 for unsupported kinds (defensive).
+func maxVersionForKind(k reflect.Kind) int64 {
+	if max, ok := versionKindTable[k]; ok {
+		return max
+	}
+	return math.MaxInt64
+}
+
+// toInt64Version reads an int* / uint* reflect.Value as int64. Caller
+// guarantees the kind is one accepted by isVersionableKind.
+func toInt64Version(v reflect.Value) int64 {
+	switch v.Kind() {
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		return v.Int()
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		return int64(v.Uint())
+	}
+	return 0
+}
+
+// setInt64Version writes n into an int* / uint* reflect.Value, mirroring the
+// kinds accepted by toInt64Version.
+func setInt64Version(v reflect.Value, n int64) {
+	if !v.CanSet() {
+		return
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		v.SetInt(n)
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		v.SetUint(uint64(n))
+	}
 }
 
 // timeType is cached to avoid repeated reflect.TypeOf calls.

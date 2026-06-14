@@ -112,11 +112,11 @@ func TestSave_Versioned_ConcurrentWritersExactlyOneWins(t *testing.T) {
 	}
 
 	var (
-		wg         sync.WaitGroup
-		successes  atomic.Int32
-		conflicts  atomic.Int32
-		otherErrs  atomic.Int32
-		startGate  = make(chan struct{})
+		wg        sync.WaitGroup
+		successes atomic.Int32
+		conflicts atomic.Int32
+		otherErrs atomic.Int32
+		startGate = make(chan struct{})
 	)
 	for i := 0; i < writers; i++ {
 		i := i

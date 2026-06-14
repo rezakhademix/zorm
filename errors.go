@@ -61,6 +61,9 @@ var (
 	// ErrSaveUntracked is returned when Save() is called on an entity that has
 	// no dirty-tracking baseline (was never loaded via Find/First/Get)
 	ErrSaveUntracked = errors.New("zorm: Save requires a tracked entity")
+	// ErrVersionOverflow is returned when Save() would increment a version
+	// column past the maximum value of its field type. Prevents silent wraparound.
+	ErrVersionOverflow = errors.New("zorm: version column overflow")
 
 	// ErrColumnNotFound Schema errors
 	// ErrColumnNotFound is returned when a column doesn't exist

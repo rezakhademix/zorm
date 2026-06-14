@@ -1130,48 +1130,52 @@ func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) (er
 	return
 }
 
-// needsCreateTx reports whether T implements any *Tx hook variant fired by Create.
-func needsCreateTx[T any](entity *T) bool {
-	if _, ok := any(entity).(interface {
-		BeforeCreateTx(context.Context, *Tx) error
-	}); ok {
-		return true
-	}
-	if _, ok := any(entity).(interface {
-		AfterCreateTx(context.Context, *Tx) error
-	}); ok {
-		return true
-	}
-	return false
-}
+// writeOp identifies one of the three write operations that dispatch hooks.
+// Used by needsAutoTx to consolidate the per-op *Tx-variant detection that
+// was previously implemented as three near-identical functions.
+type writeOp int
 
-// needsUpdateTx reports whether T implements any *Tx hook variant fired by Update.
-func needsUpdateTx[T any](entity *T) bool {
-	if _, ok := any(entity).(interface {
-		BeforeUpdateTx(context.Context, *Tx) error
-	}); ok {
-		return true
-	}
-	if _, ok := any(entity).(interface {
-		AfterUpdateTx(context.Context, *Tx) error
-	}); ok {
-		return true
-	}
-	return false
-}
+const (
+	opCreate writeOp = iota + 1
+	opUpdate
+	opDelete
+)
 
-// needsDeleteTx reports whether T implements any *Tx hook variant fired by Delete.
-func needsDeleteTx[T any]() bool {
-	zero := new(T)
-	if _, ok := any(zero).(interface {
-		BeforeDeleteTx(context.Context, *Tx) error
-	}); ok {
-		return true
-	}
-	if _, ok := any(zero).(interface {
-		AfterDeleteTx(context.Context, *Tx) error
-	}); ok {
-		return true
+// needsAutoTx reports whether T implements either *Tx hook variant for op.
+// A non-nil entity is used for opCreate/opUpdate (the caller already has one);
+// opDelete fires on a zero-value *T because Delete is a WHERE-based batch op.
+func needsAutoTx[T any](op writeOp, entity *T) bool {
+	switch op {
+	case opCreate:
+		if _, ok := any(entity).(interface {
+			BeforeCreateTx(context.Context, *Tx) error
+		}); ok {
+			return true
+		}
+		_, ok := any(entity).(interface {
+			AfterCreateTx(context.Context, *Tx) error
+		})
+		return ok
+	case opUpdate:
+		if _, ok := any(entity).(interface {
+			BeforeUpdateTx(context.Context, *Tx) error
+		}); ok {
+			return true
+		}
+		_, ok := any(entity).(interface {
+			AfterUpdateTx(context.Context, *Tx) error
+		})
+		return ok
+	case opDelete:
+		if _, ok := any(entity).(interface {
+			BeforeDeleteTx(context.Context, *Tx) error
+		}); ok {
+			return true
+		}
+		_, ok := any(entity).(interface {
+			AfterDeleteTx(context.Context, *Tx) error
+		})
+		return ok
 	}
 	return false
 }
@@ -1292,7 +1296,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 	// Auto-tx: if the entity uses a *Tx hook variant and we're not already in a
 	// transaction, open one so hook DB work rolls back atomically with the INSERT.
-	if m.tx == nil && needsCreateTx(entity) {
+	if m.tx == nil && needsAutoTx(opCreate, entity) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.Create(ctx, entity)
 		})
@@ -1400,7 +1404,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	}
 
 	// Auto-tx: see Create for rationale.
-	if m.tx == nil && needsUpdateTx(entity) {
+	if m.tx == nil && needsAutoTx(opUpdate, entity) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.Update(ctx, entity)
 		})
@@ -1517,7 +1521,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	}
 
 	// Auto-tx: see Create for rationale.
-	if m.tx == nil && needsUpdateTx(entity) {
+	if m.tx == nil && needsAutoTx(opUpdate, entity) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.UpdateColumns(ctx, entity, columns...)
 		})
@@ -1623,15 +1627,21 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 //
 // Unlike Update, which writes every non-primary column, Save inspects the
 // dirty-tracking baseline and emits an UPDATE containing only columns whose
-// current value differs from the loaded one. If no columns are dirty, Save
-// returns nil without issuing SQL — hooks are not fired in this no-op case.
+// current value differs from the loaded one.
 //
 // When the model declares a `version` field (struct tag includes `version`),
 // Save performs optimistic concurrency control: it appends `AND <col> = ?`
 // with the loaded version to WHERE and `<col> = <col> + 1` to SET. If the
-// UPDATE matches zero rows, Save returns ErrOptimisticLock (use
-// IsOptimisticLock to test). On success, the in-memory version field is
-// incremented to match the new row state.
+// UPDATE matches zero rows, Save probes the table to distinguish two cases:
+//
+//   - the row still exists: a concurrent writer bumped the version,
+//     Save returns ErrOptimisticLock (test with IsOptimisticLock);
+//   - the row no longer exists: another tx deleted it,
+//     Save returns ErrRecordNotFound (test with IsNotFound).
+//
+// On success, the in-memory version field is incremented. To prevent silent
+// wraparound, Save returns ErrVersionOverflow when the loaded version is at
+// the maximum value of its field type.
 //
 // Save requires:
 //   - a non-zero primary key on entity (use Create for inserts);
@@ -1640,16 +1650,16 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 //     ErrSaveUntracked to prevent silent full-column rewrites that would
 //     overwrite columns with zero values. Use Update for full writes.
 //
-// Hooks: when Save issues SQL it fires BeforeUpdate / AfterUpdate (and their
-// *Tx variants) in the same positions as Update. When Save is a no-op
-// (nothing dirty) it returns nil without firing hooks.
+// Hooks: Save fires BeforeUpdate / AfterUpdate (and their *Tx variants) in
+// the same positions as Update — including when the entity is clean and no
+// SQL is issued. Audit-logging hooks therefore see every Save() call.
 func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	if entity == nil {
 		return ErrNilPointer
 	}
 
 	// Auto-tx: see Create for rationale.
-	if m.tx == nil && needsUpdateTx(entity) {
+	if m.tx == nil && needsAutoTx(opUpdate, entity) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.Save(ctx, entity)
 		})
@@ -1674,8 +1684,16 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		return ErrSaveUntracked
 	}
 
-	// Compute dirty set BEFORE auto-touching updated_at so a true no-op stays
-	// a no-op (otherwise touching updated_at would always force a write).
+	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented). Fires
+	// regardless of dirty state so observability captures every Save() call,
+	// matching Update's behavior. Hook may mutate fields; dirty is computed
+	// after to observe any such mutations.
+	if err := m.callBeforeUpdate(ctx, entity); err != nil {
+		return err
+	}
+
+	// Compute dirty set AFTER BeforeUpdate so hook mutations are observed,
+	// and BEFORE auto-touching updated_at so a true no-op stays a no-op.
 	dirty := getDirty(entity, m.modelInfo)
 
 	// If anything changed, auto-touch updated_at (matching Update's behavior).
@@ -1701,15 +1719,11 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		delete(dirty, m.modelInfo.VersionField.Column)
 	}
 
-	// No data changes => true no-op. Mirrors Hibernate / EF Core: an unchanged
-	// entity does not consume a version slot just because Save was called.
+	// No data changes => no-op. Still fire AfterUpdate so audit hooks see the
+	// Save() call. Mirrors Hibernate semantics for clean entities except that
+	// hooks fire (ZORM's observability contract).
 	if len(dirty) == 0 {
-		return nil
-	}
-
-	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
-	if err := m.callBeforeUpdate(ctx, entity); err != nil {
-		return err
+		return m.callAfterUpdate(ctx, entity)
 	}
 
 	// Sort columns for stable SQL output (helps tests and Print()).
@@ -1729,11 +1743,19 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 
 	var loadedVersion int64
 	var hasVersion bool
+	var versionKind reflect.Kind
 	if m.modelInfo.VersionField != nil {
 		vf := m.modelInfo.VersionField
 		hasVersion = true
 		vVal := val.FieldByIndex(vf.Index)
+		versionKind = vVal.Kind()
 		loadedVersion = toInt64Version(vVal)
+		// Refuse to wrap around silently. The next increment would either
+		// overflow int64 or wrap a smaller integer type back to a negative
+		// value, breaking the optimistic-lock invariant.
+		if loadedVersion >= maxVersionForKind(versionKind) {
+			return fmt.Errorf("zorm: %w on %s.%s (loaded=%d)", ErrVersionOverflow, m.modelInfo.TableName, vf.Column, loadedVersion)
+		}
 		sets = append(sets, vf.Column+" = "+vf.Column+" + 1")
 	}
 
@@ -1785,6 +1807,15 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	}
 	if affected == 0 {
 		if hasVersion {
+			// Distinguish "row deleted by another tx" from "version stale" so
+			// callers can pick merge-vs-abort instead of retrying forever.
+			exists, existErr := m.rowExists(ctx, pkVal)
+			if existErr != nil {
+				return WrapQueryError("UPDATE", query, values, existErr)
+			}
+			if !exists {
+				return ErrRecordNotFound
+			}
 			return ErrOptimisticLock
 		}
 		return ErrRecordNotFound
@@ -1807,6 +1838,23 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	return nil
 }
 
+// rowExists probes whether a row with the given primary key still exists in
+// the model's table. Used by Save to distinguish ErrRecordNotFound from
+// ErrOptimisticLock when an optimistic-lock UPDATE matches zero rows.
+func (m *Model[T]) rowExists(ctx context.Context, pkVal any) (bool, error) {
+	q := "SELECT 1 FROM " + m.modelInfo.TableName + " WHERE " + m.modelInfo.PrimaryKey + " = ? LIMIT 1"
+	row := m.queryerForWrite().QueryRowContext(ctx, rebind(q), pkVal)
+	var one int
+	switch err := row.Scan(&one); err {
+	case nil:
+		return true, nil
+	case sql.ErrNoRows:
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // isZeroPK reports whether the primary-key value is the zero value of its
 // type. Numeric zero, empty string, and nil pointer/interface all count as
 // "not yet inserted".
@@ -1818,31 +1866,9 @@ func isZeroPK(v any) bool {
 	return rv.IsZero()
 }
 
-// toInt64Version reads an int* / uint* reflect.Value as int64. Caller
-// guarantees the kind is one accepted by isVersionableKind.
-func toInt64Version(v reflect.Value) int64 {
-	switch v.Kind() {
-	case reflect.Int, reflect.Int32, reflect.Int64:
-		return v.Int()
-	case reflect.Uint, reflect.Uint32, reflect.Uint64:
-		return int64(v.Uint())
-	}
-	return 0
-}
-
-// setInt64Version writes n into an int* / uint* reflect.Value, mirroring the
-// kinds accepted by toInt64Version.
-func setInt64Version(v reflect.Value, n int64) {
-	if !v.CanSet() {
-		return
-	}
-	switch v.Kind() {
-	case reflect.Int, reflect.Int32, reflect.Int64:
-		v.SetInt(n)
-	case reflect.Uint, reflect.Uint32, reflect.Uint64:
-		v.SetUint(uint64(n))
-	}
-}
+// isVersionableKind / maxVersionForKind / toInt64Version / setInt64Version
+// live in schema.go alongside one versionKindTable so adding a new integer
+// kind requires editing one place rather than four parallel switches.
 
 // Delete deletes records matching the current query conditions.
 // At least one WHERE condition is required to prevent accidental full-table deletes.
@@ -1884,7 +1910,7 @@ func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
 func (m *Model[T]) execDelete(ctx context.Context) error {
 	// Auto-tx: see Create for rationale. Delete hooks fire on a zero-value *T,
 	// so we probe T (not an entity) for *Tx variants.
-	if m.tx == nil && needsDeleteTx[T]() {
+	if m.tx == nil && needsAutoTx(opDelete, new(T)) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.execDelete(ctx)
 		})
@@ -2375,7 +2401,7 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 	// Auto-tx: if entities use a *Tx hook variant (AfterCreateTx) and we're not
 	// already in a transaction, open one so per-row hook DB work rolls back
 	// atomically with the batch INSERT on error.
-	if m.tx == nil && needsCreateTx(entities[0]) {
+	if m.tx == nil && needsAutoTx(opCreate, entities[0]) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.BulkInsert(ctx, entities)
 		})
