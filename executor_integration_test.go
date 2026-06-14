@@ -469,6 +469,91 @@ func TestUpdateManyByKey_UpdatesTimestamp(t *testing.T) {
 	}
 }
 
+// tsModelBoth mirrors a typical user model with both timestamp columns; used
+// to verify plain Update() auto-populates updated_at when the caller does not
+// set it explicitly.
+type tsModelBoth struct {
+	ID        int `zorm:"primaryKey"`
+	Name      string
+	Age       int
+	UpdatedAt time.Time `zorm:"column:updated_at"`
+	CreatedAt time.Time `zorm:"column:created_at"`
+}
+
+func (tsModelBoth) TableName() string { return "ts_models_both" }
+
+func TestUpdate_AutoSetsUpdatedAt(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE ts_models_both (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			age INTEGER,
+			updated_at DATETIME,
+			created_at DATETIME
+		);
+		INSERT INTO ts_models_both (id, name, age, updated_at, created_at) VALUES
+			(1, 'orig', 30, '2020-01-01 00:00:00', '2020-01-01 00:00:00');
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Load the existing row so CreatedAt is non-zero and UpdatedAt reflects
+	// the seeded 2020 value.
+	row, err := New[tsModelBoth]().SetDB(db).Where("id", 1).First(ctx)
+	if err != nil {
+		t.Fatalf("First failed: %v", err)
+	}
+	seededCreatedAt := row.CreatedAt
+	seededUpdatedAt := row.UpdatedAt
+
+	// Mutate a non-timestamp field; do NOT touch UpdatedAt.
+	row.Name = "changed"
+
+	beforeUpdate := time.Now()
+	if err := New[tsModelBoth]().SetDB(db).Update(ctx, row); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	// Re-fetch and assert updated_at advanced to ~time.Now() and is not the
+	// zero time.Time value.
+	after, err := New[tsModelBoth]().SetDB(db).Where("id", 1).First(ctx)
+	if err != nil {
+		t.Fatalf("re-fetch failed: %v", err)
+	}
+
+	if after.UpdatedAt.IsZero() {
+		t.Fatalf("expected updated_at to be auto-set, got zero value")
+	}
+	if after.UpdatedAt.Equal(seededUpdatedAt) {
+		t.Fatalf("expected updated_at to change from seeded %v, still %v", seededUpdatedAt, after.UpdatedAt)
+	}
+	// Allow a small clock skew window; updated_at should be at or after
+	// beforeUpdate (truncated to second since sqlite DATETIME loses sub-second
+	// precision depending on driver formatting).
+	if after.UpdatedAt.Before(beforeUpdate.Truncate(time.Second)) {
+		t.Errorf("expected updated_at >= %v, got %v", beforeUpdate, after.UpdatedAt)
+	}
+
+	// Sanity: created_at must not be overwritten by Update.
+	if !after.CreatedAt.Equal(seededCreatedAt) {
+		t.Errorf("created_at should be unchanged by Update; was %v, now %v", seededCreatedAt, after.CreatedAt)
+	}
+
+	// Sanity: the non-timestamp mutation was persisted.
+	if after.Name != "changed" {
+		t.Errorf("expected name 'changed', got %q", after.Name)
+	}
+}
+
 func TestUpdateManyByKey_Chunking(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
