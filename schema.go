@@ -411,6 +411,16 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 					isPrimary = true
 				case "auto":
 					isAuto = true
+				case "primaryKey":
+					isPrimary = true
+					isAuto = true
+				default:
+					// Bare-form shorthand: `zorm:"full_name"` overrides the
+					// column name. Only fires when the token has no `:` so
+					// unknown `key:value` pairs stay no-ops (forward-compat).
+					if key != "" && !strings.Contains(part, ":") {
+						dbCol = key
+					}
 				}
 			}
 		}

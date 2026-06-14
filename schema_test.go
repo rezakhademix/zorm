@@ -1,8 +1,12 @@
 package zorm
 
 import (
+	"context"
+	"database/sql"
 	"reflect"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestToSnakeCase(t *testing.T) {
@@ -373,4 +377,326 @@ func TestSetField_Exhaustive(t *testing.T) {
 	})
 
 	_ = info // Avoid unused
+}
+
+// bareTagModel exercises the new bare-form tag shorthand.
+type bareTagModel struct {
+	ID       int
+	Name     string `zorm:"full_name"`
+	NickName string `zorm:"alias"`
+}
+
+func TestParseModel_BareFormTag(t *testing.T) {
+	info := ParseModel[bareTagModel]()
+
+	if f, ok := info.Columns["full_name"]; !ok || f.Name != "Name" {
+		t.Errorf("expected bare-form column full_name -> Name, got %+v (ok=%v)", f, ok)
+	}
+	if f, ok := info.Columns["alias"]; !ok || f.Name != "NickName" {
+		t.Errorf("expected bare-form column alias -> NickName, got %+v (ok=%v)", f, ok)
+	}
+	// Default snake_case is unchanged when no tag is given.
+	if _, ok := info.Columns["id"]; !ok {
+		t.Error("expected default column id for ID field")
+	}
+	// Ensure the original default column (snake_case of field name) is NOT
+	// also registered when the bare tag overrides it.
+	if _, ok := info.Columns["name"]; ok {
+		t.Error("bare tag full_name should replace default column name, not add it")
+	}
+}
+
+// primaryKeyTagModel exercises the new `primaryKey` keyword on a non-ID field.
+type primaryKeyTagModel struct {
+	UUID string `zorm:"primaryKey"`
+	Name string
+}
+
+func TestParseModel_PrimaryKeyKeyword(t *testing.T) {
+	info := ParseModel[primaryKeyTagModel]()
+
+	if info.PrimaryKey != "uuid" {
+		t.Errorf("expected primary key uuid, got %s", info.PrimaryKey)
+	}
+	f, ok := info.Columns["uuid"]
+	if !ok {
+		t.Fatal("missing column uuid")
+	}
+	if !f.IsPrimary {
+		t.Error("UUID should be marked primary")
+	}
+	if !f.IsAuto {
+		t.Error("primaryKey shorthand should imply auto-increment")
+	}
+}
+
+// mixedTagModel mixes a bare-form column name with a keyword flag.
+type mixedTagModel struct {
+	ID  int
+	Foo int `zorm:"primary;widget_id"`
+}
+
+func TestParseModel_MixedBareAndKeyword(t *testing.T) {
+	info := ParseModel[mixedTagModel]()
+
+	if info.PrimaryKey != "widget_id" {
+		t.Errorf("expected primary key widget_id, got %s", info.PrimaryKey)
+	}
+	f, ok := info.Columns["widget_id"]
+	if !ok {
+		t.Fatal("missing column widget_id")
+	}
+	if !f.IsPrimary {
+		t.Error("Foo should be marked primary")
+	}
+	if f.IsAuto {
+		t.Error("Foo should NOT be auto (no auto/primaryKey keyword present)")
+	}
+}
+
+// longFormTagModel verifies that the existing long-form tags still work
+// untouched after the parser extension.
+type longFormTagModel struct {
+	ID    int64  `zorm:"column:id;primary;auto"`
+	Email string `zorm:"column:email_address"`
+}
+
+func TestParseModel_LongFormStillWorks(t *testing.T) {
+	info := ParseModel[longFormTagModel]()
+
+	if info.PrimaryKey != "id" {
+		t.Errorf("expected primary key id, got %s", info.PrimaryKey)
+	}
+	pk, ok := info.Columns["id"]
+	if !ok {
+		t.Fatal("missing column id")
+	}
+	if !pk.IsPrimary || !pk.IsAuto {
+		t.Errorf("expected id to be primary+auto, got primary=%v auto=%v", pk.IsPrimary, pk.IsAuto)
+	}
+	if _, ok := info.Columns["email_address"]; !ok {
+		t.Error("missing column email_address")
+	}
+}
+
+// orderIndepModel — bare token appears BEFORE the keyword. Result must match
+// the keyword-first ordering covered in TestParseModel_MixedBareAndKeyword.
+type orderIndepModel struct {
+	ID  int
+	Foo int `zorm:"widget_id;primary"`
+}
+
+func TestParseModel_BareAndKeywordOrderIndependent(t *testing.T) {
+	info := ParseModel[orderIndepModel]()
+
+	if info.PrimaryKey != "widget_id" {
+		t.Errorf("expected primary key widget_id, got %s", info.PrimaryKey)
+	}
+	f, ok := info.Columns["widget_id"]
+	if !ok {
+		t.Fatal("missing column widget_id")
+	}
+	if !f.IsPrimary {
+		t.Error("Foo should be marked primary regardless of token order")
+	}
+	if f.IsAuto {
+		t.Error("Foo should NOT be auto (only 'primary' keyword, not 'auto' or 'primaryKey')")
+	}
+}
+
+// forwardCompatModel — an unknown `key:value` pair must remain a no-op so the
+// tag vocabulary can grow later without churning consumers. Only the bare,
+// no-colon form is treated as a column override.
+type forwardCompatModel struct {
+	ID   int
+	Name string `zorm:"unknown:something;primary"`
+}
+
+func TestParseModel_UnknownKeyValueIsNoOp(t *testing.T) {
+	info := ParseModel[forwardCompatModel]()
+
+	// Column must stay as default snake_case of the field name, NOT 'unknown'.
+	if _, ok := info.Columns["name"]; !ok {
+		t.Error("expected default column name to survive unknown key:value tag")
+	}
+	if _, ok := info.Columns["unknown"]; ok {
+		t.Error("unknown key:value pair must not set the column name")
+	}
+	if _, ok := info.Columns["something"]; ok {
+		t.Error("value half of unknown pair must not become a column")
+	}
+	// Sibling keyword in the same tag must still apply.
+	if info.PrimaryKey != "name" {
+		t.Errorf("expected primary key name (set by sibling 'primary'), got %s", info.PrimaryKey)
+	}
+}
+
+// reservedEscapeModel — column literally named `primary` collides with the
+// reserved keyword. Long-form `column:primary` must win and override the
+// keyword interpretation.
+type reservedEscapeModel struct {
+	ID    int
+	Field string `zorm:"column:primary"`
+}
+
+func TestParseModel_ReservedKeywordEscapeViaColumnPrefix(t *testing.T) {
+	info := ParseModel[reservedEscapeModel]()
+
+	f, ok := info.Columns["primary"]
+	if !ok {
+		t.Fatal("expected column literally named 'primary' from column: escape")
+	}
+	if f.Name != "Field" {
+		t.Errorf("expected Field->primary mapping, got Name=%s", f.Name)
+	}
+	if f.IsPrimary {
+		t.Error("column:primary must NOT mark the field as primary key")
+	}
+	if info.PrimaryKey != "id" {
+		t.Errorf("primary key should still be id, got %s", info.PrimaryKey)
+	}
+}
+
+// collisionInner — embedded; carries a bare-form tag that maps to a column
+// also produced by another sibling's default snake_case. Parser must accept
+// both Fields entries; Columns is a map so the last-parsed FieldInfo wins
+// (documented behavior — caller must avoid the collision).
+type CollisionInner struct {
+	FullName string // default column: full_name
+}
+type collisionModel struct {
+	ID    int
+	Other string `zorm:"full_name"` // bare-form collides with FullName's default
+	CollisionInner
+}
+
+func TestParseModel_BareTagCollisionWithDefaultSnakeCase(t *testing.T) {
+	info := ParseModel[collisionModel]()
+
+	// Both Field entries must exist — Fields is keyed by Go field name.
+	if _, ok := info.Fields["Other"]; !ok {
+		t.Error("Field 'Other' should still be registered")
+	}
+	if _, ok := info.Fields["FullName"]; !ok {
+		t.Error("Embedded field 'FullName' should still be registered")
+	}
+
+	// Columns is map[string]*FieldInfo — collision means one wins. Document
+	// the winner so callers see deterministic behavior. parseFields walks
+	// top-level fields then embedded; the embedded FullName is parsed last
+	// because the embedded struct sits AFTER `Other` in the outer struct's
+	// declaration order, so FullName's default snake_case is the final
+	// write to Columns["full_name"].
+	col, ok := info.Columns["full_name"]
+	if !ok {
+		t.Fatal("missing column full_name")
+	}
+	if col.Name != "FullName" {
+		t.Errorf("expected late-parsed FullName to win the column collision, got %s", col.Name)
+	}
+
+	// Sanity: id default still present.
+	if _, ok := info.Columns["id"]; !ok {
+		t.Error("missing default id column")
+	}
+}
+
+// embeddedBareTagOuter — bare-form tag on a field inside an embedded struct
+// must still take effect when reached via parseFields' recursive walk.
+type EmbeddedBareTagInner struct {
+	Email string `zorm:"contact_email"`
+}
+type embeddedBareTagOuter struct {
+	ID int
+	EmbeddedBareTagInner
+	Note string `zorm:"memo"`
+}
+
+func TestParseModel_BareTagInsideEmbeddedStruct(t *testing.T) {
+	info := ParseModel[embeddedBareTagOuter]()
+
+	f, ok := info.Columns["contact_email"]
+	if !ok {
+		t.Fatal("expected embedded field's bare-tag column contact_email to be registered")
+	}
+	if f.Name != "Email" {
+		t.Errorf("expected Email field to back column contact_email, got %s", f.Name)
+	}
+	// Field index must address the embedded path (len > 1) so reflection can
+	// reach the value at runtime — otherwise scans/inserts would panic.
+	if len(f.Index) < 2 {
+		t.Errorf("expected nested field index path for embedded field, got %v", f.Index)
+	}
+
+	// Outer-level bare tag also lands.
+	if _, ok := info.Columns["memo"]; !ok {
+		t.Error("missing bare-tag column memo on outer field")
+	}
+
+	// Default snake_case for the embedded field's struct-style name MUST NOT
+	// also land — the tag override replaces it.
+	if _, ok := info.Columns["email"]; ok {
+		t.Error("embedded Email should not also register as the default 'email' column when a bare tag overrides it")
+	}
+}
+
+// crudBareTagModel — end-to-end test: bare-form tag must propagate through
+// the executor (INSERT column list, UPDATE SET clause, SELECT scan), not just
+// the parsed ModelInfo. Uses a real SQLite table whose column names match
+// the bare-form tags rather than the Go field names.
+type crudBareTagModel struct {
+	ID       int    `zorm:"primaryKey"`
+	UserName string `zorm:"login"`   // DB column: login (NOT user_name)
+	Bio      string `zorm:"profile"` // DB column: profile
+}
+
+func (crudBareTagModel) TableName() string { return "bare_crud" }
+
+func TestParseModel_BareTagEndToEndCRUD(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`CREATE TABLE bare_crud (id INTEGER PRIMARY KEY, login TEXT, profile TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create — INSERT must use `login` and `profile`, NOT `user_name`/`bio`.
+	row := &crudBareTagModel{UserName: "alice", Bio: "first bio"}
+	if err := New[crudBareTagModel]().SetDB(db).Create(ctx, row); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if row.ID == 0 {
+		t.Fatal("expected RETURNING id to populate row.ID")
+	}
+
+	// First — SELECT scan must map login/profile back into the Go fields.
+	got, err := New[crudBareTagModel]().SetDB(db).Where("id", row.ID).First(ctx)
+	if err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if got.UserName != "alice" || got.Bio != "first bio" {
+		t.Errorf("scan mismatch: got %+v", got)
+	}
+
+	// Update — SET clause must reference login/profile.
+	got.UserName = "alice2"
+	got.Bio = "second bio"
+	if err := New[crudBareTagModel]().SetDB(db).Update(ctx, got); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// Verify with a raw SQL query against the actual DB column names so the
+	// test fails loudly if the executor accidentally generated user_name/bio.
+	var login, profile string
+	if err := db.QueryRow(`SELECT login, profile FROM bare_crud WHERE id = ?`, row.ID).Scan(&login, &profile); err != nil {
+		t.Fatalf("raw verify: %v", err)
+	}
+	if login != "alice2" || profile != "second bio" {
+		t.Errorf("DB row mismatch: login=%q profile=%q", login, profile)
+	}
 }
