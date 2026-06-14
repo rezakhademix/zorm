@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"maps"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1616,6 +1617,231 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	}
 
 	return nil
+}
+
+// Save persists in-memory changes to entity using a dirty-aware UPDATE.
+//
+// Unlike Update, which writes every non-primary column, Save inspects the
+// dirty-tracking baseline and emits an UPDATE containing only columns whose
+// current value differs from the loaded one. If no columns are dirty, Save
+// returns nil without issuing SQL — hooks are not fired in this no-op case.
+//
+// When the model declares a `version` field (struct tag includes `version`),
+// Save performs optimistic concurrency control: it appends `AND <col> = ?`
+// with the loaded version to WHERE and `<col> = <col> + 1` to SET. If the
+// UPDATE matches zero rows, Save returns ErrOptimisticLock (use
+// IsOptimisticLock to test). On success, the in-memory version field is
+// incremented to match the new row state.
+//
+// Save requires:
+//   - a non-zero primary key on entity (use Create for inserts);
+//   - a dirty-tracking baseline, established by loading the entity via
+//     Find / First / Get. A manually-constructed entity is rejected with
+//     ErrSaveUntracked to prevent silent full-column rewrites that would
+//     overwrite columns with zero values. Use Update for full writes.
+//
+// Hooks: when Save issues SQL it fires BeforeUpdate / AfterUpdate (and their
+// *Tx variants) in the same positions as Update. When Save is a no-op
+// (nothing dirty) it returns nil without firing hooks.
+func (m *Model[T]) Save(ctx context.Context, entity *T) error {
+	if entity == nil {
+		return ErrNilPointer
+	}
+
+	// Auto-tx: see Create for rationale.
+	if m.tx == nil && needsUpdateTx(entity) {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.Save(ctx, entity)
+		})
+	}
+
+	val := reflect.ValueOf(entity).Elem()
+
+	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+	if !ok {
+		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
+	}
+	pkVal := val.FieldByIndex(pkField.Index).Interface()
+	if isZeroPK(pkVal) {
+		return fmt.Errorf("zorm: Save requires non-zero primary key on %s; use Create for inserts", m.modelInfo.TableName)
+	}
+
+	// Reject untracked entities: without a baseline, getDirty would treat every
+	// non-PK field as dirty and silently rewrite the whole row (overwriting
+	// columns that the caller never intended to touch). Callers must load via
+	// Find / First / Get, or fall back to Update for full-column writes.
+	if !IsTracked(entity) {
+		return ErrSaveUntracked
+	}
+
+	// Compute dirty set BEFORE auto-touching updated_at so a true no-op stays
+	// a no-op (otherwise touching updated_at would always force a write).
+	dirty := getDirty(entity, m.modelInfo)
+
+	// If anything changed, auto-touch updated_at (matching Update's behavior).
+	if len(dirty) > 0 {
+		if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
+			if _, alreadyDirty := dirty["updated_at"]; !alreadyDirty {
+				fieldVal := val.FieldByIndex(fieldInfo.Index)
+				if fieldVal.CanSet() {
+					_ = setFieldValue(fieldVal, time.Now())
+					dirty["updated_at"] = fieldVal.Interface()
+				}
+			}
+		}
+	}
+
+	// Drop omitted columns and the version column (it is managed separately).
+	for col := range dirty {
+		if m.omitColumns != nil && m.omitColumns[col] {
+			delete(dirty, col)
+		}
+	}
+	if m.modelInfo.VersionField != nil {
+		delete(dirty, m.modelInfo.VersionField.Column)
+	}
+
+	// No data changes => true no-op. Mirrors Hibernate / EF Core: an unchanged
+	// entity does not consume a version slot just because Save was called.
+	if len(dirty) == 0 {
+		return nil
+	}
+
+	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
+	if err := m.callBeforeUpdate(ctx, entity); err != nil {
+		return err
+	}
+
+	// Sort columns for stable SQL output (helps tests and Print()).
+	cols := make([]string, 0, len(dirty))
+	for col := range dirty {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+
+	sets := make([]string, 0, len(cols)+1) // +1 for optional `version = version + 1`
+	values := make([]any, 0, len(cols)+2)  // +1 for PK, +1 for optional version WHERE arg
+
+	for _, col := range cols {
+		sets = append(sets, col+" = ?")
+		values = append(values, dirty[col])
+	}
+
+	var loadedVersion int64
+	var hasVersion bool
+	if m.modelInfo.VersionField != nil {
+		vf := m.modelInfo.VersionField
+		hasVersion = true
+		vVal := val.FieldByIndex(vf.Index)
+		loadedVersion = toInt64Version(vVal)
+		sets = append(sets, vf.Column+" = "+vf.Column+" + 1")
+	}
+
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+	sb.WriteString("UPDATE ")
+	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(" SET ")
+	sb.WriteString(strings.Join(sets, ", "))
+	sb.WriteString(" WHERE ")
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	sb.WriteString(" = ?")
+	values = append(values, pkVal)
+
+	if hasVersion {
+		sb.WriteString(" AND ")
+		sb.WriteString(m.modelInfo.VersionField.Column)
+		sb.WriteString(" = ?")
+		values = append(values, loadedVersion)
+	}
+
+	query := sb.String()
+	allArgs := append(cteArgs, values...)
+
+	var result sql.Result
+	var err error
+	if m.stmtCache != nil {
+		var stmt *sql.Stmt
+		var release func()
+		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
+		if err != nil {
+			return WrapQueryError("PREPARE", query, values, err)
+		}
+		defer release()
+		result, err = stmt.ExecContext(ctx, allArgs...)
+	} else {
+		result, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
+	}
+
+	if err != nil {
+		return WrapQueryError("UPDATE", query, values, err)
+	}
+
+	affected, raErr := result.RowsAffected()
+	if raErr != nil {
+		// Driver could not report the row count; we cannot safely tell success
+		// from a version conflict, so refuse to mutate the in-memory baseline.
+		return WrapQueryError("UPDATE", query, values, raErr)
+	}
+	if affected == 0 {
+		if hasVersion {
+			return ErrOptimisticLock
+		}
+		return ErrRecordNotFound
+	}
+
+	// Bump in-memory version to mirror the new row state.
+	if hasVersion {
+		vVal := val.FieldByIndex(m.modelInfo.VersionField.Index)
+		setInt64Version(vVal, loadedVersion+1)
+	}
+
+	// Refresh originals so subsequent Save() sees the new clean baseline.
+	syncOriginals(entity, m.modelInfo)
+
+	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
+	if err := m.callAfterUpdate(ctx, entity); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// isZeroPK reports whether the primary-key value is the zero value of its
+// type. Numeric zero, empty string, and nil pointer/interface all count as
+// "not yet inserted".
+func isZeroPK(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.IsZero()
+}
+
+// toInt64Version reads an int* / uint* reflect.Value as int64. Caller
+// guarantees the kind is one accepted by isVersionableKind.
+func toInt64Version(v reflect.Value) int64 {
+	switch v.Kind() {
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		return v.Int()
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		return int64(v.Uint())
+	}
+	return 0
+}
+
+// setInt64Version writes n into an int* / uint* reflect.Value, mirroring the
+// kinds accepted by toInt64Version.
+func setInt64Version(v reflect.Value, n int64) {
+	if !v.CanSet() {
+		return
+	}
+	switch v.Kind() {
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		v.SetInt(n)
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		v.SetUint(uint64(n))
+	}
 }
 
 // Delete deletes records matching the current query conditions.
