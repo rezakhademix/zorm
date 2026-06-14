@@ -246,6 +246,10 @@ type ModelInfo struct {
 	RelationFields  map[string][]int      // FieldName -> field index for FieldByIndex (relation fields)
 	Accessors       []int                 // Indices of methods starting with "Get"
 	RelationMethods map[string]int        // MethodName -> Index
+	// VersionField, when non-nil, points to a field flagged with the `version`
+	// tag modifier. Save() uses it for optimistic concurrency control:
+	// the UPDATE checks the current version in WHERE and increments it.
+	VersionField *FieldInfo
 }
 
 // FieldInfo holds data about a single field in the model.
@@ -392,6 +396,7 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 		dbCol := ToSnakeCase(field.Name)
 		isPrimary := false
 		isAuto := false
+		isVersion := false
 
 		// Parse tag
 		if tag != "" {
@@ -414,6 +419,8 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 				case "primaryKey":
 					isPrimary = true
 					isAuto = true
+				case "version":
+					isVersion = true
 				default:
 					// Bare-form shorthand: `zorm:"full_name"` overrides the
 					// column name. Only fires when the token has no `:` so
@@ -462,7 +469,30 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 
 		info.Fields[field.Name] = fInfo
 		info.Columns[dbCol] = fInfo
+
+		if isVersion {
+			if !isVersionableKind(field.Type.Kind()) {
+				panic(fmt.Sprintf("zorm: field %q on %s tagged `version` must be an integer type, got %s",
+					field.Name, typ.Name(), field.Type.Kind()))
+			}
+			if info.VersionField != nil {
+				panic(fmt.Sprintf("zorm: model %s declares more than one `version` field (%s and %s)",
+					typ.Name(), info.VersionField.Name, field.Name))
+			}
+			info.VersionField = fInfo
+		}
 	}
+}
+
+// isVersionableKind reports whether kind is a supported integer kind for an
+// optimistic-lock version column.
+func isVersionableKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 // timeType is cached to avoid repeated reflect.TypeOf calls.

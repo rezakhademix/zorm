@@ -56,6 +56,11 @@ var (
 	ErrTransactionDeadlock = errors.New("zorm: transaction deadlock")
 	// ErrSerializationFailure is returned for serialization failures
 	ErrSerializationFailure = errors.New("zorm: serialization failure")
+	// ErrOptimisticLock is returned when Save() detects a concurrent modification
+	ErrOptimisticLock = errors.New("zorm: optimistic lock conflict")
+	// ErrSaveUntracked is returned when Save() is called on an entity that has
+	// no dirty-tracking baseline (was never loaded via Find/First/Get)
+	ErrSaveUntracked = errors.New("zorm: Save requires a tracked entity")
 
 	// ErrColumnNotFound Schema errors
 	// ErrColumnNotFound is returned when a column doesn't exist
@@ -576,6 +581,11 @@ func IsDeadlock(err error) bool {
 // IsSerializationFailure checks if the error is a serialization failure.
 func IsSerializationFailure(err error) bool {
 	return errors.Is(err, ErrSerializationFailure)
+}
+
+// IsOptimisticLock checks if the error is an optimistic lock conflict from Save().
+func IsOptimisticLock(err error) bool {
+	return errors.Is(err, ErrOptimisticLock)
 }
 
 // IsConnectionError checks if the error is a connection failure.

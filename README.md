@@ -224,7 +224,8 @@ err = zorm.New[Order]().
 | ------------------------------------------- | --------------------------------------------- |
 | `Create(ctx, entity)`                       | Insert single record                          |
 | `CreateMany(ctx, entities)`                 | Insert multiple records                       |
-| `Update(ctx, entity)`                       | Update single record by primary key           |
+| `Update(ctx, entity)`                       | Update all non-PK columns by primary key      |
+| `Save(ctx, entity)`                         | Update only dirty columns; optimistic-lock aware |
 | `UpdateMany(ctx, values)`                   | Update multiple records matching query        |
 | `UpdateManyByKey(ctx, lookup, target, map)` | Update records by matching lookup column keys |
 | `Delete(ctx)`                               | Delete records matching query                 |
@@ -905,6 +906,8 @@ zorm.ErrTimeout            // Operation timeout
 // Transaction errors
 zorm.ErrTransactionDeadlock    // Deadlock detected
 zorm.ErrSerializationFailure  // Serialization failure
+zorm.ErrOptimisticLock         // Save() detected concurrent modification
+zorm.ErrSaveUntracked          // Save() called on entity not loaded from DB
 
 // Schema errors
 zorm.ErrColumnNotFound     // Column doesn't exist
@@ -965,6 +968,67 @@ if err != nil {
 ---
 
 ## Advanced Features
+
+### Save() vs Update()
+
+`Update(ctx, entity)` writes every non-primary column. `Save(ctx, entity)`
+inspects the dirty-tracking baseline (set when the entity was loaded via
+`Find` / `First` / `Get`) and emits an `UPDATE` containing only columns that
+actually changed. If nothing changed, `Save` is a no-op and issues no SQL.
+
+```go
+user, _ := zorm.New[User]().Find(ctx, 1)
+user.Name = "Renamed"
+
+err := zorm.New[User]().Save(ctx, user)
+// UPDATE users SET name = ?, updated_at = ? WHERE id = ?
+// (only the dirty columns; "value", "email", etc. are NOT rewritten)
+```
+
+`Save` requires:
+
+- a non-zero primary key on the entity (use `Create` to insert); and
+- a dirty-tracking baseline, i.e. the entity must have been loaded via
+  `Find` / `First` / `Get`. A manually-constructed entity is rejected with
+  `ErrSaveUntracked` so it cannot silently rewrite columns to zero values.
+  Use `Update` for full-column writes from a hand-built entity.
+
+Hooks: `Save` fires `BeforeUpdate` / `AfterUpdate` (and the `*Tx` variants)
+in the same positions as `Update` whenever it issues SQL. When `Save` is a
+no-op (nothing dirty) it returns `nil` without firing hooks. If the row was
+deleted between load and save and no version column is configured, `Save`
+returns `ErrRecordNotFound`.
+
+### Optimistic Concurrency
+
+Add a `version` tag to a numeric field to enable optimistic locking on
+`Save()`. The version is checked in `WHERE` and incremented in `SET`; if a
+concurrent writer already bumped it, the UPDATE matches zero rows and `Save`
+returns `ErrOptimisticLock`.
+
+```go
+type Order struct {
+    ID      int64  `zorm:"primaryKey"`
+    Status  string
+    Version int64  `zorm:"version"`  // marks the optimistic-lock column
+}
+
+a, _ := zorm.New[Order]().Find(ctx, 1)  // Version == 1
+b, _ := zorm.New[Order]().Find(ctx, 1)  // Version == 1
+
+a.Status = "paid"
+_ = zorm.New[Order]().Save(ctx, a)      // OK; a.Version == 2 in DB and memory
+
+b.Status = "cancelled"
+err := zorm.New[Order]().Save(ctx, b)
+if zorm.IsOptimisticLock(err) {
+    // re-load, reapply change, retry
+}
+```
+
+Supported version-field kinds: `int`, `int32`, `int64`, `uint`, `uint32`,
+`uint64`. At most one `version` field per model. The check applies only to
+`Save`; `Update` and `UpdateColumns` are left as full-write escape hatches.
 
 ### Statement Caching
 
