@@ -109,6 +109,8 @@ go test -v -run TestRelations ./...
 - **errors.go** — Sentinel errors and `IsNotFound` / `IsDuplicateKey` / `IsConnectionError` / etc. helpers, plus `QueryError` with operation/table/constraint context.
 - **postgres.go** — `ConnectPostgres(dsn, *DBConfig)` helper (uses `pgx/v5/stdlib`).
 - **dirty.go** — Change tracking. `Print()` (defined in `query.go`, mirrored in `scalar.go` for `ScalarQuery`) returns SQL+args without executing for debugging.
+- **pkg.go** — `Dialect` enum (`DialectAuto` / `DialectPostgres` / `DialectSQLite`) plus `SetDialect()` / `GetDialect()` package-wide override, driver-name auto-detection via `detectDialect()`, and `buildInClause()` which emits `col = ANY($1)` with a typed-slice arg on Postgres (sidesteps the 65535 bind-param limit) or `col IN (?, ?, ...)` on SQLite. Mixed-type `[]any` slices fall back to the `IN` form; SQLite/fallback inputs larger than `maxInArgs` (65535) return an error instead of producing invalid SQL.
+- **examples/** — `stmt_cache_example.go` standalone usage demo.
 
 ### Key Patterns
 
@@ -121,6 +123,8 @@ go test -v -run TestRelations ./...
 **Global DB**: Set `zorm.GlobalDB` (or call `zorm.SetGlobalDB(db)` for thread-safety) at startup. Per-query override via `SetDB(db)` or `WithTx(tx)`.
 
 **Placeholder rebinding**: `rebind()` in `query.go` converts `?` to `$1, $2, …` for PostgreSQL. SQLite (used by tests) keeps `?`. Most query paths apply this automatically; a few relation-loader paths call it explicitly. Relevant when reading generated SQL via `Print()` or hand-writing `Raw(...)` queries.
+
+**Dialect override**: rebinding + IN-clause shape derive from `detectDialect()` (driver-name sniff). Call `zorm.SetDialect(zorm.DialectSQLite)` at startup to force a dialect — useful for tests using a non-standard driver name or for `Print()` on a model with no bound DB (defaults to Postgres). For large IN-lists on Postgres, pass a typed slice (`[]int64`, `[]string`, `[]float64`, `[]bool`) so `buildInClause` picks the `= ANY($1)` fast path; otherwise the 65535 parameter cap applies.
 
 ### Hooks & Accessors
 
