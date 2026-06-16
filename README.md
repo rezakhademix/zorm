@@ -220,18 +220,18 @@ err = zorm.New[Order]().
 
 ### Write Methods
 
-| Method                                      | Description                                   |
-| ------------------------------------------- | --------------------------------------------- |
-| `Create(ctx, entity)`                       | Insert single record                          |
-| `CreateMany(ctx, entities)`                 | Insert multiple records                       |
-| `Update(ctx, entity)`                       | Update all non-PK columns by primary key      |
+| Method                                      | Description                                      |
+| ------------------------------------------- | ------------------------------------------------ |
+| `Create(ctx, entity)`                       | Insert single record                             |
+| `CreateMany(ctx, entities)`                 | Insert multiple records                          |
+| `Update(ctx, entity)`                       | Update all non-PK columns by primary key         |
 | `Save(ctx, entity)`                         | Update only dirty columns; optimistic-lock aware |
-| `UpdateMany(ctx, values)`                   | Update multiple records matching query        |
-| `UpdateManyByKey(ctx, lookup, target, map)` | Update records by matching lookup column keys |
-| `Delete(ctx)`                               | Delete records matching query                 |
-| `DeleteMany(ctx)`                           | Alias for Delete                              |
-| `FirstOrCreate(ctx, attrs, values)`         | Find first or create new                      |
-| `UpdateOrCreate(ctx, attrs, values)`        | Update existing or create new                 |
+| `UpdateMany(ctx, values)`                   | Update multiple records matching query           |
+| `UpdateManyByKey(ctx, lookup, target, map)` | Update records by matching lookup column keys    |
+| `Delete(ctx)`                               | Delete records matching query                    |
+| `DeleteMany(ctx)`                           | Alias for Delete                                 |
+| `FirstOrCreate(ctx, attrs, values)`         | Find first or create new                         |
+| `UpdateOrCreate(ctx, attrs, values)`        | Update existing or create new                    |
 
 ### Query Builder Methods
 
@@ -1309,6 +1309,59 @@ func main() {
 ```
 
 ---
+
+## zorm benchmarks
+
+Cross-ORM benchmark suite comparing **zorm** against:
+
+- [ent](https://github.com/ent/ent)
+- [gorm](https://github.com/go-gorm/gorm)
+- [sqlx](https://github.com/jmoiron/sqlx)
+
+All four run the same workload against the same in-memory SQLite database, with
+identical seed data, identical row shapes, and identical iteration semantics so
+the numbers compare apples to apples (with the caveats noted below).
+
+## The model
+
+A portable two-table schema (`users` and `posts`) chosen to exercise the
+common Go datatypes without needing a Postgres-only column type:
+
+| Column     | Go type     | SQLite affinity     |
+| ---------- | ----------- | ------------------- |
+| id         | `int64`     | INTEGER PK          |
+| name       | `string`    | TEXT                |
+| email      | `string`    | TEXT UNIQUE         |
+| age        | `int64`     | INTEGER             |
+| score      | `float64`   | REAL                |
+| is_active  | `bool`      | INTEGER 0/1         |
+| nickname   | `*string`   | TEXT NULL           |
+| avatar     | `[]byte`    | BLOB                |
+| metadata   | `string`    | TEXT (JSON-as-text) |
+| created_at | `time.Time` | DATETIME            |
+
+`posts` adds a `user_id` foreign key so `User HasMany Post` /
+`Post BelongsTo User` is exercised by the eager-load benchmarks.
+
+## Benchmark
+
+Recorded on Apple M3 Pro / darwin/arm64, SQLite `:memory:`, single connection.
+Lower is better. Raw `go test -bench=. -benchmem` output:
+
+### Side-by-side (ns/op · B/op · allocs/op)
+
+| Op                  | gorm                           | zorm                            | Winner (ns/op) |
+| ------------------- | ------------------------------ | ------------------------------- | -------------- |
+| InsertOne           | 11,047 · 6,732 · 87            | 10,911 · 4,661 · 72             | zorm           |
+| GetByPK             | 8,873 · 5,515 · 109            | 8,493 · 4,818 · 103             | zorm           |
+| UpdateOne           | 9,418 · 10,040 · 101           | 7,342 · 4,460 · 63              | zorm           |
+| DeleteOne           | 6,605 · 3,106 · 40             | 5,971 · 1,879 · 29              | zorm           |
+| BulkInsert100       | 305,729 · 213,582 · 3,203      | 1,234,804 · 221,158 · 3,479     | gorm           |
+| BulkInsert1000      | 2,988,061 · 1,991,097 · 31,411 | 50,519,979 · 2,140,176 · 35,262 | gorm           |
+| FindWhereOrderLimit | 249,172 · 56,515 · 1,387       | 247,887 · 67,647 · 1,626        | zorm           |
+| TxInsert100         | 1,608,794 · 703,747 · 9,256    | 1,536,454 · 541,881 · 7,899     | zorm           |
+| EagerLoadHasMany    | 1,435,784 · 627,648 · 17,223   | 1,124,967 · 444,236 · 11,573    | zorm           |
+| EagerLoadBelongsTo  | 318,111 · 177,928 · 3,798      | 289,290 · 152,650 · 3,476       | zorm           |
 
 ## Contributing
 
