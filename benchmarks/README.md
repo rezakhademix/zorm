@@ -10,30 +10,23 @@ All four run the same workload against the same in-memory SQLite database, with
 identical seed data, identical row shapes, and identical iteration semantics so
 the numbers compare apples to apples (with the caveats noted below).
 
-## Why a separate Go module
-
-This directory has its own `go.mod` so the heavyweight peer dependencies
-(`gorm.io/gorm`, `entgo.io/ent`, …) don't pollute zorm's root module. Library
-consumers `go get github.com/rezakhademix/zorm` and pull only `pgx`, `sqlite3`,
-and `uuid` — nothing more.
-
 ## The model
 
 A portable two-table schema (`users` and `posts`) chosen to exercise the
 common Go datatypes without needing a Postgres-only column type:
 
-| Column      | Go type      | SQLite affinity |
-|-------------|--------------|-----------------|
-| id          | `int64`      | INTEGER PK      |
-| name        | `string`     | TEXT            |
-| email       | `string`     | TEXT UNIQUE     |
-| age         | `int64`      | INTEGER         |
-| score       | `float64`    | REAL            |
-| is_active   | `bool`       | INTEGER 0/1     |
-| nickname    | `*string`    | TEXT NULL       |
-| avatar      | `[]byte`     | BLOB            |
-| metadata    | `string`     | TEXT (JSON-as-text) |
-| created_at  | `time.Time`  | DATETIME        |
+| Column     | Go type     | SQLite affinity     |
+| ---------- | ----------- | ------------------- |
+| id         | `int64`     | INTEGER PK          |
+| name       | `string`    | TEXT                |
+| email      | `string`    | TEXT UNIQUE         |
+| age        | `int64`     | INTEGER             |
+| score      | `float64`   | REAL                |
+| is_active  | `bool`      | INTEGER 0/1         |
+| nickname   | `*string`   | TEXT NULL           |
+| avatar     | `[]byte`    | BLOB                |
+| metadata   | `string`    | TEXT (JSON-as-text) |
+| created_at | `time.Time` | DATETIME            |
 
 `posts` adds a `user_id` foreign key so `User HasMany Post` /
 `Post BelongsTo User` is exercised by the eager-load benchmarks.
@@ -47,18 +40,18 @@ Each ORM has its own `*_bench_test.go` file. All declare the same nine
 `Benchmark*` funcs (prefixed by the ORM name) so `go test -bench=.` produces a
 single table:
 
-| Bench                          | What it measures                                                            |
-|--------------------------------|-----------------------------------------------------------------------------|
-| `*_InsertOne`                  | Insert one row per iteration                                                |
-| `*_GetByPK`                    | `SELECT … WHERE id = ?` against a seeded row                                |
-| `*_UpdateOne`                  | Update two columns of a preloaded row                                       |
-| `*_DeleteOne`                  | Delete a row by PK (re-seed step excluded from the timer via `b.StopTimer`) |
-| `*_BulkInsert100`              | Insert 100 rows in one logical batch                                        |
-| `*_BulkInsert1000`             | Insert 1,000 rows in one logical batch                                      |
-| `*_TxInsert100`                | 100 single-row inserts inside one transaction (per-call cost + commit)      |
-| `*_FindWhereOrderLimit`        | `WHERE age > ? AND is_active = ? ORDER BY score DESC LIMIT 50`              |
-| `*_EagerLoadHasMany`           | Load 100 users + their posts (`User → []Post`)                              |
-| `*_EagerLoadBelongsTo`         | Load 100 posts + their author (`Post → User`)                               |
+| Bench                   | What it measures                                                            |
+| ----------------------- | --------------------------------------------------------------------------- |
+| `*_InsertOne`           | Insert one row per iteration                                                |
+| `*_GetByPK`             | `SELECT … WHERE id = ?` against a seeded row                                |
+| `*_UpdateOne`           | Update two columns of a preloaded row                                       |
+| `*_DeleteOne`           | Delete a row by PK (re-seed step excluded from the timer via `b.StopTimer`) |
+| `*_BulkInsert100`       | Insert 100 rows in one logical batch                                        |
+| `*_BulkInsert1000`      | Insert 1,000 rows in one logical batch                                      |
+| `*_TxInsert100`         | 100 single-row inserts inside one transaction (per-call cost + commit)      |
+| `*_FindWhereOrderLimit` | `WHERE age > ? AND is_active = ? ORDER BY score DESC LIMIT 50`              |
+| `*_EagerLoadHasMany`    | Load 100 users + their posts (`User → []Post`)                              |
+| `*_EagerLoadBelongsTo`  | Load 100 posts + their author (`Post → User`)                               |
 
 ## Benchmark
 
@@ -95,45 +88,18 @@ BenchmarkZorm_EagerLoadBelongsTo-11             4074        289290 ns/op      15
 
 ### Side-by-side (ns/op · B/op · allocs/op)
 
-| Op                  | gorm                            | zorm                            | Winner (ns/op) |
-|---------------------|---------------------------------|---------------------------------|----------------|
-| InsertOne           | 11,047 · 6,732 · 87             | 10,911 · 4,661 · 72             | zorm           |
-| GetByPK             | 8,873 · 5,515 · 109             | 8,493 · 4,818 · 103             | zorm           |
-| UpdateOne           | 9,418 · 10,040 · 101            | 7,342 · 4,460 · 63              | zorm           |
-| DeleteOne           | 6,605 · 3,106 · 40              | 5,971 · 1,879 · 29              | zorm           |
-| BulkInsert100       | 305,729 · 213,582 · 3,203       | 1,234,804 · 221,158 · 3,479     | gorm           |
-| BulkInsert1000      | 2,988,061 · 1,991,097 · 31,411  | 50,519,979 · 2,140,176 · 35,262 | gorm           |
-| FindWhereOrderLimit | 249,172 · 56,515 · 1,387        | 247,887 · 67,647 · 1,626        | zorm           |
-| TxInsert100         | 1,608,794 · 703,747 · 9,256     | 1,536,454 · 541,881 · 7,899     | zorm           |
-| EagerLoadHasMany    | 1,435,784 · 627,648 · 17,223    | 1,124,967 · 444,236 · 11,573    | zorm           |
-| EagerLoadBelongsTo  | 318,111 · 177,928 · 3,798       | 289,290 · 152,650 · 3,476       | zorm           |
-
-zorm wins on 8 of 10 ops in wall-clock latency and on every op in allocs.
-gorm's bulk-insert path (`CreateInBatches`) wins decisively — zorm's
-`CreateMany` at N=1000 is ~17× slower and an open follow-up; investigate the
-SQL build path before publishing claims about zorm's bulk-write performance.
-
-## Fairness notes (read before publishing numbers)
-
-- **Bulk insert** uses each library's idiomatic batch path: `CreateMany` (zorm),
-  `CreateInBatches` (gorm), `CreateBulk` (ent), one multi-`VALUES` `Exec` (sqlx).
-  No library is forced into another's pattern.
-- **Eager load** in sqlx is a hand-rolled two-query stitch (`SELECT users`, then
-  `SELECT posts WHERE user_id IN (…)`) because sqlx has no ORM-level relation
-  loader. The numbers reflect the cost of doing what sqlx users would actually
-  write — treat sqlx as a "ceiling" for hand-tuned code, not as a peer feature.
-- **Prepared-statement cache**: zorm's `WithStmtCache` is **off** in the default
-  bench. Turning it on changes the numbers; if added later, it must be a
-  separate row in the results table, clearly labelled.
-- **No outer transactions** wrap the single-row ops above; that's measured
-  separately by `*_TxInsert100`, which wraps 100 inserts in one transaction so
-  the commit cost is amortized and per-call overhead inside an open tx is
-  visible distinct from auto-commit-per-row.
-- All four bench files use `db.SetMaxOpenConns(1)` so the in-memory SQLite
-  database is serialized under `-race` (matches the existing test infra in
-  `save_complex_test.go`).
-- `b.ResetTimer()` is called after setup/seed and `b.ReportAllocs()` is on for
-  every bench so the alloc count is visible in the output.
+| Op                  | gorm                           | zorm                            | Winner (ns/op) |
+| ------------------- | ------------------------------ | ------------------------------- | -------------- |
+| InsertOne           | 11,047 · 6,732 · 87            | 10,911 · 4,661 · 72             | zorm           |
+| GetByPK             | 8,873 · 5,515 · 109            | 8,493 · 4,818 · 103             | zorm           |
+| UpdateOne           | 9,418 · 10,040 · 101           | 7,342 · 4,460 · 63              | zorm           |
+| DeleteOne           | 6,605 · 3,106 · 40             | 5,971 · 1,879 · 29              | zorm           |
+| BulkInsert100       | 305,729 · 213,582 · 3,203      | 1,234,804 · 221,158 · 3,479     | gorm           |
+| BulkInsert1000      | 2,988,061 · 1,991,097 · 31,411 | 50,519,979 · 2,140,176 · 35,262 | gorm           |
+| FindWhereOrderLimit | 249,172 · 56,515 · 1,387       | 247,887 · 67,647 · 1,626        | zorm           |
+| TxInsert100         | 1,608,794 · 703,747 · 9,256    | 1,536,454 · 541,881 · 7,899     | zorm           |
+| EagerLoadHasMany    | 1,435,784 · 627,648 · 17,223   | 1,124,967 · 444,236 · 11,573    | zorm           |
+| EagerLoadBelongsTo  | 318,111 · 177,928 · 3,798      | 289,290 · 152,650 · 3,476       | zorm           |
 
 ## Running
 
@@ -180,6 +146,3 @@ BenchmarkZorm_GetByPK-10        50000     22431 ns/op    1184 B/op    35 allocs/
   but a library with 2× the allocs and 0.9× the latency is still faster in
   wall-clock terms — read both columns together.
 
-Numbers vary materially between Go versions and CPU. Always re-run on a single
-machine before drawing conclusions; do not paste numbers from one host into
-the README of another.
