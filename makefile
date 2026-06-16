@@ -29,6 +29,9 @@ tidy: ## run `go mod tidy` command
 	go mod tidy -v
 	@echo "done"
 
+bench: ## run the benchmarks/ suite (zorm vs gorm vs sqlx; ent requires `go generate ./entbench` + -tags=ent)
+	cd benchmarks && go test -bench=. -benchmem -run=^$$ ./...
+
 # help
 help:
 	@echo "usage: make [command]"
