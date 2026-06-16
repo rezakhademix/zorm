@@ -1991,8 +1991,123 @@ func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 	return nil, ErrRequiresRawQuery
 }
 
+// bulkInsertMaxRowsPerStmt caps the number of rows per single INSERT...VALUES
+// statement. The previous 500-row cap forced an extra round-trip for 1000-row
+// batches; 5000 is well below SQLite's default 32766-variable limit for
+// reasonable column counts and never exceeds Postgres' 65535 (the per-column
+// chunkSize math below catches that case).
+const bulkInsertMaxRowsPerStmt = 5000
+
+// bulkInsertSQLCache memoizes finished INSERT SQL strings keyed by the
+// (table, columns, rowCount, dialect, pk) shape so the hot loop doesn't
+// rebuild the same multi-thousand-byte string per call.
+var bulkInsertSQLCache sync.Map
+
+type bulkInsertCacheKey struct {
+	table   string
+	cols    string
+	rows    int
+	dialect Dialect
+	pk      string
+}
+
+// argsPool reuses []any buffers for bulk arg construction to cut allocations
+// on the hottest call sites. Buffers are returned via putArgs after the SQL
+// driver finishes binding (drivers do not retain args beyond the call).
+var argsPool = sync.Pool{
+	New: func() any {
+		s := make([]any, 0, 64)
+		return &s
+	},
+}
+
+func getArgs(capacity int) *[]any {
+	p := argsPool.Get().(*[]any)
+	if cap(*p) < capacity {
+		buf := make([]any, 0, capacity)
+		*p = buf
+	} else {
+		*p = (*p)[:0]
+	}
+	return p
+}
+
+func putArgs(p *[]any) {
+	// Clear references so pooled buffer doesn't pin user data.
+	s := (*p)[:cap(*p)]
+	for i := range s {
+		s[i] = nil
+	}
+	*p = (*p)[:0]
+	argsPool.Put(p)
+}
+
+// buildBulkInsertSQL produces the INSERT SQL for the given shape, emitting
+// dialect-native placeholders directly (no second rebind walk). Results are
+// cached in bulkInsertSQLCache.
+func buildBulkInsertSQL(table, pk string, columns []string, numRows int, dialect Dialect) string {
+	cols := strings.Join(columns, ", ")
+	key := bulkInsertCacheKey{table: table, cols: cols, rows: numRows, dialect: dialect, pk: pk}
+	if v, ok := bulkInsertSQLCache.Load(key); ok {
+		return v.(string)
+	}
+
+	sb := GetStringBuilder()
+	defer PutStringBuilder(sb)
+	// Rough size: header + numRows * (cols * ~4 chars).
+	sb.Grow(64 + len(table) + len(cols) + numRows*(len(columns)*4+4))
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(table)
+	sb.WriteString(" (")
+	sb.WriteString(cols)
+	sb.WriteString(") VALUES ")
+
+	paramIdx := 0
+	for r := 0; r < numRows; r++ {
+		if r > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('(')
+		for c := 0; c < len(columns); c++ {
+			if c > 0 {
+				sb.WriteString(", ")
+			}
+			if dialect == DialectPostgres {
+				paramIdx++
+				sb.WriteByte('$')
+				sb.WriteString(strconv.Itoa(paramIdx))
+			} else {
+				sb.WriteByte('?')
+			}
+		}
+		sb.WriteByte(')')
+	}
+	sb.WriteString(" RETURNING ")
+	sb.WriteString(pk)
+
+	out := strings.Clone(sb.String())
+	actual, _ := bulkInsertSQLCache.LoadOrStore(key, out)
+	return actual.(string)
+}
+
 // CreateMany inserts multiple records in a single query.
 func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
+	return m.createManyImpl(ctx, entities, false)
+}
+
+// CreateManyNewPK is a fast-path variant of CreateMany for the common case
+// where the caller knows every entity has a zero auto-increment primary key
+// (i.e. fresh inserts). It skips the per-entity PK-scan that CreateMany runs
+// to decide whether to include the PK column in the INSERT.
+//
+// If any entity in the batch actually has a non-zero PK, the DB will reject
+// the insert (or silently override it depending on schema). Use plain
+// CreateMany when in doubt.
+func (m *Model[T]) CreateManyNewPK(ctx context.Context, entities []*T) error {
+	return m.createManyImpl(ctx, entities, true)
+}
+
+func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan bool) error {
 	if len(entities) == 0 {
 		return nil
 	}
@@ -2024,8 +2139,9 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	}
 
 	// Include the auto PK column only if at least one entity has it set.
+	// In skipPKScan mode (CreateManyNewPK), trust the caller and never include.
 	includeAutoPK := false
-	if autoPKField != nil {
+	if autoPKField != nil && !skipPKScan {
 		for _, entity := range entities {
 			val := reflect.ValueOf(entity).Elem()
 			if !val.FieldByIndex(autoPKField.Index).IsZero() {
@@ -2035,39 +2151,38 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		}
 	}
 
-	// Prepare columns list
-	fieldsToInsert := make([][]int, 0, numFields) // Field indices in struct
+	// Prepare columns list and field metadata for arg extraction.
+	fieldsToInsert := make([]*FieldInfo, 0, numFields)
 
 	for _, field := range m.modelInfo.Fields {
 		if field.IsPrimary && field.IsAuto && !includeAutoPK {
 			continue
 		}
 		columns = append(columns, field.Column)
-		fieldsToInsert = append(fieldsToInsert, field.Index)
+		fieldsToInsert = append(fieldsToInsert, field)
 	}
 
-	// Determine chunk size based on Postgres limit of 65535 parameters
+	// Determine chunk size based on Postgres limit of 65535 parameters.
 	numColumns := len(columns)
 	if numColumns == 0 {
 		numColumns = 1 // Safety to avoid division by zero
 	}
 
 	chunkSize := 65535 / numColumns
-	if chunkSize > 500 {
-		chunkSize = 500 // Cap at reasonable batch size
+	if chunkSize > bulkInsertMaxRowsPerStmt {
+		chunkSize = bulkInsertMaxRowsPerStmt
 	} else if chunkSize < 1 {
 		chunkSize = 1
 	}
 
 	if len(entities) <= chunkSize {
-		return m.createBatch(ctx, entities, columns, fieldsToInsert)
+		return m.createBatch(ctx, m.tx, entities, columns, fieldsToInsert)
 	}
 
-	// Use a transaction for multiple chunks to ensure atomicity
-	var tx *sql.Tx
-	var err error
+	// Use a transaction for multiple chunks to ensure atomicity.
+	tx := m.tx
 	var committed bool
-	if m.tx == nil {
+	if tx == nil {
 		db := m.db
 		if db == nil {
 			db = GetGlobalDB()
@@ -2075,37 +2190,33 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 		if db == nil {
 			return ErrNilDatabase
 		}
-		tx, err = db.BeginTx(ctx, nil)
+		opened, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
+		tx = opened
 		defer func() {
 			if !committed {
-				tx.Rollback()
+				opened.Rollback()
 			}
 		}()
 	}
 
-	// Execute in chunks
+	// Execute in chunks. createBatch is invoked with the explicit tx so we
+	// avoid Clone() per chunk (the old code copied wheres/orderBys/etc. for
+	// no reason on this code path).
 	for i := 0; i < len(entities); i += chunkSize {
 		end := i + chunkSize
 		if end > len(entities) {
 			end = len(entities)
 		}
-
-		batch := entities[i:end]
-		// Create a clone with the transaction for this batch
-		batchModel := m.Clone()
-		if tx != nil {
-			batchModel.tx = tx
-		}
-
-		if err := batchModel.createBatch(ctx, batch, columns, fieldsToInsert); err != nil {
+		if err := m.createBatch(ctx, tx, entities[i:end], columns, fieldsToInsert); err != nil {
 			return err
 		}
 	}
 
-	if tx != nil {
+	// Only commit if we opened the tx ourselves.
+	if m.tx == nil {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -2115,61 +2226,76 @@ func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	return nil
 }
 
-// createBatch performs a single batch insert query.
-func (m *Model[T]) createBatch(ctx context.Context, entities []*T, columns []string, fieldsToInsert [][]int) error {
-	var sb strings.Builder
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(m.TableName())
-	sb.WriteString(" (")
-	sb.WriteString(strings.Join(columns, ", "))
-	sb.WriteString(") VALUES ")
-
-	// Pre-allocate args slice with exact capacity
-	args := make([]any, 0, len(entities)*len(fieldsToInsert))
-
-	// Build row placeholder once: "(?, ?, ...)"
-	var rowSb strings.Builder
-	rowSb.WriteByte('(')
-	writePlaceholdersWithSeparator(&rowSb, len(columns), ", ")
-	rowSb.WriteByte(')')
-	rowPlaceholder := rowSb.String()
-
-	for i, entity := range entities {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(rowPlaceholder)
-
-		val := reflect.ValueOf(entity).Elem()
-		for _, fieldIndex := range fieldsToInsert {
-			args = append(args, val.FieldByIndex(fieldIndex).Interface())
-		}
-	}
-
-	// RETURNING ID?
-	sb.WriteString(" RETURNING " + m.modelInfo.PrimaryKey)
-
-	query := sb.String()
-	rows, err := m.queryerForWrite().QueryContext(ctx, rebind(query), args...)
-	if err != nil {
-		return WrapQueryError("INSERT", query, args, err)
-	}
-	defer rows.Close()
-
-	// Scan IDs back
-	idx := 0
+// createBatch performs a single batch insert query. tx, when non-nil, is the
+// active transaction to run inside; pass nil to run against the model's
+// configured writer (m.queryerForWrite()).
+func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, columns []string, fieldsToInsert []*FieldInfo) error {
 	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 	if !ok {
 		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
 	}
 
+	dialect := m.effectiveDialect()
+	query := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, len(entities), dialect)
+
+	// Pool the args buffer; arg slices for big batches can be 4000+ entries.
+	argsP := getArgs(len(entities) * len(fieldsToInsert))
+	defer putArgs(argsP)
+	args := *argsP
+
+	for _, entity := range entities {
+		val := reflect.ValueOf(entity).Elem()
+		for _, fi := range fieldsToInsert {
+			// Flat (non-embedded) fields use val.Field(i) which is faster
+			// than the FieldByIndex walk required for embedded structs.
+			var fv reflect.Value
+			if len(fi.Index) == 1 {
+				fv = val.Field(fi.Index[0])
+			} else {
+				fv = val.FieldByIndex(fi.Index)
+			}
+			args = append(args, fv.Interface())
+		}
+	}
+	*argsP = args
+
+	// Choose the executor: explicit tx > model's stmt cache > raw writer.
+	var rows *sql.Rows
+	var err error
+	switch {
+	case tx != nil:
+		rows, err = tx.QueryContext(ctx, query, args...)
+	case m.stmtCache != nil:
+		var stmt *sql.Stmt
+		var release func()
+		stmt, release, err = m.prepareStmtForWrite(ctx, query)
+		if err != nil {
+			return WrapQueryError("PREPARE", query, args, err)
+		}
+		defer release()
+		rows, err = stmt.QueryContext(ctx, args...)
+	default:
+		rows, err = m.queryerForWrite().QueryContext(ctx, query, args...)
+	}
+	if err != nil {
+		return WrapQueryError("INSERT", query, args, err)
+	}
+	defer rows.Close()
+
+	// Scan IDs back.
+	idx := 0
 	for rows.Next() {
 		if idx >= len(entities) {
 			break
 		}
 		entity := entities[idx]
 		val := reflect.ValueOf(entity).Elem()
-		fVal := val.FieldByIndex(pkField.Index)
+		var fVal reflect.Value
+		if len(pkField.Index) == 1 {
+			fVal = val.Field(pkField.Index[0])
+		} else {
+			fVal = val.FieldByIndex(pkField.Index)
+		}
 
 		if fVal.CanSet() {
 			if err := rows.Scan(fVal.Addr().Interface()); err != nil {
