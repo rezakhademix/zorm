@@ -260,8 +260,12 @@ type FieldInfo struct {
 	Column    string       // 16 bytes
 	FieldType reflect.Type // 16 bytes
 	Index     []int        // 24 bytes
-	IsPrimary bool         // 1 byte
-	IsAuto    bool         // 1 byte + 6 padding
+	// Offset is the byte offset of the field within the top-level struct.
+	// Only meaningful when len(Index) == 1 (non-embedded). For embedded
+	// fields callers must fall back to reflect.Value.FieldByIndex.
+	Offset    uintptr // 8 bytes
+	IsPrimary bool    // 1 byte
+	IsAuto    bool    // 1 byte + 6 padding
 }
 
 // GetRelationField returns the reflect.Value for a relation field by name.
@@ -468,6 +472,14 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 		finalIndex := make([]int, len(currentIndex))
 		copy(finalIndex, currentIndex)
 
+		// Offset is only valid when the field lives directly on the top-level
+		// struct (no embedded traversal). For embedded fields we leave it zero
+		// and callers must keep using FieldByIndex.
+		var offset uintptr
+		if len(finalIndex) == 1 {
+			offset = field.Offset
+		}
+
 		fInfo := &FieldInfo{
 			Name:      field.Name,
 			Column:    dbCol,
@@ -475,6 +487,7 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 			IsAuto:    isAuto,
 			FieldType: field.Type,
 			Index:     finalIndex,
+			Offset:    offset,
 		}
 
 		info.Fields[field.Name] = fInfo

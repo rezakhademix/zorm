@@ -63,43 +63,43 @@ goos: darwin
 goarch: arm64
 pkg: github.com/rezakhademix/zorm/benchmarks
 cpu: Apple M3 Pro
-BenchmarkGorm_InsertOne-11                    108280         11047 ns/op        6732 B/op          87 allocs/op
-BenchmarkGorm_GetByPK-11                      145824          8873 ns/op        5515 B/op         109 allocs/op
-BenchmarkGorm_UpdateOne-11                    121521          9418 ns/op       10040 B/op         101 allocs/op
-BenchmarkGorm_DeleteOne-11                    180073          6605 ns/op        3106 B/op          40 allocs/op
-BenchmarkGorm_BulkInsert100-11                  4012        305729 ns/op      213582 B/op        3203 allocs/op
-BenchmarkGorm_BulkInsert1000-11                  400       2988061 ns/op     1991097 B/op       31411 allocs/op
-BenchmarkGorm_FindWhereOrderLimit-11            4824        249172 ns/op       56515 B/op        1387 allocs/op
-BenchmarkGorm_TxInsert100-11                     746       1608794 ns/op      703747 B/op        9256 allocs/op
-BenchmarkGorm_EagerLoadHasMany-11                836       1435784 ns/op      627648 B/op       17223 allocs/op
-BenchmarkGorm_EagerLoadBelongsTo-11             3788        318111 ns/op      177928 B/op        3798 allocs/op
+BenchmarkGorm_InsertOne-11                    105361         11147 ns/op        6732 B/op          87 allocs/op
+BenchmarkGorm_GetByPK-11                      142958          8320 ns/op        5516 B/op         109 allocs/op
+BenchmarkGorm_UpdateOne-11                    120948          9112 ns/op       10040 B/op         101 allocs/op
+BenchmarkGorm_DeleteOne-11                    192854          6161 ns/op        3106 B/op          40 allocs/op
+BenchmarkGorm_BulkInsert100-11                  3778        309817 ns/op      213593 B/op        3203 allocs/op
+BenchmarkGorm_BulkInsert1000-11                  396       3041683 ns/op     1990998 B/op       31411 allocs/op
+BenchmarkGorm_FindWhereOrderLimit-11            4776        248997 ns/op       56515 B/op        1387 allocs/op
+BenchmarkGorm_TxInsert100-11                     748       1596357 ns/op      703940 B/op        9258 allocs/op
+BenchmarkGorm_EagerLoadHasMany-11                811       1466133 ns/op      627644 B/op       17223 allocs/op
+BenchmarkGorm_EagerLoadBelongsTo-11             3494        322497 ns/op      177939 B/op        3798 allocs/op
 
-BenchmarkZorm_InsertOne-11                     93940         10911 ns/op        4661 B/op          72 allocs/op
-BenchmarkZorm_GetByPK-11                      136419          8493 ns/op        4818 B/op         103 allocs/op
-BenchmarkZorm_UpdateOne-11                    162715          7342 ns/op        4460 B/op          63 allocs/op
-BenchmarkZorm_DeleteOne-11                    189541          5971 ns/op        1879 B/op          29 allocs/op
-BenchmarkZorm_BulkInsert100-11                   996       1234804 ns/op      221158 B/op        3479 allocs/op
-BenchmarkZorm_BulkInsert1000-11                   26      50519979 ns/op     2140176 B/op       35262 allocs/op
-BenchmarkZorm_FindWhereOrderLimit-11            4491        247887 ns/op       67647 B/op        1626 allocs/op
-BenchmarkZorm_TxInsert100-11                     795       1536454 ns/op      541881 B/op        7899 allocs/op
-BenchmarkZorm_EagerLoadHasMany-11               1060       1124967 ns/op      444236 B/op       11573 allocs/op
-BenchmarkZorm_EagerLoadBelongsTo-11             4074        289290 ns/op      152650 B/op        3476 allocs/op
+BenchmarkZorm_InsertOne-11                    104210         11637 ns/op        4661 B/op          72 allocs/op
+BenchmarkZorm_GetByPK-11                      129213          9120 ns/op        4818 B/op         103 allocs/op
+BenchmarkZorm_UpdateOne-11                    145099          8063 ns/op        4461 B/op          63 allocs/op
+BenchmarkZorm_DeleteOne-11                    198926          5876 ns/op        1879 B/op          29 allocs/op
+BenchmarkZorm_BulkInsert100-11                  4039        294982 ns/op      165799 B/op        2660 allocs/op
+BenchmarkZorm_BulkInsert1000-11                  423       2842708 ns/op     1567151 B/op       26363 allocs/op
+BenchmarkZorm_FindWhereOrderLimit-11            4524        258790 ns/op       67684 B/op        1627 allocs/op
+BenchmarkZorm_TxInsert100-11                     735       1582641 ns/op      541958 B/op        7899 allocs/op
+BenchmarkZorm_EagerLoadHasMany-11               1014       1147633 ns/op      442953 B/op       11536 allocs/op
+BenchmarkZorm_EagerLoadBelongsTo-11             3951        304350 ns/op      153179 B/op        3491 allocs/op
 ```
 
 ### Side-by-side (ns/op · B/op · allocs/op)
 
 | Op                  | gorm                           | zorm                            | Winner (ns/op) |
 | ------------------- | ------------------------------ | ------------------------------- | -------------- |
-| InsertOne           | 11,047 · 6,732 · 87            | 10,911 · 4,661 · 72             | zorm           |
-| GetByPK             | 8,873 · 5,515 · 109            | 8,493 · 4,818 · 103             | zorm           |
-| UpdateOne           | 9,418 · 10,040 · 101           | 7,342 · 4,460 · 63              | zorm           |
-| DeleteOne           | 6,605 · 3,106 · 40             | 5,971 · 1,879 · 29              | zorm           |
-| BulkInsert100       | 305,729 · 213,582 · 3,203      | 1,234,804 · 221,158 · 3,479     | gorm           |
-| BulkInsert1000      | 2,988,061 · 1,991,097 · 31,411 | 50,519,979 · 2,140,176 · 35,262 | gorm           |
-| FindWhereOrderLimit | 249,172 · 56,515 · 1,387       | 247,887 · 67,647 · 1,626        | zorm           |
-| TxInsert100         | 1,608,794 · 703,747 · 9,256    | 1,536,454 · 541,881 · 7,899     | zorm           |
-| EagerLoadHasMany    | 1,435,784 · 627,648 · 17,223   | 1,124,967 · 444,236 · 11,573    | zorm           |
-| EagerLoadBelongsTo  | 318,111 · 177,928 · 3,798      | 289,290 · 152,650 · 3,476       | zorm           |
+| InsertOne           | 11,147 · 6,732 · 87            | 11,637 · 4,661 · 72             | gorm           |
+| GetByPK             | 8,320 · 5,516 · 109            | 9,120 · 4,818 · 103             | gorm           |
+| UpdateOne           | 9,112 · 10,040 · 101           | 8,063 · 4,461 · 63              | zorm           |
+| DeleteOne           | 6,161 · 3,106 · 40             | 5,876 · 1,879 · 29              | zorm           |
+| BulkInsert100       | 309,817 · 213,593 · 3,203      | 294,982 · 165,799 · 2,660       | zorm           |
+| BulkInsert1000      | 3,041,683 · 1,990,998 · 31,411 | 2,842,708 · 1,567,151 · 26,363  | zorm           |
+| FindWhereOrderLimit | 248,997 · 56,515 · 1,387       | 258,790 · 67,684 · 1,627        | gorm           |
+| TxInsert100         | 1,596,357 · 703,940 · 9,258    | 1,582,641 · 541,958 · 7,899     | zorm           |
+| EagerLoadHasMany    | 1,466,133 · 627,644 · 17,223   | 1,147,633 · 442,953 · 11,536    | zorm           |
+| EagerLoadBelongsTo  | 322,497 · 177,939 · 3,798      | 304,350 · 153,179 · 3,491       | zorm           |
 
 ## Running
 
