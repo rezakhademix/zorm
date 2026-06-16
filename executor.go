@@ -1272,6 +1272,21 @@ func (m *Model[T]) callAfterDelete(ctx context.Context, entity *T) error {
 	return nil
 }
 
+// autoSetCreatedAt populates the created_at field with time.Now() when the
+// model declares such a column and the entity's current value is the zero
+// time. Pre-set values are preserved so callers importing historical rows
+// or seeding fixtures retain control.
+func (m *Model[T]) autoSetCreatedAt(entity *T) {
+	fieldInfo, ok := m.modelInfo.Columns["created_at"]
+	if !ok {
+		return
+	}
+	fieldVal := reflect.ValueOf(entity).Elem().FieldByIndex(fieldInfo.Index)
+	if fieldVal.CanSet() && fieldVal.IsZero() {
+		_ = setFieldValue(fieldVal, time.Now())
+	}
+}
+
 // Create inserts a new record.
 //
 // Hook Behavior: If the entity implements BeforeCreate(context.Context) error,
@@ -1301,6 +1316,10 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 			return txm.Create(ctx, entity)
 		})
 	}
+
+	// Auto-set created_at if it exists and the caller left it zero.
+	// Pre-set values are preserved so backfills / fixture imports keep control.
+	m.autoSetCreatedAt(entity)
 
 	// 1. BeforeCreate Hook (prefers BeforeCreateTx when implemented).
 	// If this succeeds but INSERT fails and the plain BeforeCreate is used,
@@ -1976,6 +1995,14 @@ func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	if len(entities) == 0 {
 		return nil
+	}
+
+	// Auto-set created_at per entity (zero-only) before reading field values
+	// into the batch args slice. Same rules as Create.
+	for _, e := range entities {
+		if e != nil {
+			m.autoSetCreatedAt(e)
+		}
 	}
 
 	// 2. Build Query

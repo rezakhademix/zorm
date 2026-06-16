@@ -66,7 +66,7 @@ type User struct {
     Name      string     // Maps to "name" column
     Email     string     // Maps to "email" column
     Age       int        // Maps to "age" column
-    CreatedAt time.Time  // Maps to "created_at" column
+    CreatedAt time.Time  // Maps to "created_at" (auto-set on Create when zero)
     UpdatedAt time.Time  // Maps to "updated_at" (auto-updated)
 }
 // Table name: "users" (auto-pluralized snake_case)
@@ -198,7 +198,7 @@ err = zorm.New[Order]().
 - Supports any map key/value types (string, int, float64, bool, etc.)
 - Automatically chunks large maps (500+ entries) with transaction safety
 - Combines with existing WHERE conditions
-- Auto-updates `updated_at` timestamp if the column exists
+- Auto-updates `updated_at` timestamp if the column exists. `Create`/`CreateMany` also auto-populate `created_at` when present and unset.
 
 ---
 
@@ -519,9 +519,10 @@ func (u *User) AfterUpdate(ctx context.Context) error {
 
 ```go
 // Create flow:
-// 1. BeforeCreate(ctx) called
-// 2. INSERT executed
-// 3. ID populated
+// 1. created_at auto-set if column exists and field is zero
+// 2. BeforeCreate(ctx) called
+// 3. INSERT executed
+// 4. ID populated
 
 user := &User{Name: "John", Email: "JOHN@EXAMPLE.COM"}
 err := zorm.New[User]().Create(ctx, user)
