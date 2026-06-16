@@ -418,9 +418,6 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 				case "auto":
 					isAuto = true
 				case "primaryKey":
-					// GORM-style alias for `primary`. Implies auto-increment
-					// only for integer kinds — string/UUID PKs are left
-					// non-auto so callers can supply their own value.
 					isPrimary = true
 					if isIntegerKind(field.Type.Kind()) {
 						isAuto = true

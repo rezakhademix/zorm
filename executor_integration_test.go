@@ -554,6 +554,91 @@ func TestUpdate_AutoSetsUpdatedAt(t *testing.T) {
 	}
 }
 
+func TestCreate_AutoSetsCreatedAt(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE ts_models_both (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT,
+			age INTEGER,
+			updated_at DATETIME,
+			created_at DATETIME
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+
+	ctx := context.Background()
+
+	t.Run("zero CreatedAt is auto-populated", func(t *testing.T) {
+		before := time.Now()
+		row := &tsModelBoth{Name: "alice", Age: 30}
+		if err := New[tsModelBoth]().SetDB(db).Create(ctx, row); err != nil {
+			t.Fatalf("Create failed: %v", err)
+		}
+
+		if row.CreatedAt.IsZero() {
+			t.Fatalf("expected created_at to be auto-set on entity, got zero")
+		}
+		if row.CreatedAt.Before(before.Truncate(time.Second)) {
+			t.Errorf("expected created_at >= %v, got %v", before, row.CreatedAt)
+		}
+
+		fetched, err := New[tsModelBoth]().SetDB(db).Where("id", row.ID).First(ctx)
+		if err != nil {
+			t.Fatalf("First failed: %v", err)
+		}
+		if fetched.CreatedAt.IsZero() {
+			t.Fatalf("expected created_at persisted to DB, got zero")
+		}
+	})
+
+	t.Run("pre-set CreatedAt is preserved", func(t *testing.T) {
+		seeded := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+		row := &tsModelBoth{Name: "bob", Age: 40, CreatedAt: seeded}
+		if err := New[tsModelBoth]().SetDB(db).Create(ctx, row); err != nil {
+			t.Fatalf("Create failed: %v", err)
+		}
+
+		fetched, err := New[tsModelBoth]().SetDB(db).Where("id", row.ID).First(ctx)
+		if err != nil {
+			t.Fatalf("First failed: %v", err)
+		}
+		if !fetched.CreatedAt.Equal(seeded) {
+			t.Errorf("expected created_at to be preserved as %v, got %v", seeded, fetched.CreatedAt)
+		}
+	})
+
+	t.Run("CreateMany respects per-entity zero/preset state", func(t *testing.T) {
+		seeded := time.Date(2021, 6, 7, 8, 9, 10, 0, time.UTC)
+		before := time.Now()
+		rows := []*tsModelBoth{
+			{Name: "carol", Age: 25},                        // zero -> auto
+			{Name: "dave", Age: 35, CreatedAt: seeded},      // preserved
+			{Name: "eve", Age: 45},                          // zero -> auto
+		}
+		if err := New[tsModelBoth]().SetDB(db).CreateMany(ctx, rows); err != nil {
+			t.Fatalf("CreateMany failed: %v", err)
+		}
+
+		if rows[0].CreatedAt.IsZero() || rows[0].CreatedAt.Before(before.Truncate(time.Second)) {
+			t.Errorf("rows[0] created_at = %v, want >= %v", rows[0].CreatedAt, before)
+		}
+		if !rows[1].CreatedAt.Equal(seeded) {
+			t.Errorf("rows[1] created_at = %v, want preserved %v", rows[1].CreatedAt, seeded)
+		}
+		if rows[2].CreatedAt.IsZero() || rows[2].CreatedAt.Before(before.Truncate(time.Second)) {
+			t.Errorf("rows[2] created_at = %v, want >= %v", rows[2].CreatedAt, before)
+		}
+	})
+}
+
 func TestUpdateManyByKey_Chunking(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
