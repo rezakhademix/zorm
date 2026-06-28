@@ -390,6 +390,23 @@ func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 	return m
 }
 
+// WhereNotIn adds a WHERE NOT IN clause.
+// Column names are validated to prevent SQL injection.
+func (m *Model[T]) WhereNotIn(column string, args []any) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		m.buildErr = fmt.Errorf("zorm: WhereNotIn: invalid column %q: %w", column, err)
+		return m
+	}
+	frag, outArgs, err := buildNotInClause(column, args, m.effectiveDialect())
+	if err != nil {
+		m.buildErr = fmt.Errorf("zorm: WhereNotIn: %w", err)
+		return m
+	}
+	m.wheres = append(m.wheres, "AND "+frag)
+	m.args = append(m.args, outArgs...)
+	return m
+}
+
 // OrderBy adds an ORDER BY clause.
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
