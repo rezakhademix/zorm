@@ -214,6 +214,36 @@ func TestWhereNotIn_Empty(t *testing.T) {
 	}
 }
 
+func TestWhereNotIn_SQLiteRejectsOverflow(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	args := make([]any, maxInArgs+1)
+	for i := range args {
+		args[i] = i
+	}
+	m := New[TestModel]().WhereNotIn("id", args)
+	if m.buildErr == nil {
+		t.Fatalf("expected buildErr for NOT IN list of %d args, got nil", len(args))
+	}
+	if !strings.Contains(m.buildErr.Error(), "exceeds PostgreSQL parameter limit") {
+		t.Fatalf("expected limit error, got: %v", m.buildErr)
+	}
+}
+
+func TestBuildNotInClause_PostgresMixedTypeUsesSpreadPlaceholders(t *testing.T) {
+	frag, args, err := buildNotInClause("id", []any{int64(1), "2"}, DialectPostgres)
+	if err != nil {
+		t.Fatalf("buildNotInClause failed: %v", err)
+	}
+	if frag != "id NOT IN (?,?)" {
+		t.Fatalf("expected spread NOT IN fallback, got %q", frag)
+	}
+	if len(args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(args))
+	}
+}
+
 // TestOrderBy tests the OrderBy method
 func TestOrderBy(t *testing.T) {
 	m := New[TestModel]().OrderBy("created_at", "DESC")

@@ -146,6 +146,7 @@ func buildInClauseWithOperator(col string, args []any, dialect Dialect, negate b
 	if len(args) > maxInArgs {
 		return "", nil, fmt.Errorf("zorm: IN list of %d args exceeds PostgreSQL parameter limit %d; pass a typed []int64/[]uint64/[]string/[]float64/[]bool slice (homogeneous) to enable the ANY-array fast path", len(args), maxInArgs)
 	}
+
 	var sb strings.Builder
 	sb.Grow(len(col) + 9 + 2*len(args))
 	sb.WriteString(col)
