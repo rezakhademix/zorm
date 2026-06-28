@@ -235,28 +235,30 @@ err = zorm.New[Order]().
 
 ### Query Builder Methods
 
-| Method                         | Description               |
-| ------------------------------ | ------------------------- |
-| `Select(columns...)`           | Specify columns to select |
-| `Distinct()`                   | Add DISTINCT to query     |
-| `DistinctBy(columns...)`       | PostgreSQL DISTINCT ON    |
-| `Where(query, args...)`        | Add WHERE condition       |
-| `OrWhere(query, args...)`      | Add OR WHERE condition    |
-| `WhereIn(column, values)`      | WHERE column IN (...)     |
-| `WhereNotIn(column, values)`   | WHERE column NOT IN (...) |
-| `WhereNull(column)`            | WHERE column IS NULL      |
-| `WhereNotNull(column)`         | WHERE column IS NOT NULL  |
-| `OrWhereNull(column)`          | OR column IS NULL         |
-| `OrWhereNotNull(column)`       | OR column IS NOT NULL     |
-| `WhereHas(relation, callback)` | WHERE EXISTS subquery     |
-| `OrderBy(column, direction)`   | Add ORDER BY              |
-| `Latest(column?)`              | ORDER BY column DESC      |
-| `Oldest(column?)`              | ORDER BY column ASC       |
-| `GroupBy(columns...)`          | Add GROUP BY              |
-| `Having(query, args...)`       | Add HAVING                |
-| `Limit(n)`                     | Set LIMIT                 |
-| `Offset(n)`                    | Set OFFSET                |
-| `Lock(mode)`                   | Add FOR UPDATE/SHARE      |
+| Method                         | Description                  |
+| ------------------------------ | ---------------------------- |
+| `Select(columns...)`           | Specify columns to select    |
+| `Distinct()`                   | Add DISTINCT to query        |
+| `DistinctBy(columns...)`       | PostgreSQL DISTINCT ON       |
+| `Where(query, args...)`        | Add WHERE condition          |
+| `OrWhere(query, args...)`      | Add OR WHERE condition       |
+| `WhereIn(column, values)`      | WHERE column IN (...)        |
+| `OrWhereIn(column, values)`    | OR WHERE column IN (...)     |
+| `WhereNotIn(column, values)`   | WHERE column NOT IN (...)    |
+| `OrWhereNotIn(column, values)` | OR WHERE column NOT IN (...) |
+| `WhereNull(column)`            | WHERE column IS NULL         |
+| `WhereNotNull(column)`         | WHERE column IS NOT NULL     |
+| `OrWhereNull(column)`          | OR column IS NULL            |
+| `OrWhereNotNull(column)`       | OR column IS NOT NULL        |
+| `WhereHas(relation, callback)` | WHERE EXISTS subquery        |
+| `OrderBy(column, direction)`   | Add ORDER BY                 |
+| `Latest(column?)`              | ORDER BY column DESC         |
+| `Oldest(column?)`              | ORDER BY column ASC          |
+| `GroupBy(columns...)`          | Add GROUP BY                 |
+| `Having(query, args...)`       | Add HAVING                   |
+| `Limit(n)`                     | Set LIMIT                    |
+| `Offset(n)`                    | Set OFFSET                   |
+| `Lock(mode)`                   | Add FOR UPDATE/SHARE         |
 
 ### Utility Methods
 
@@ -315,6 +317,8 @@ zorm.New[User]().WhereNotIn("status", []any{"banned", "archived"}).Get(ctx)
 
 // OR conditions
 zorm.New[User]().Where("age", ">", 18).OrWhere("verified", true).Get(ctx)
+zorm.New[User]().OrWhereNotIn("status", []any{"banned", "archived"}).Get(ctx)
+zorm.New[User]().OrWhereIn("id", []any{1, 2, 3}).Get(ctx)
 ```
 
 ### Exists Check

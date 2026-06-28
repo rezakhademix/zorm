@@ -390,6 +390,27 @@ func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 	return m
 }
 
+// OrWhereIn adds an OR condition that checks whether the given column is inside the given values.
+// Column names are validated to prevent SQL injection.
+//
+// Example:
+//
+//	Model[User]().OrWhereIn("status", []string{"active", "inactive"})
+func (m *Model[T]) OrWhereIn(column string, args []any) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		m.buildErr = fmt.Errorf("zorm: OrWhereIn: invalid column %q: %w", column, err)
+		return m
+	}
+	frag, outArgs, err := buildInClause(column, args, m.effectiveDialect())
+	if err != nil {
+		m.buildErr = fmt.Errorf("zorm: OrWhereIn: %w", err)
+		return m
+	}
+	m.wheres = append(m.wheres, "OR "+frag)
+	m.args = append(m.args, outArgs...)
+	return m
+}
+
 // WhereNotIn adds a WHERE NOT IN clause.
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) WhereNotIn(column string, args []any) *Model[T] {
@@ -403,6 +424,27 @@ func (m *Model[T]) WhereNotIn(column string, args []any) *Model[T] {
 		return m
 	}
 	m.wheres = append(m.wheres, "AND "+frag)
+	m.args = append(m.args, outArgs...)
+	return m
+}
+
+// OrWhereNotIn adds an OR condition that checks whether the given column is not inside the given values.
+// Column names are validated to prevent SQL injection.
+//
+// Example:
+//
+//	Model[User]().OrWhereNotIn("status", []string{"active", "inactive"})
+func (m *Model[T]) OrWhereNotIn(column string, args []any) *Model[T] {
+	if err := ValidateColumnName(column); err != nil {
+		m.buildErr = fmt.Errorf("zorm: OrWhereNotIn: invalid column %q: %w", column, err)
+		return m
+	}
+	frag, outArgs, err := buildNotInClause(column, args, m.effectiveDialect())
+	if err != nil {
+		m.buildErr = fmt.Errorf("zorm: OrWhereNotIn: %w", err)
+		return m
+	}
+	m.wheres = append(m.wheres, "OR "+frag)
 	m.args = append(m.args, outArgs...)
 	return m
 }
