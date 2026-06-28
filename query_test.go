@@ -1258,3 +1258,144 @@ func TestWhere_RawQuery_NoValidation(t *testing.T) {
 		t.Errorf("expected raw expression in query, got %q", query)
 	}
 }
+
+// TestOrWhereIn tests the OrWhereIn method under the SQLite dialect, which
+// produces the classic spread-placeholder form. The PostgreSQL dialect emits
+// `= ANY($1)` instead and is covered by TestOrWhereIn_LargeListUsesANYOnPostgres.
+func TestOrWhereIn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m := New[TestModel]().OrWhereIn("id", []any{1, 2, 3})
+	query, args := m.Print()
+
+	expected := "id IN ($1,$2,$3)"
+	if !strings.Contains(query, expected) {
+		t.Errorf("expected query to contain %q, got %q", expected, query)
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+// TestOrWhereIn_Empty tests OrWhereIn with empty array
+func TestOrWhereIn_Empty(t *testing.T) {
+	m := New[TestModel]().OrWhereIn("id", []any{})
+	query, _ := m.Print()
+
+	// Should add 1=0 optimization for empty IN
+	if !strings.Contains(query, "1=0") {
+		t.Errorf("expected query to contain '1=0' for empty IN, got %q", query)
+	}
+}
+
+// TestOrWhereIn_LargeListUsesANYOnPostgres verifies that on the PostgreSQL
+// dialect OrWhereIn collapses an arbitrarily large IN list to a single
+// `= ANY($1)` placeholder backed by one typed-slice argument. This sidesteps
+// PostgreSQL's hard 65535-parameter limit and proves the previously-silent
+// overflow can no longer occur.
+func TestOrWhereIn_LargeListUsesANYOnPostgres(t *testing.T) {
+	SetDialect(DialectPostgres)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	const n = 70000
+	args := make([]any, n)
+	for i := range args {
+		args[i] = int64(i)
+	}
+
+	m := New[TestModel]().OrWhereIn("id", args)
+	sql, outArgs := m.Print()
+
+	if !strings.Contains(sql, "id = ANY($1)") {
+		t.Fatalf("expected ANY shortcut in SQL, got: %s", sql[:min(len(sql), 200)])
+	}
+	if len(outArgs) != 1 {
+		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
+	}
+	if _, ok := outArgs[0].([]int64); !ok {
+		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
+	}
+}
+
+// TestOrWhereIn_ValidatesColumn verifies OrWhereIn validates column name.
+func TestOrWhereIn_ValidatesColumn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m1 := New[TestModel]().OrWhereIn("id", []any{1, 2, 3})
+	query1, _ := m1.Print()
+	if !strings.Contains(query1, "OR id IN") {
+		t.Error("Valid column should generate IN clause" + query1)
+	}
+
+	m2 := New[TestModel]().OrWhereIn("id; DROP TABLE users", []any{1, 2, 3})
+	query2, _ := m2.Print()
+	if strings.Contains(query2, "DROP") {
+		t.Error("Injection attempt should be blocked")
+	}
+}
+
+// TestOrWhereNotIn tests the OrWhereNotIn method under the SQLite dialect, which
+// produces the classic spread-placeholder form. The PostgreSQL dialect emits
+// `<> ALL($1)` instead and is covered by TestOrWhereNotIn_LargeListUsesALLOnPostgres.
+func TestOrWhereNotIn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m := New[TestModel]().OrWhereNotIn("id", []any{1, 2, 3})
+	query, args := m.Print()
+
+	expected := "id NOT IN ($1,$2,$3)"
+	if !strings.Contains(query, expected) {
+		t.Errorf("expected query to contain %q, got %q", expected, query)
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+// TestOrWhereNotIn_Empty tests WhereNotIn with an empty array.
+func TestOrWhereNotIn_Empty(t *testing.T) {
+	m := New[TestModel]().WhereNotIn("id", []any{})
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "1=1") {
+		t.Errorf("expected query to contain '1=1' for empty NOT IN, got %q", query)
+	}
+}
+
+func TestOrWhereNotIn_SQLiteRejectsOverflow(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	args := make([]any, maxInArgs+1)
+	for i := range args {
+		args[i] = i
+	}
+	m := New[TestModel]().OrWhereNotIn("id", args)
+	if m.buildErr == nil {
+		t.Fatalf("expected buildErr for NOT IN list of %d args, got nil", len(args))
+	}
+	if !strings.Contains(m.buildErr.Error(), "exceeds PostgreSQL parameter limit") {
+		t.Fatalf("expected limit error, got: %v", m.buildErr)
+	}
+}
+
+// TestOrWhereNotIn_ValidatesColumn verifies WhereNotIn validates column name.
+func TestOrWhereNotIn_ValidatesColumn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m1 := New[TestModel]().OrWhereNotIn("id", []any{1, 2, 3})
+	query1, _ := m1.Print()
+	if !strings.Contains(query1, "OR id NOT IN") {
+		t.Error("Valid column should generate NOT IN clause")
+	}
+
+	m2 := New[TestModel]().OrWhereNotIn("id; DROP TABLE users", []any{1, 2, 3})
+	query2, _ := m2.Print()
+	if strings.Contains(query2, "DROP") {
+		t.Error("Injection attempt should be blocked")
+	}
+}
