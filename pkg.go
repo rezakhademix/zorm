@@ -117,21 +117,44 @@ func detectDialect(db *sql.DB) Dialect {
 //
 // An empty args slice returns `1=0` (matches nothing).
 func buildInClause(col string, args []any, dialect Dialect) (string, []any, error) {
+	return buildInClauseWithOperator(col, args, dialect, false)
+}
+
+// buildNotInClause emits the complement of buildInClause.
+//
+// An empty args slice returns `1=1` (matches everything), mirroring SQL's
+// expected empty NOT IN-set semantics.
+func buildNotInClause(col string, args []any, dialect Dialect) (string, []any, error) {
+	return buildInClauseWithOperator(col, args, dialect, true)
+}
+
+func buildInClauseWithOperator(col string, args []any, dialect Dialect, negate bool) (string, []any, error) {
 	if len(args) == 0 {
+		if negate {
+			return "1=1", nil, nil
+		}
 		return "1=0", nil, nil
 	}
 	if dialect == DialectPostgres {
 		if typed, ok := toTypedArraySlice(args); ok {
+			if negate {
+				return col + " <> ALL(?)", []any{typed}, nil
+			}
 			return col + " = ANY(?)", []any{typed}, nil
 		}
 	}
 	if len(args) > maxInArgs {
 		return "", nil, fmt.Errorf("zorm: IN list of %d args exceeds PostgreSQL parameter limit %d; pass a typed []int64/[]uint64/[]string/[]float64/[]bool slice (homogeneous) to enable the ANY-array fast path", len(args), maxInArgs)
 	}
+
 	var sb strings.Builder
-	sb.Grow(len(col) + 5 + 2*len(args))
+	sb.Grow(len(col) + 9 + 2*len(args))
 	sb.WriteString(col)
-	sb.WriteString(" IN (")
+	if negate {
+		sb.WriteString(" NOT IN (")
+	} else {
+		sb.WriteString(" IN (")
+	}
 	writePlaceholders(&sb, len(args))
 	sb.WriteByte(')')
 	out := make([]any, len(args))

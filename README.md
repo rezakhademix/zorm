@@ -243,6 +243,7 @@ err = zorm.New[Order]().
 | `Where(query, args...)`        | Add WHERE condition       |
 | `OrWhere(query, args...)`      | Add OR WHERE condition    |
 | `WhereIn(column, values)`      | WHERE column IN (...)     |
+| `WhereNotIn(column, values)`   | WHERE column NOT IN (...) |
 | `WhereNull(column)`            | WHERE column IS NULL      |
 | `WhereNotNull(column)`         | WHERE column IS NOT NULL  |
 | `OrWhereNull(column)`          | OR column IS NULL         |
@@ -310,6 +311,7 @@ zorm.New[User]().WhereNotNull("verified_at").Get(ctx)
 
 // IN clause
 zorm.New[User]().WhereIn("id", []any{1, 2, 3}).Get(ctx)
+zorm.New[User]().WhereNotIn("status", []any{"banned", "archived"}).Get(ctx)
 
 // OR conditions
 zorm.New[User]().Where("age", ">", 18).OrWhere("verified", true).Get(ctx)
@@ -369,7 +371,7 @@ roles, err := zorm.Query[string]().
 ```
 
 `ScalarQuery` supports the same query builder methods as `Model`:
-- `Where`, `OrWhere`, `WhereIn`, `WhereNull`, `WhereNotNull`
+- `Where`, `OrWhere`, `WhereIn`, `WhereNotIn`, `WhereNull`, `WhereNotNull`
 - `OrderBy`, `Limit`, `Offset`
 - `Distinct`, `GroupBy`, `Having`
 - `First` (returns single value), `Count` (returns row count)

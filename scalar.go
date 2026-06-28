@@ -168,6 +168,22 @@ func (q *ScalarQuery[T]) WhereIn(column string, values []any) *ScalarQuery[T] {
 	return q
 }
 
+// WhereNotIn adds a WHERE column NOT IN (...) condition.
+func (q *ScalarQuery[T]) WhereNotIn(column string, values []any) *ScalarQuery[T] {
+	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNotIn: invalid column %q: %w", column, err)
+		return q
+	}
+	frag, outArgs, err := buildNotInClause(column, values, q.effectiveDialect())
+	if err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNotIn: %w", err)
+		return q
+	}
+	q.wheres = append(q.wheres, "AND "+frag)
+	q.args = append(q.args, outArgs...)
+	return q
+}
+
 // WhereNull adds a WHERE column IS NULL condition.
 func (q *ScalarQuery[T]) WhereNull(column string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {

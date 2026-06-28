@@ -185,6 +185,65 @@ func TestWhereIn_Empty(t *testing.T) {
 	}
 }
 
+// TestWhereNotIn tests the WhereNotIn method under the SQLite dialect, which
+// produces the classic spread-placeholder form. The PostgreSQL dialect emits
+// `<> ALL($1)` instead and is covered by TestWhereNotIn_LargeListUsesALLOnPostgres.
+func TestWhereNotIn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m := New[TestModel]().WhereNotIn("id", []any{1, 2, 3})
+	query, args := m.Print()
+
+	expected := "id NOT IN ($1,$2,$3)"
+	if !strings.Contains(query, expected) {
+		t.Errorf("expected query to contain %q, got %q", expected, query)
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+// TestWhereNotIn_Empty tests WhereNotIn with an empty array.
+func TestWhereNotIn_Empty(t *testing.T) {
+	m := New[TestModel]().WhereNotIn("id", []any{})
+	query, _ := m.Print()
+
+	if !strings.Contains(query, "1=1") {
+		t.Errorf("expected query to contain '1=1' for empty NOT IN, got %q", query)
+	}
+}
+
+func TestWhereNotIn_SQLiteRejectsOverflow(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	args := make([]any, maxInArgs+1)
+	for i := range args {
+		args[i] = i
+	}
+	m := New[TestModel]().WhereNotIn("id", args)
+	if m.buildErr == nil {
+		t.Fatalf("expected buildErr for NOT IN list of %d args, got nil", len(args))
+	}
+	if !strings.Contains(m.buildErr.Error(), "exceeds PostgreSQL parameter limit") {
+		t.Fatalf("expected limit error, got: %v", m.buildErr)
+	}
+}
+
+func TestBuildNotInClause_PostgresMixedTypeUsesSpreadPlaceholders(t *testing.T) {
+	frag, args, err := buildNotInClause("id", []any{int64(1), "2"}, DialectPostgres)
+	if err != nil {
+		t.Fatalf("buildNotInClause failed: %v", err)
+	}
+	if frag != "id NOT IN (?,?)" {
+		t.Fatalf("expected spread NOT IN fallback, got %q", frag)
+	}
+	if len(args) != 2 {
+		t.Fatalf("expected 2 args, got %d", len(args))
+	}
+}
+
 // TestOrderBy tests the OrderBy method
 func TestOrderBy(t *testing.T) {
 	m := New[TestModel]().OrderBy("created_at", "DESC")
@@ -742,6 +801,33 @@ func TestWhereIn_LargeListUsesANYOnPostgres(t *testing.T) {
 	}
 }
 
+// TestWhereNotIn_LargeListUsesALLOnPostgres verifies that on the PostgreSQL
+// dialect WhereNotIn collapses an arbitrarily large NOT IN list to a single
+// `<> ALL($1)` placeholder backed by one typed-slice argument.
+func TestWhereNotIn_LargeListUsesALLOnPostgres(t *testing.T) {
+	SetDialect(DialectPostgres)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	const n = 70000
+	args := make([]any, n)
+	for i := range args {
+		args[i] = int64(i)
+	}
+
+	m := New[TestModel]().WhereNotIn("id", args)
+	sql, outArgs := m.Print()
+
+	if !strings.Contains(sql, "id <> ALL($1)") {
+		t.Fatalf("expected ALL shortcut in SQL, got: %s", sql[:min(len(sql), 200)])
+	}
+	if len(outArgs) != 1 {
+		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
+	}
+	if _, ok := outArgs[0].([]int64); !ok {
+		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
+	}
+}
+
 // TestWhereIn_SQLitePlaceholdersAreSequential verifies that on the SQLite
 // dialect WhereIn falls back to spread placeholders, that they are numbered
 // sequentially after rebind, and that the arg count matches the input.
@@ -799,6 +885,24 @@ func TestWhereIn_ValidatesColumn(t *testing.T) {
 
 	// Invalid column - should be skipped
 	m2 := New[TestModel]().WhereIn("id; DROP TABLE users", []any{1, 2, 3})
+	query2, _ := m2.Print()
+	if strings.Contains(query2, "DROP") {
+		t.Error("Injection attempt should be blocked")
+	}
+}
+
+// TestWhereNotIn_ValidatesColumn verifies WhereNotIn validates column name.
+func TestWhereNotIn_ValidatesColumn(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	m1 := New[TestModel]().WhereNotIn("id", []any{1, 2, 3})
+	query1, _ := m1.Print()
+	if !strings.Contains(query1, "id NOT IN") {
+		t.Error("Valid column should generate NOT IN clause")
+	}
+
+	m2 := New[TestModel]().WhereNotIn("id; DROP TABLE users", []any{1, 2, 3})
 	query2, _ := m2.Print()
 	if strings.Contains(query2, "DROP") {
 		t.Error("Injection attempt should be blocked")

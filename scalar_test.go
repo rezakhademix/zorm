@@ -1698,12 +1698,11 @@ func TestScalarQuery_WhereNotIn(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test raw NOT IN with 3+ args (triggers raw query path in addWhere)
 	names, err := Query[string]().
 		SetDB(db).
 		Table("users").
 		Select("name").
-		Where("id NOT IN (?, ?, ?)", 1, 2, 999).
+		WhereNotIn("id", []any{1, 2, 999}).
 		OrderBy("id", "ASC").
 		Get(ctx)
 
@@ -1721,6 +1720,74 @@ func TestScalarQuery_WhereNotIn(t *testing.T) {
 		if name != expected[i] {
 			t.Errorf("expected names[%d] = %q, got %q", i, expected[i], name)
 		}
+	}
+}
+
+func TestScalarQuery_WhereNotIn_Empty(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	names, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		WhereNotIn("id", []any{}).
+		OrderBy("id", "ASC").
+		Get(ctx)
+
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(names) != 4 {
+		t.Fatalf("expected 4 names for empty WhereNotIn, got %d", len(names))
+	}
+}
+
+func TestScalarQuery_WhereNotIn_InvalidColumn(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	_, err := Query[string]().
+		SetDB(db).
+		Table("users").
+		Select("name").
+		WhereNotIn("id; DROP TABLE users", []any{1}).
+		Get(context.Background())
+
+	if err == nil {
+		t.Fatal("expected invalid column error, got nil")
+	}
+	if !strings.Contains(err.Error(), "ScalarQuery.WhereNotIn: invalid column") {
+		t.Fatalf("expected invalid column error, got: %v", err)
+	}
+}
+
+func TestScalarQuery_WhereNotIn_SQLiteRejectsOverflow(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	args := make([]any, maxInArgs+1)
+	for i := range args {
+		args[i] = i
+	}
+
+	_, err := Query[string]().
+		Table("users").
+		Select("name").
+		WhereNotIn("id", args).
+		Get(context.Background())
+
+	if err == nil {
+		t.Fatalf("expected build error for NOT IN list of %d args, got nil", len(args))
+	}
+	if !strings.Contains(err.Error(), "ScalarQuery.WhereNotIn") {
+		t.Fatalf("expected ScalarQuery.WhereNotIn error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exceeds PostgreSQL parameter limit") {
+		t.Fatalf("expected limit error, got: %v", err)
 	}
 }
 
