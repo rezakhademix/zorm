@@ -1351,23 +1351,22 @@ common Go datatypes without needing a Postgres-only column type:
 
 ## Benchmark
 
-Recorded on Apple M3 Pro / darwin/arm64, SQLite `:memory:`, single connection.
-Lower is better. Raw `go test -bench=. -benchmem` output:
+Recorded on Apple M3 Pro / darwin/arm64, SQLite `:memory:`, single connection. Raw `go test -bench=. -benchmem` output:
 
 ### Side-by-side (ns/op · B/op · allocs/op)
 
-| Op                  | gorm (ns/op · B/op · allocs/op) | zorm (ns/op · B/op · allocs/op) |
-| ------------------- | ------------------------------- | ------------------------------- |
-| InsertOne           | 11,147 · 6,732 · 87             | 11,637 · 4,661 · 72             |
-| GetByPK             | 8,320 · 5,516 · 109             | 9,120 · 4,818 · 103             |
-| UpdateOne           | 9,112 · 10,040 · 101            | 8,063 · 4,461 · 63              |
-| DeleteOne           | 6,161 · 3,106 · 40              | 5,876 · 1,879 · 29              |
-| BulkInsert100       | 309,817 · 213,593 · 3,203       | 294,982 · 165,799 · 2,660       |
-| BulkInsert1000      | 3,041,683 · 1,990,998 · 31,411  | 2,842,708 · 1,567,151 · 26,363  |
-| FindWhereOrderLimit | 248,997 · 56,515 · 1,387        | 258,790 · 67,684 · 1,627        |
-| TxInsert100         | 1,596,357 · 703,940 · 9,258     | 1,582,641 · 541,958 · 7,899     |
-| EagerLoadHasMany    | 1,466,133 · 627,644 · 17,223    | 1,147,633 · 442,953 · 11,536    |
-| EagerLoadBelongsTo  | 322,497 · 177,939 · 3,798       | 304,350 · 153,179 · 3,491       |
+| Operation           | gorm (ns/op · B/op · allocs/op) | zorm (ns/op · B/op · allocs/op) | Summary |
+| ------------------- | ------------------------------- | ------------------------------- | ------- |
+| InsertOne           | 11,147 · 6,732 · 87             | 11,637 · 4,661 · 72             | **zorm** 31% less memory, 21% fewer allocs |
+| GetByPK             | 8,320 · 5,516 · 109             | 9,120 · 4,818 · 103             | **zorm** 14.5% less memory, 6% fewer allocs |
+| UpdateOne           | 9,112 · 10,040 · 101            | 8,063 · 4,461 · 63              | **zorm** 12% faster, 56% less memory, 38% fewer allocs |
+| DeleteOne           | 6,161 · 3,106 · 40              | 5,876 · 1,879 · 29              | **zorm** 5% faster, 40% less memory, 28% fewer allocs |
+| BulkInsert100       | 309,817 · 213,593 · 3,203       | 294,982 · 165,799 · 2,660       | **zorm** 5% faster, 22% less memory, 17% fewer allocs |
+| BulkInsert1000      | 3,041,683 · 1,990,998 · 31,411  | 2,842,708 · 1,567,151 · 26,363  | **zorm** 7% faster, 21% less memory, 16% fewer allocs |
+| FindWhereOrderLimit | 248,997 · 56,515 · 1,387        | 258,790 · 67,684 · 1,627        | **gorm** 4% faster, 16% less memory, 15% fewer allocs |
+| TxInsert100         | 1,596,357 · 703,940 · 9,258     | 1,582,641 · 541,958 · 7,899     | **zorm** 1% faster, 23% less memory, 15% fewer allocs |
+| EagerLoadHasMany    | 1,466,133 · 627,644 · 17,223    | 1,147,633 · 442,953 · 11,536    | **zorm** 22% faster, 29% less memory, 33% fewer allocs |
+| EagerLoadBelongsTo  | 322,497 · 177,939 · 3,798       | 304,350 · 153,179 · 3,491       | **zorm** 6% faster, 14% less memory, 8% fewer allocs |
 
 
 ## Contributing
