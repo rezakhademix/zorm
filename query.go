@@ -8,34 +8,65 @@ import (
 	"strings"
 )
 
-// validOperators is a whitelist of safe SQL operators for Where clauses.
-// Any operator not in this set will be rejected to prevent SQL injection.
+// validOperators is the whitelist of safe SQL operators for Where clauses.
+// Every entry must render correctly as `column OP ?` with exactly one bind
+// value — this map is the single source of truth for both validation and the
+// placeholder rendering in addWhere, so the two cannot drift apart.
+// Any operator not in this set is rejected to prevent SQL injection.
 var validOperators = map[string]bool{
-	"=":       true,
-	">":       true,
-	"<":       true,
-	">=":      true,
-	"<=":      true,
-	"<>":      true,
-	"!=":      true,
-	"LIKE":    true,
-	"ILIKE":   true,
-	"IS":      true,
-	"IS NOT":  true,
-	"IN":      true,
-	"NOT IN":  true,
-	"BETWEEN": true,
-	"NOT":     true,
-	"@>":      true, // PostgreSQL array contains
-	"<@":      true, // PostgreSQL array contained by
-	"&&":      true, // PostgreSQL array overlap
-	"@@":      true, // PostgreSQL full-text search
+	"=":      true,
+	">":      true,
+	"<":      true,
+	">=":     true,
+	"<=":     true,
+	"<>":     true,
+	"!=":     true,
+	"LIKE":   true,
+	"ILIKE":  true,
+	"IS":     true,
+	"IS NOT": true,
+	"@>":     true, // PostgreSQL array contains
+	"<@":     true, // PostgreSQL array contained by
+	"&&":     true, // PostgreSQL array overlap
+	"@@":     true, // PostgreSQL full-text search
+}
+
+// nonBinaryOperators are recognized SQL operators that cannot be expressed as
+// `column OP ?` with a single bind value. They are rejected with a pointer to
+// the builder method that does handle them, rather than silently emitting
+// malformed SQL such as `id BETWEEN = ?`.
+var nonBinaryOperators = map[string]string{
+	"IN":      "use WhereIn/OrWhereIn",
+	"NOT IN":  "use WhereNotIn/OrWhereNotIn",
+	"BETWEEN": `express as two conditions, e.g. Where(col, ">=", lo).Where(col, "<=", hi)`,
+	"NOT":     "use a comparison operator such as != or <>",
+}
+
+// normalizeOperator upper-cases and trims an operator for table lookups.
+func normalizeOperator(op string) string {
+	return strings.ToUpper(strings.TrimSpace(op))
 }
 
 // isValidOperator checks if an operator is in the whitelist.
 // Comparison is case-insensitive for SQL keywords.
 func isValidOperator(op string) bool {
-	return validOperators[strings.ToUpper(strings.TrimSpace(op))]
+	return validOperators[normalizeOperator(op)]
+}
+
+// hasTrailingOperator reports whether s already ends with a whitelisted
+// operator, meaning addWhere should append a bare `?` rather than `= ?`.
+// Two-token operators (IS NOT) are checked before their single-token prefix.
+func hasTrailingOperator(s string) bool {
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return false
+	}
+	if len(fields) >= 3 {
+		if validOperators[normalizeOperator(fields[len(fields)-2]+" "+fields[len(fields)-1])] {
+			return true
+		}
+	}
+	return validOperators[normalizeOperator(fields[len(fields)-1])]
 }
 
 // validLockModes is a whitelist of safe SQL lock modes.
@@ -100,51 +131,93 @@ func (m *Model[T]) Raw(query string, args ...any) *Model[T] {
 //	Where(map[string]any{"name": "John", "age": 30}) -> name = ? AND age = ?
 //	Where(&User{Name: "John"}) -> name = ?
 //	Where(func(q *Model[T]) { ... }) -> nested group with parentheses
+//	Where("id IN (SELECT ... WHERE x = ?)", v) -> raw fragment with bound args
+//
+// SECURITY: the raw form is an escape hatch. Its text is checked for SQL
+// comments and statement separators — with or without bound args — but that
+// cannot stop logical injection ("active = ? OR 1=1"). Keep the fragment a
+// trusted constant and pass user input as bound arguments, never concatenated.
 func (m *Model[T]) Where(query any, args ...any) *Model[T] {
+	return m.where("AND", "Where", query, args...)
+}
+
+// OrWhere adds an OR WHERE clause.
+// Supports the same forms as Where.
+func (m *Model[T]) OrWhere(query any, args ...any) *Model[T] {
+	return m.where("OR", "OrWhere", query, args...)
+}
+
+// where is the shared implementation for Where and OrWhere. It normalizes the
+// operator forms ("col", value) and ("col", op, value) before delegating to
+// addWhere. name is used in error messages ("Where" / "OrWhere").
+func (m *Model[T]) where(typ, name string, query any, args ...any) *Model[T] {
 	var (
 		operator string
 		value    any
 	)
 
+	if len(args) == 0 {
+		return m.addWhere(typ, query)
+	}
+
+	// The operator forms interpolate the column expression into the SQL text,
+	// so it has to be a string. Report rather than panic on the type assertion.
+	column, ok := query.(string)
+	if !ok {
+		m.buildErr = fmt.Errorf("zorm: %s: column must be a string when a value is supplied, got %T", name, query)
+		return m
+	}
+
+	// A fragment carrying its own placeholders is raw SQL, whatever the arg
+	// count — it is not a column name to append an operator to. addWhere
+	// validates it and binds the args as given. ScalarQuery.addWhere decides the
+	// same way, so both builders accept the same shapes.
+	if strings.Contains(column, "?") {
+		return m.addWhere(typ, column, args...)
+	}
+
 	switch len(args) {
-	case 0:
-		return m.addWhere("AND", query)
 	case 1:
 		value = args[0]
 		operator = "="
 
 		sb := GetStringBuilder()
-		sb.WriteString(query.(string))
+		sb.WriteString(column)
 		sb.WriteByte(' ')
 		sb.WriteString(operator)
 		result := sb.String()
 		PutStringBuilder(sb)
-		return m.addWhere("AND", result, value)
+		return m.addWhere(typ, result, value)
 	case 2:
 		operator = fmt.Sprint(args[0])
 		value = args[1]
 
+		// Operators that are valid SQL but cannot render as `column OP ?` get a
+		// pointer to the method that handles them.
+		if hint, ok := nonBinaryOperators[normalizeOperator(operator)]; ok {
+			m.buildErr = fmt.Errorf("zorm: %s: operator %q takes more than one value; %s", name, operator, hint)
+			return m
+		}
+
 		// Validate operator to prevent SQL injection
 		if !isValidOperator(operator) {
-			m.buildErr = fmt.Errorf("zorm: Where: invalid operator %q; use one of =, >, <, >=, <=, <>, !=, LIKE, ILIKE, IS, IS NOT, IN, NOT IN, BETWEEN", operator)
+			m.buildErr = fmt.Errorf("zorm: %s: invalid operator %q; use one of =, >, <, >=, <=, <>, !=, LIKE, ILIKE, IS, IS NOT, @>, <@, &&, @@", name, operator)
 			return m
 		}
 
 		sb := GetStringBuilder()
-		sb.WriteString(query.(string))
+		sb.WriteString(column)
 		sb.WriteByte(' ')
 		sb.WriteString(operator)
 		result := sb.String()
 		PutStringBuilder(sb)
-		return m.addWhere("AND", result, value)
+		return m.addWhere(typ, result, value)
 	default:
+		// No supported form takes this many arguments. Silently building
+		// nothing would run the query without the filter the caller wrote.
+		m.buildErr = fmt.Errorf("zorm: %s: expected (column, value) or (column, operator, value), got %d arguments after the column", name, len(args))
 		return m
 	}
-}
-
-// OrWhere adds an OR WHERE clause.
-func (m *Model[T]) OrWhere(query any, args ...any) *Model[T] {
-	return m.addWhere("OR", query, args...)
 }
 
 func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
@@ -157,13 +230,23 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 			modelInfo: m.modelInfo,
 		}
 		callback(nested)
+		// Surface validation failures raised inside the group. Without this the
+		// group is dropped silently and the query runs missing a filter.
+		if nested.buildErr != nil {
+			m.buildErr = nested.buildErr
+			return m
+		}
 		if len(nested.wheres) > 0 {
-			// Strip prefixes from nested wheres
-			var conditions []string
-			for _, w := range nested.wheres {
+			// Strip the AND/OR prefix from the first predicate only; keep the
+			// connectors between subsequent predicates so the group stays
+			// valid SQL: "(a = ? OR b = ?)".
+			conditions := make([]string, 0, len(nested.wheres))
+			for i, w := range nested.wheres {
 				w = strings.TrimSpace(w)
-				w = strings.TrimPrefix(w, "AND ")
-				w = strings.TrimPrefix(w, "OR ")
+				if i == 0 {
+					w = strings.TrimPrefix(w, "AND ")
+					w = strings.TrimPrefix(w, "OR ")
+				}
 				conditions = append(conditions, w)
 			}
 			grouped := "(" + strings.Join(conditions, " ") + ")"
@@ -175,13 +258,16 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 
 	// 2. Handle Map
 	if conditionMap, ok := query.(map[string]any); ok {
-		for k, v := range conditionMap {
+		// Sort the keys: map iteration order is randomized, so an unsorted walk
+		// emits a different (but equivalent) statement on every call, which
+		// defeats the statement cache and makes Print() unstable.
+		for _, k := range sortedKeys(conditionMap) {
 			if err := ValidateColumnName(k); err != nil {
 				m.buildErr = fmt.Errorf("Where map: invalid column name %q: %w", k, err)
 				return m
 			}
 			m.wheres = append(m.wheres, typ+" "+k+" = ?")
-			m.args = append(m.args, v)
+			m.args = append(m.args, conditionMap[k])
 		}
 		return m
 	}
@@ -199,7 +285,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		} else {
 			info = ParseModelType(val.Type())
 		}
-		for _, field := range info.Fields {
+		for _, field := range info.OrderedFields {
 			fVal := val.FieldByName(field.Name)
 			if !fVal.IsZero() {
 				if err := ValidateColumnName(field.Column); err != nil {
@@ -221,19 +307,10 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 
 	if len(args) > 0 && !strings.Contains(queryStr, "?") {
 		trimmed := strings.TrimSpace(queryStr)
-		// Check for operator
 		parts := strings.Fields(trimmed)
-		hasOperator := false
-		if len(parts) > 1 {
-			op := strings.ToUpper(parts[1])
-			operators := map[string]bool{
-				"=": true, ">": true, "<": true, ">=": true, "<=": true,
-				"LIKE": true, "ILIKE": true, "IS": true, "IN": true, "<>": true, "!=": true,
-			}
-			if operators[op] {
-				hasOperator = true
-			}
-		}
+		// Reuse the same whitelist that validates operators, so an operator
+		// accepted by Where always renders as `column OP ?`.
+		hasOperator := hasTrailingOperator(trimmed)
 
 		// Validate the column name portion (first word) to prevent SQL injection
 		if len(parts) > 0 {
@@ -248,10 +325,13 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		} else {
 			queryStr = trimmed + " = ?"
 		}
-	} else if len(args) == 0 {
-		// Raw string with no args: check for the most dangerous injection patterns.
-		// SQL comments and multi-statement separators are blocked.
-		// Subqueries (SELECT, EXISTS) and expressions are allowed for legitimate use.
+	} else {
+		// Raw fragment, with or without bound args: check for the most dangerous
+		// injection patterns. SQL comments and multi-statement separators are
+		// blocked. Subqueries (SELECT, EXISTS) and expressions are allowed for
+		// legitimate use. One rule for every raw shape — the parameterized form
+		// used to skip validation entirely, which is the inconsistency, not the
+		// hardening.
 		if err := validateWhereRawString(queryStr); err != nil {
 			m.buildErr = fmt.Errorf("zorm: Where: %w", err)
 			return m
@@ -450,15 +530,19 @@ func (m *Model[T]) OrWhereNotIn(column string, args []any) *Model[T] {
 }
 
 // OrderBy adds an ORDER BY clause.
-// Column names are validated to prevent SQL injection.
+// Column names and the direction are validated to prevent SQL injection.
+// Returns the model with buildErr set if either is invalid; the error is
+// surfaced when a terminal method (Get, First, etc.) is called.
 func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: OrderBy: invalid column %q: %w", column, err)
+		return m
 	}
 	// Validate direction is only ASC or DESC
 	dir := strings.ToUpper(strings.TrimSpace(direction))
 	if dir != "ASC" && dir != "DESC" {
-		dir = "DESC" // Default to DESC if invalid
+		m.buildErr = fmt.Errorf("zorm: OrderBy: invalid direction %q: %w", direction, ErrInvalidColumnName)
+		return m
 	}
 
 	sb := GetStringBuilder()
@@ -475,7 +559,8 @@ func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
 func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			continue // Skip invalid column names
+			m.buildErr = fmt.Errorf("zorm: GroupBy: invalid column %q: %w", col, err)
+			return m
 		}
 		m.groupBys = append(m.groupBys, col)
 	}
@@ -488,7 +573,8 @@ func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
 	var validCols []string
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			continue // Skip invalid column names
+			m.buildErr = fmt.Errorf("zorm: GroupByRollup: invalid column %q: %w", col, err)
+			return m
 		}
 		validCols = append(validCols, col)
 	}
@@ -509,7 +595,8 @@ func (m *Model[T]) GroupByCube(columns ...string) *Model[T] {
 	var validCols []string
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			continue // Skip invalid column names
+			m.buildErr = fmt.Errorf("zorm: GroupByCube: invalid column %q: %w", col, err)
+			return m
 		}
 		validCols = append(validCols, col)
 	}
@@ -537,7 +624,8 @@ func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 			var validCols []string
 			for _, col := range set {
 				if err := ValidateColumnName(col); err != nil {
-					continue // Skip invalid column names
+					m.buildErr = fmt.Errorf("zorm: GroupByGroupingSets: invalid column %q: %w", col, err)
+					return m
 				}
 				validCols = append(validCols, col)
 			}
@@ -579,7 +667,8 @@ func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 func (m *Model[T]) Having(query string, args ...any) *Model[T] {
 	// Validate query to prevent SQL injection
 	if err := ValidateRawQuery(query); err != nil {
-		return m // Skip invalid queries
+		m.buildErr = fmt.Errorf("zorm: Having: invalid expression %q: %w", query, err)
+		return m
 	}
 
 	// Similar to Where, but for HAVING
@@ -929,6 +1018,16 @@ func (m *Model[T]) GetLimit() int {
 	return m.limit
 }
 
+// GetBuildErr returns the accumulated builder validation error, if any.
+//
+// It exists for the same reason as the getters above: a relation callback's
+// state is read back through this interface, and without it a validation
+// failure inside a WithCallback callback would be invisible to the loader — the
+// rejected condition would be dropped and the relation would load every child.
+func (m *Model[T]) GetBuildErr() error {
+	return m.buildErr
+}
+
 // Join adds an INNER JOIN clause.
 // Both table and column names are validated to prevent SQL injection.
 // Returns the model with buildErr set on invalid input; the error is surfaced
@@ -1043,7 +1142,8 @@ func (m *Model[T]) WithMorph(relation string, typeMap map[string][]string) *Mode
 func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
 	// Validate CTE name to prevent SQL injection
 	if err := ValidateColumnName(name); err != nil {
-		return m // Skip invalid CTE names
+		m.buildErr = fmt.Errorf("zorm: WithCTE: invalid name %q: %w", name, err)
+		return m
 	}
 
 	m.ctes = append(m.ctes, CTE{
@@ -1061,7 +1161,8 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 	// Validate lock mode to prevent SQL injection
 	normalizedMode := strings.ToUpper(strings.TrimSpace(mode))
 	if !validLockModes[normalizedMode] {
-		return m // Skip invalid lock modes
+		m.buildErr = fmt.Errorf("zorm: Lock: invalid mode %q: %w", mode, ErrInvalidColumnName)
+		return m
 	}
 	m.lockMode = normalizedMode
 	return m
@@ -1074,7 +1175,8 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 // Generates: WHERE to_tsvector('english', content) @@ plainto_tsquery('english', ?)
 func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereFullText: invalid column %q: %w", column, err)
+		return m
 	}
 
 	sb := GetStringBuilder()
@@ -1093,10 +1195,12 @@ func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 // Generates: WHERE to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)
 func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereFullTextWithConfig: invalid column %q: %w", column, err)
+		return m
 	}
 	if err := ValidateColumnName(config); err != nil {
-		return m // Skip invalid config names
+		m.buildErr = fmt.Errorf("zorm: WhereFullTextWithConfig: invalid config %q: %w", config, err)
+		return m
 	}
 
 	sb := GetStringBuilder()
@@ -1120,7 +1224,8 @@ func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *M
 // Generates: WHERE search_vector @@ to_tsquery('english', ?)
 func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 	if err := ValidateColumnName(tsvectorColumn); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WhereTsVector: invalid column %q: %w", tsvectorColumn, err)
+		return m
 	}
 
 	sb := GetStringBuilder()
@@ -1141,7 +1246,8 @@ func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 // Generates: WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', ?)
 func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
 	if err := ValidateColumnName(column); err != nil {
-		return m // Skip invalid column names
+		m.buildErr = fmt.Errorf("zorm: WherePhraseSearch: invalid column %q: %w", column, err)
+		return m
 	}
 
 	sb := GetStringBuilder()

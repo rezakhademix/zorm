@@ -84,8 +84,6 @@ func GetGlobalResolver() *DBResolver {
 //	go func() { base.Where("role", "admin").Get(ctx) }()
 //	go func() { base.Where("role", "user").Get(ctx) }()
 type Model[T any] struct {
-	mu sync.RWMutex // Protects query state for Clone() operations
-
 	ctx       context.Context
 	db        *sql.DB
 	tx        *sql.Tx
@@ -176,12 +174,19 @@ func New[T any]() *Model[T] {
 
 // effectiveDialect resolves the dialect to use for SQL generation, honoring
 // (in order): an explicit override on the model, the package-wide override,
-// and finally driver-based detection on the configured *sql.DB.
+// and finally driver-based detection on the configured *sql.DB. When no DB is
+// set on the model, the resolver's primary is consulted before the global DB,
+// so a resolver-only setup still detects its real driver.
 func (m *Model[T]) effectiveDialect() Dialect {
 	if m.dialect != DialectAuto {
 		return m.dialect
 	}
 	db := m.db
+	if db == nil {
+		if resolver := GetGlobalResolver(); resolver != nil {
+			db = resolver.Primary()
+		}
+	}
 	if db == nil {
 		db = GetGlobalDB()
 	}
@@ -321,7 +326,9 @@ func (m *Model[T]) reset() {
 // Clone() itself is safe to call from multiple goroutines on a model that is no longer
 // being modified (e.g., a base model built in a setup phase). It is NOT safe to call
 // Clone() concurrently with any mutating method (Where, Select, OrderBy, etc.) on the
-// same instance — those methods do not acquire any lock.
+// same instance. No lock is involved on either side: a mutex taken only by the
+// reader cannot make an unsynchronized writer safe, so the contract is enforced
+// by usage (build, then clone), not by locking.
 //
 // Safe patterns:
 //
@@ -333,9 +340,6 @@ func (m *Model[T]) reset() {
 //	// Or create a fresh model per goroutine
 //	go func() { New[User]().Where("active", true).Get(ctx) }()
 func (m *Model[T]) Clone() *Model[T] {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	newModel := &Model[T]{
 		ctx:          m.ctx,
 		db:           m.db,

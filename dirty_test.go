@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"runtime"
 	"testing"
+	"weak"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -666,30 +667,30 @@ func TestLRUTracker_Eviction(t *testing.T) {
 	key3 := uintptr(768)
 
 	// Add 2 entities to shard 0 (at capacity)
-	tracker.Store(key1, map[string]any{"name": "user1"})
-	tracker.Store(key2, map[string]any{"name": "user2"})
+	tracker.Store(key1, map[string]any{"name": "user1"}, nil)
+	tracker.Store(key2, map[string]any{"name": "user2"}, nil)
 
 	// Verify both exist
-	if _, ok := tracker.Load(key1); !ok {
+	if _, ok := tracker.Load(key1, nil); !ok {
 		t.Error("Expected key1 to exist")
 	}
-	if _, ok := tracker.Load(key2); !ok {
+	if _, ok := tracker.Load(key2, nil); !ok {
 		t.Error("Expected key2 to exist")
 	}
 
 	// Adding key3 should evict the oldest (key1)
-	tracker.Store(key3, map[string]any{"name": "user3"})
+	tracker.Store(key3, map[string]any{"name": "user3"}, nil)
 
 	// key1 should be evicted (was LRU)
-	if _, ok := tracker.Load(key1); ok {
+	if _, ok := tracker.Load(key1, nil); ok {
 		t.Error("Expected key1 to be evicted")
 	}
 
 	// key2 and key3 should exist
-	if _, ok := tracker.Load(key2); !ok {
+	if _, ok := tracker.Load(key2, nil); !ok {
 		t.Error("Expected key2 to exist")
 	}
-	if _, ok := tracker.Load(key3); !ok {
+	if _, ok := tracker.Load(key3, nil); !ok {
 		t.Error("Expected key3 to exist")
 	}
 }
@@ -705,29 +706,29 @@ func TestLRUTracker_AccessOrder(t *testing.T) {
 	key3 := uintptr(768)
 
 	// Add 3 entities to the same shard (shard has capacity 2)
-	tracker.Store(key1, map[string]any{"name": "user1"})
-	tracker.Store(key2, map[string]any{"name": "user2"})
+	tracker.Store(key1, map[string]any{"name": "user1"}, nil)
+	tracker.Store(key2, map[string]any{"name": "user2"}, nil)
 
 	// At this point, key1 is LRU and key2 is MRU
 	// Access key1 (moves to front)
-	tracker.Load(key1)
+	tracker.Load(key1, nil)
 
 	// Now key2 is LRU and key1 is MRU
 	// Adding key3 should evict key2 (now the oldest)
-	tracker.Store(key3, map[string]any{"name": "user3"})
+	tracker.Store(key3, map[string]any{"name": "user3"}, nil)
 
 	// key2 should be evicted (was LRU)
-	if _, ok := tracker.Load(key2); ok {
+	if _, ok := tracker.Load(key2, nil); ok {
 		t.Error("Expected key2 to be evicted")
 	}
 
 	// key1 should still exist (was accessed, moved to MRU)
-	if _, ok := tracker.Load(key1); !ok {
+	if _, ok := tracker.Load(key1, nil); !ok {
 		t.Error("Expected key1 to exist")
 	}
 
 	// key3 should exist (just added)
-	if _, ok := tracker.Load(key3); !ok {
+	if _, ok := tracker.Load(key3, nil); !ok {
 		t.Error("Expected key3 to exist")
 	}
 }
@@ -736,10 +737,10 @@ func TestLRUTracker_Update(t *testing.T) {
 	tracker := newLRUTracker(3)
 
 	// Add entity
-	tracker.Store(1, map[string]any{"name": "user1"})
+	tracker.Store(1, map[string]any{"name": "user1"}, nil)
 
 	// Update entity
-	tracker.Store(1, map[string]any{"name": "user1_updated"})
+	tracker.Store(1, map[string]any{"name": "user1_updated"}, nil)
 
 	// Should still have only 1 entity
 	if tracker.Len() != 1 {
@@ -747,7 +748,7 @@ func TestLRUTracker_Update(t *testing.T) {
 	}
 
 	// Should have updated value
-	originals, ok := tracker.Load(1)
+	originals, ok := tracker.Load(1, nil)
 	if !ok {
 		t.Fatal("Expected entity 1 to exist")
 	}
@@ -759,8 +760,8 @@ func TestLRUTracker_Update(t *testing.T) {
 func TestLRUTracker_Delete(t *testing.T) {
 	tracker := newLRUTracker(3)
 
-	tracker.Store(1, map[string]any{"name": "user1"})
-	tracker.Store(2, map[string]any{"name": "user2"})
+	tracker.Store(1, map[string]any{"name": "user1"}, nil)
+	tracker.Store(2, map[string]any{"name": "user2"}, nil)
 
 	if tracker.Len() != 2 {
 		t.Errorf("Expected 2 entities, got %d", tracker.Len())
@@ -772,7 +773,7 @@ func TestLRUTracker_Delete(t *testing.T) {
 		t.Errorf("Expected 1 entity after delete, got %d", tracker.Len())
 	}
 
-	if _, ok := tracker.Load(1); ok {
+	if _, ok := tracker.Load(1, nil); ok {
 		t.Error("Expected entity 1 to be deleted")
 	}
 }
@@ -780,8 +781,8 @@ func TestLRUTracker_Delete(t *testing.T) {
 func TestLRUTracker_Clear(t *testing.T) {
 	tracker := newLRUTracker(3)
 
-	tracker.Store(1, map[string]any{"name": "user1"})
-	tracker.Store(2, map[string]any{"name": "user2"})
+	tracker.Store(1, map[string]any{"name": "user1"}, nil)
+	tracker.Store(2, map[string]any{"name": "user2"}, nil)
 
 	tracker.Clear()
 
@@ -796,7 +797,7 @@ func TestLRUTracker_Unbounded(t *testing.T) {
 
 	// Add many entities
 	for i := 0; i < 100; i++ {
-		tracker.Store(uintptr(i), map[string]any{"name": "user"})
+		tracker.Store(uintptr(i), map[string]any{"name": "user"}, nil)
 	}
 
 	// All should exist
@@ -1032,8 +1033,13 @@ func TestCursorWithTrackingScope(t *testing.T) {
 // TestDirtyTracking_NoFinalizerAutoCleanup documents that dirty tracking does NOT
 // use runtime finalizers. Tracking data persists until either the LRU capacity
 // evicts it, ClearOriginals is called explicitly, or a TrackingScope is closed.
-// This avoids the ABA problem where a finalizer for a GC'd entity could fire after
-// a new entity reuses the same address, incorrectly clearing the new entity's data.
+//
+// The ABA problem this avoids — a finalizer firing after a new entity reuses the
+// collected entity's address — is handled instead by the weak reference each entry
+// carries: the entry stays put, but a lookup from a different entity at that
+// address does not match it. So occupancy is what this test asserts; retrievability
+// through the collected entity is gone by design (see
+// TestDirtyTracking_RecycledAddressDoesNotInheritBaseline).
 func TestDirtyTracking_NoFinalizerAutoCleanup(t *testing.T) {
 	ClearAllOriginals()
 	modelInfo := ParseModel[DirtyUser]()
@@ -1044,23 +1050,27 @@ func TestDirtyTracking_NoFinalizerAutoCleanup(t *testing.T) {
 		trackOriginals(user, modelInfo)
 		key = getEntityKey(user)
 
-		if _, ok := globalTracker.Load().Load(key); !ok {
+		if _, ok := globalTracker.Load().Load(key, user); !ok {
 			t.Fatal("expected entity to be tracked before going out of scope")
 		}
 	}()
+
+	if got := TrackedEntityCount(); got != 1 {
+		t.Fatalf("expected 1 tracked entity before GC, got %d", got)
+	}
 
 	// Without finalizers, GC does NOT remove tracking data.
 	runtime.GC()
 	runtime.GC()
 
-	if _, ok := globalTracker.Load().Load(key); !ok {
-		t.Error("tracking entry was unexpectedly removed; no finalizer should be running")
+	if got := TrackedEntityCount(); got != 1 {
+		t.Errorf("tracking entry was unexpectedly removed (count=%d); no finalizer should be running", got)
 	}
 
 	// Explicit cleanup is the correct approach.
 	globalTracker.Load().Delete(key)
-	if _, ok := globalTracker.Load().Load(key); ok {
-		t.Error("expected tracking entry to be gone after explicit Delete")
+	if got := TrackedEntityCount(); got != 0 {
+		t.Errorf("expected tracking entry to be gone after explicit Delete, count=%d", got)
 	}
 }
 
@@ -1094,5 +1104,188 @@ func TestDirtyTracking_RetrackDoesNotPanic(t *testing.T) {
 
 	if !IsTracked(user) {
 		t.Error("expected entity to still be tracked after syncOriginals")
+	}
+}
+
+// =============================================================================
+// ADDRESS-REUSE (ABA) TESTS
+// =============================================================================
+
+// TestDirtyTracking_RecycledAddressDoesNotInheritBaseline verifies that an entity
+// occupying an address previously held by a different, now-collected entity does
+// not inherit that entity's baseline.
+//
+// Entries are keyed by pointer address, so once an entity is garbage collected a
+// new allocation can land on the same address. Storing the ghost's entry under the
+// fresh entity's key reproduces that deterministically, without depending on the
+// allocator actually recycling an address during the test.
+func TestDirtyTracking_RecycledAddressDoesNotInheritBaseline(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	ghost := &DirtyUser{ID: 1, Name: "Ghost", Email: "ghost@example.com"}
+	trackOriginals(ghost, modelInfo)
+
+	ghostOriginals, ok := globalTracker.Load().Load(getEntityKey(ghost), ghost)
+	if !ok {
+		t.Fatal("setup: expected ghost entity to be tracked")
+	}
+	ghostRef := weakRef[DirtyUser]{p: weak.Make(ghost)}
+
+	fresh := &DirtyUser{ID: 2, Name: "Fresh", Email: "fresh@example.com"}
+	globalTracker.Load().Store(getEntityKey(fresh), ghostOriginals, ghostRef)
+
+	if IsTracked(fresh) {
+		t.Error("a never-tracked entity reported as tracked: it inherited a recycled baseline")
+	}
+	if got := GetOriginals(fresh); got != nil {
+		t.Errorf("fresh entity exposed a foreign baseline: %v", got)
+	}
+	if got := GetOriginal(fresh, "name"); got != nil {
+		t.Errorf("fresh entity exposed a foreign original for name: %v", got)
+	}
+
+	// Untracked entities are dirty by definition; inheriting a baseline would
+	// wrongly report them clean.
+	model := New[DirtyUser]()
+	if !model.IsDirtyField(fresh, "name") {
+		t.Error("expected name to be dirty on an untracked entity")
+	}
+
+	runtime.KeepAlive(ghost)
+}
+
+// TestDirtyTracking_FreshEntitiesNeverInheritAfterGC is the end-to-end form of the
+// same hazard: after a tracked entity is collected, no subsequently allocated
+// entity may report as tracked. It cannot fail spuriously — it only fails if an
+// address really is recycled and the baseline really is inherited.
+func TestDirtyTracking_FreshEntitiesNeverInheritAfterGC(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	func() {
+		ghost := &DirtyUser{ID: 999, Name: "Ghost", Email: "ghost@example.com"}
+		trackOriginals(ghost, modelInfo)
+	}()
+
+	runtime.GC()
+	runtime.GC()
+
+	inherited := 0
+	for i := 0; i < 20000; i++ {
+		fresh := &DirtyUser{ID: i, Name: "Fresh"}
+		if IsTracked(fresh) {
+			inherited++
+		}
+	}
+
+	if inherited > 0 {
+		t.Errorf("%d freshly allocated entities inherited a collected entity's baseline", inherited)
+	}
+}
+
+// TestSave_RejectsEntityWithRecycledBaseline is the user-visible consequence:
+// Save must refuse an entity that never carried a baseline of its own, rather
+// than computing a dirty set against a foreign row and issuing a wrong UPDATE.
+func TestSave_RejectsEntityWithRecycledBaseline(t *testing.T) {
+	db := setupDirtyDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	if _, err := db.Exec(`INSERT INTO dirty_users (id, name, email) VALUES (1, 'Original', 'original@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ghost := &DirtyUser{ID: 1, Name: "Ghost", Email: "ghost@example.com"}
+	trackOriginals(ghost, modelInfo)
+	ghostOriginals, ok := globalTracker.Load().Load(getEntityKey(ghost), ghost)
+	if !ok {
+		t.Fatal("setup: expected ghost entity to be tracked")
+	}
+	ghostRef := weakRef[DirtyUser]{p: weak.Make(ghost)}
+
+	// A hand-built entity that happens to sit on the ghost's address.
+	fresh := &DirtyUser{ID: 1, Name: "Fresh"}
+	globalTracker.Load().Store(getEntityKey(fresh), ghostOriginals, ghostRef)
+
+	err := New[DirtyUser]().SetDB(db).Save(ctx, fresh)
+	if err != ErrSaveUntracked {
+		t.Errorf("expected ErrSaveUntracked, got %v", err)
+	}
+
+	// The row must be untouched.
+	var name string
+	if err := db.QueryRow("SELECT name FROM dirty_users WHERE id = 1").Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Original" {
+		t.Errorf("Save wrote through a recycled baseline: name is now %q", name)
+	}
+
+	runtime.KeepAlive(ghost)
+}
+
+// TestTrackingScope_CloseSpareRecycledOccupant verifies that closing a scope
+// deletes only the entries the scope itself created. Entries are keyed by
+// address, so if a scoped entity is collected and its address is reused by an
+// entity tracked elsewhere, Close must leave the newcomer's baseline alone —
+// otherwise an unrelated entity silently loses tracking and its next Save
+// fails with ErrSaveUntracked.
+func TestTrackingScope_CloseSparesRecycledOccupant(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	scope := NewTrackingScope()
+
+	ghost := &DirtyUser{ID: 1, Name: "Ghost", Email: "ghost@example.com"}
+	trackOriginalsWithScope(ghost, modelInfo, scope)
+	key := getEntityKey(ghost)
+
+	// The scoped entity is collected and a different entity, tracked outside the
+	// scope, takes over its address.
+	fresh := &DirtyUser{ID: 2, Name: "Fresh", Email: "fresh@example.com"}
+	freshOriginals := map[string]any{"id": 2, "name": "Fresh", "email": "fresh@example.com"}
+	globalTracker.Load().Store(key, freshOriginals, weakRef[DirtyUser]{p: weak.Make(fresh)})
+
+	scope.Close()
+
+	originals, ok := globalTracker.Load().Load(key, fresh)
+	if !ok {
+		t.Fatal("scope.Close deleted an entry belonging to a different entity")
+	}
+	if originals["name"] != "Fresh" {
+		t.Errorf("expected the newcomer's baseline to survive, got %v", originals)
+	}
+
+	runtime.KeepAlive(ghost)
+}
+
+// TestTrackingScope_CloseStillClearsItsOwnEntities is the companion: normal
+// scope cleanup must keep working.
+func TestTrackingScope_CloseStillClearsItsOwnEntities(t *testing.T) {
+	ClearAllOriginals()
+	modelInfo := ParseModel[DirtyUser]()
+
+	scope := NewTrackingScope()
+	users := []*DirtyUser{
+		{ID: 1, Name: "One"},
+		{ID: 2, Name: "Two"},
+	}
+	for _, u := range users {
+		trackOriginalsWithScope(u, modelInfo, scope)
+		if !IsTracked(u) {
+			t.Fatalf("setup: expected %s to be tracked", u.Name)
+		}
+	}
+
+	scope.Close()
+
+	for _, u := range users {
+		if IsTracked(u) {
+			t.Errorf("expected %s to be untracked after scope close", u.Name)
+		}
 	}
 }

@@ -48,12 +48,19 @@ func Query[T any]() *ScalarQuery[T] {
 
 // effectiveDialect resolves the dialect to use for SQL generation, honoring
 // (in order): an explicit override on the query, the package-wide override,
-// and finally driver-based detection on the configured *sql.DB.
+// and finally driver-based detection on the configured *sql.DB. When no DB is
+// set on the query, the resolver's primary is consulted before the global DB,
+// so a resolver-only setup still detects its real driver.
 func (q *ScalarQuery[T]) effectiveDialect() Dialect {
 	if q.dialect != DialectAuto {
 		return q.dialect
 	}
 	db := q.db
+	if db == nil {
+		if resolver := GetGlobalResolver(); resolver != nil {
+			db = resolver.Primary()
+		}
+	}
 	if db == nil {
 		db = GetGlobalDB()
 	}
@@ -100,12 +107,15 @@ func (q *ScalarQuery[T]) OrWhere(query any, args ...any) *ScalarQuery[T] {
 func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQuery[T] {
 	// Handle Map
 	if conditionMap, ok := query.(map[string]any); ok {
-		for k, v := range conditionMap {
+		// Sorted for the same reason as Model.addWhere: a randomized walk emits
+		// a different statement per call.
+		for _, k := range sortedKeys(conditionMap) {
 			if err := ValidateColumnName(k); err != nil {
-				continue
+				q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", k, err)
+				return q
 			}
 			q.wheres = append(q.wheres, typ+" "+k+" = ?")
-			q.args = append(q.args, v)
+			q.args = append(q.args, conditionMap[k])
 		}
 		return q
 	}
@@ -113,15 +123,38 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 	// Handle String
 	queryStr, ok := query.(string)
 	if !ok {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: condition must be a string or map[string]any, got %T", query)
+		return q
+	}
+
+	// A fragment carrying its own placeholders is raw SQL, whatever the arg
+	// count: validate it and bind the args as given. Model.addWhere decides the
+	// same way, so the two builders accept the same shapes — previously
+	// ScalarQuery read a one-arg raw fragment as a column name and rejected it,
+	// and only validated the zero-arg form.
+	if strings.Contains(queryStr, "?") {
+		if err := validateWhereRawString(queryStr); err != nil {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: %w", err)
+			return q
+		}
+		q.wheres = append(q.wheres, typ+" "+queryStr)
+		q.args = append(q.args, args...)
 		return q
 	}
 
 	switch len(args) {
 	case 0:
+		// Raw fragment with no args: block SQL comments and statement
+		// separators, matching Model.addWhere.
+		if err := validateWhereRawString(queryStr); err != nil {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: %w", err)
+			return q
+		}
 		q.wheres = append(q.wheres, typ+" "+queryStr)
 	case 1:
 		// column, value -> column = value
 		if err := ValidateColumnName(queryStr); err != nil {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", queryStr, err)
 			return q
 		}
 		sb := GetStringBuilder()
@@ -133,20 +166,37 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 	case 2:
 		// column, operator, value -> column operator value
 		if err := ValidateColumnName(queryStr); err != nil {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", queryStr, err)
+			return q
+		}
+		// The operator is interpolated into the SQL text, so it must be a
+		// string drawn from the whitelist — never caller-supplied SQL.
+		operator, ok := args[0].(string)
+		if !ok {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: operator must be a string, got %T", args[0])
+			return q
+		}
+		if hint, ok := nonBinaryOperators[normalizeOperator(operator)]; ok {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: operator %q takes more than one value; %s", operator, hint)
+			return q
+		}
+		if !isValidOperator(operator) {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid operator %q; use one of =, >, <, >=, <=, <>, !=, LIKE, ILIKE, IS, IS NOT, @>, <@, &&, @@", operator)
 			return q
 		}
 		sb := GetStringBuilder()
 		sb.WriteString(queryStr)
 		sb.WriteByte(' ')
-		sb.WriteString(args[0].(string))
+		sb.WriteString(operator)
 		sb.WriteString(" ?")
 		q.wheres = append(q.wheres, typ+" "+sb.String())
 		PutStringBuilder(sb)
 		q.args = append(q.args, args[1])
 	default:
-		// Assume raw query with placeholders
-		q.wheres = append(q.wheres, typ+" "+queryStr)
-		q.args = append(q.args, args...)
+		// No placeholders in the fragment, yet more args than any column form
+		// takes: nothing sensible to build, and binding them would produce a
+		// query with fewer placeholders than args.
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: expected (column, value) or (column, operator, value), got %d arguments after %q", len(args), queryStr)
 	}
 
 	return q
@@ -187,6 +237,7 @@ func (q *ScalarQuery[T]) WhereNotIn(column string, values []any) *ScalarQuery[T]
 // WhereNull adds a WHERE column IS NULL condition.
 func (q *ScalarQuery[T]) WhereNull(column string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNull: invalid column %q: %w", column, err)
 		return q
 	}
 	q.wheres = append(q.wheres, "AND "+column+" IS NULL")
@@ -196,6 +247,7 @@ func (q *ScalarQuery[T]) WhereNull(column string) *ScalarQuery[T] {
 // WhereNotNull adds a WHERE column IS NOT NULL condition.
 func (q *ScalarQuery[T]) WhereNotNull(column string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNotNull: invalid column %q: %w", column, err)
 		return q
 	}
 	q.wheres = append(q.wheres, "AND "+column+" IS NOT NULL")
@@ -203,13 +255,17 @@ func (q *ScalarQuery[T]) WhereNotNull(column string) *ScalarQuery[T] {
 }
 
 // OrderBy adds an ORDER BY clause.
+// The column name and direction are validated; invalid input sets buildErr,
+// which is surfaced by the terminal call.
 func (q *ScalarQuery[T]) OrderBy(column, direction string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.OrderBy: invalid column %q: %w", column, err)
 		return q
 	}
 	dir := strings.ToUpper(strings.TrimSpace(direction))
 	if dir != "ASC" && dir != "DESC" {
-		dir = "DESC"
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.OrderBy: invalid direction %q: %w", direction, ErrInvalidColumnName)
+		return q
 	}
 
 	sb := GetStringBuilder()
@@ -243,7 +299,8 @@ func (q *ScalarQuery[T]) Distinct() *ScalarQuery[T] {
 func (q *ScalarQuery[T]) GroupBy(columns ...string) *ScalarQuery[T] {
 	for _, col := range columns {
 		if err := ValidateColumnName(col); err != nil {
-			continue
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.GroupBy: invalid column %q: %w", col, err)
+			return q
 		}
 		q.groupBys = append(q.groupBys, col)
 	}
@@ -253,6 +310,7 @@ func (q *ScalarQuery[T]) GroupBy(columns ...string) *ScalarQuery[T] {
 // Having adds a HAVING clause.
 func (q *ScalarQuery[T]) Having(query string, args ...any) *ScalarQuery[T] {
 	if err := ValidateRawQuery(query); err != nil {
+		q.buildErr = fmt.Errorf("zorm: ScalarQuery.Having: invalid expression %q: %w", query, err)
 		return q
 	}
 

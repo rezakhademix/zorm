@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -627,4 +629,45 @@ func TestAcquireRelease_PoolMayAliasDocumented(t *testing.T) {
 		t.Skip("did not observe aliasing in this run; sync.Pool behaviour is non-deterministic. The hazard still exists by design — see model.go Acquire/Release.")
 	}
 	t.Log("Acquire returned the same *Model memory after Release — retained references would alias.")
+}
+
+// TestClone_ConcurrentFromReadOnlyBase pins the concurrency pattern the docs
+// promise: build a base in one goroutine, then Clone it from many. Model.mu was
+// only ever taken by Clone — never by a mutator — so it protected nothing
+// against a concurrent writer and only read as a guarantee the type does not
+// make. This test is what actually holds the pattern up, under -race.
+func TestClone_ConcurrentFromReadOnlyBase(t *testing.T) {
+	base := New[TestModel]().
+		Where("name", "shared").
+		Select("id", "name").
+		OrderBy("id", "ASC").
+		Limit(10)
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	queries := make([]string, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Each goroutine diverges from the same untouched base.
+			q := base.Clone().Where("user_age", ">", i)
+			queries[i], _ = q.Print()
+		}(i)
+	}
+	wg.Wait()
+
+	// The base must be untouched by any of them.
+	if len(base.wheres) != 1 {
+		t.Errorf("base picked up clones' conditions: %v", base.wheres)
+	}
+	for i, q := range queries {
+		if !strings.Contains(q, "name =") {
+			t.Errorf("clone %d lost the base condition: %q", i, q)
+		}
+		if !strings.Contains(q, "user_age >") {
+			t.Errorf("clone %d lost its own condition: %q", i, q)
+		}
+	}
 }

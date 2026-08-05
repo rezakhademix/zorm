@@ -829,22 +829,45 @@ func TestHasOne_EagerLoading(t *testing.T) {
 
 	ctx := context.Background()
 
-	// HasOne eager loading via loadHasMany panics because reflect.MakeSlice
-	// is called on a pointer type (*RelProfile) instead of a slice type.
-	// MorphOne handles this correctly (lines 1149-1158) but HasOne reuses
-	// loadHasMany without single-value logic.
-	panicked := true
-	func() {
-		defer func() {
-			if r := recover(); r == nil {
-				panicked = false
-			}
-		}()
-		_, _ = New[RelUserWithProfile]().With("Profile").Get(ctx)
-	}()
+	users, err := New[RelUserWithProfile]().With("Profile").Get(ctx)
+	if err != nil {
+		t.Fatalf("HasOne eager loading failed: %v", err)
+	}
+	if len(users) != 1 {
+		t.Fatalf("expected 1 user, got %d", len(users))
+	}
+	if users[0].Profile == nil {
+		t.Fatal("expected Profile to be loaded, got nil")
+	}
+	if users[0].Profile.Bio != "Alice bio" {
+		t.Errorf("expected Profile.Bio = %q, got %q", "Alice bio", users[0].Profile.Bio)
+	}
+}
 
-	if !panicked {
-		t.Error("expected HasOne eager loading to panic due to reflect.MakeSlice on pointer type, but it did not panic")
+// TestHasOne_LazyLoading verifies Load() on a single entity works for HasOne
+// (exercises the same loadHasMany path as eager loading).
+func TestHasOne_LazyLoading(t *testing.T) {
+	db := setupRelDBHasOne(t)
+	defer db.Close()
+
+	oldDB := GlobalDB
+	GlobalDB = db
+	defer func() { GlobalDB = oldDB }()
+
+	ctx := context.Background()
+
+	user, err := New[RelUserWithProfile]().Find(ctx, 1)
+	if err != nil {
+		t.Fatalf("Find failed: %v", err)
+	}
+	if err := New[RelUserWithProfile]().Load(ctx, user, "Profile"); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if user.Profile == nil {
+		t.Fatal("expected Profile to be loaded, got nil")
+	}
+	if user.Profile.Bio != "Alice bio" {
+		t.Errorf("expected Profile.Bio = %q, got %q", "Alice bio", user.Profile.Bio)
 	}
 }
 

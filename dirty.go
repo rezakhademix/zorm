@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 )
 
 // fastEqual compares two values for equality using type-specific comparison
@@ -139,10 +140,35 @@ func fastEqual(a, b any) bool {
 	return reflect.DeepEqual(a, b)
 }
 
+// entityRef identifies the entity a tracking entry was created for.
+//
+// Entries are keyed by the entity's pointer address, and an address can be
+// recycled: once an entity is garbage collected, a newly allocated entity may
+// land on the same address. Holding a weak reference lets a lookup tell the two
+// apart — a collected entity's reference resolves to nil, so the new occupant
+// is correctly reported as untracked instead of inheriting a dead baseline.
+type entityRef interface {
+	// matches reports whether this reference still points at entity.
+	matches(entity any) bool
+}
+
+// weakRef is the entityRef implementation. It is generic so weak.Pointer can
+// hold the concrete entity type, and is stored behind the non-generic
+// entityRef interface because the tracker itself is not generic.
+type weakRef[T any] struct {
+	p weak.Pointer[T]
+}
+
+func (w weakRef[T]) matches(entity any) bool {
+	e, ok := entity.(*T)
+	return ok && w.p.Value() == e
+}
+
 // trackerEntry represents a single entity's tracking data in the LRU cache.
 type trackerEntry struct {
 	key       uintptr
 	originals map[string]any
+	ref       entityRef     // Identifies the entity this baseline belongs to
 	element   *list.Element // Position in LRU list
 }
 
@@ -196,15 +222,20 @@ func (t *lruTracker) getShard(key uintptr) *lruTrackerShard {
 	return t.shards[key%shardCount]
 }
 
-// Store adds or updates tracking data for an entity.
-func (t *lruTracker) Store(key uintptr, originals map[string]any) {
+// Store adds or updates tracking data for an entity. ref identifies the entity
+// the baseline belongs to; see entityRef.
+func (t *lruTracker) Store(key uintptr, originals map[string]any, ref entityRef) {
 	shard := t.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if entry, exists := shard.items[key]; exists {
-		// Update existing entry and move to front
+		// Update existing entry and move to front. The ref must be replaced
+		// too: when this address has been recycled, the entry belongs to the
+		// new entity now, and keeping the old ref would make every subsequent
+		// lookup report untracked.
 		entry.originals = originals
+		entry.ref = ref
 		shard.lruList.MoveToFront(entry.element)
 		return
 	}
@@ -220,6 +251,7 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any) {
 	entry := &trackerEntry{
 		key:       key,
 		originals: originals,
+		ref:       ref,
 	}
 	entry.element = shard.lruList.PushFront(entry)
 	shard.items[key] = entry
@@ -230,14 +262,19 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any) {
 	}
 }
 
-// Load retrieves tracking data for an entity.
-func (t *lruTracker) Load(key uintptr) (map[string]any, bool) {
+// Load retrieves tracking data for entity, which must be the entity the key
+// was derived from. An entry whose ref no longer matches belongs to a different
+// entity that previously occupied this address, so it is not returned.
+func (t *lruTracker) Load(key uintptr, entity any) (map[string]any, bool) {
 	shard := t.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	entry, exists := shard.items[key]
 	if !exists {
+		return nil, false
+	}
+	if entry.ref != nil && !entry.ref.matches(entity) {
 		return nil, false
 	}
 
@@ -248,12 +285,25 @@ func (t *lruTracker) Load(key uintptr) (map[string]any, bool) {
 
 // Delete removes tracking data for an entity.
 func (t *lruTracker) Delete(key uintptr) {
+	t.deleteMatching(key, nil)
+}
+
+// deleteMatching removes the entry at key only when it is still the entry that
+// ref was stored with. A nil ref deletes unconditionally.
+//
+// This matters for deferred cleanup such as TrackingScope.Close: by the time it
+// runs, the scoped entity may have been collected and its address reused by an
+// unrelated entity, whose baseline must not be dropped.
+func (t *lruTracker) deleteMatching(key uintptr, ref entityRef) {
 	shard := t.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	entry, exists := shard.items[key]
 	if !exists {
+		return
+	}
+	if ref != nil && entry.ref != ref {
 		return
 	}
 
@@ -298,19 +348,20 @@ func (s *lruTrackerShard) evictLRU() {
 // tracking data to persist beyond the operation.
 type TrackingScope struct {
 	mu     sync.Mutex
-	keys   map[uintptr]struct{}
+	keys   map[uintptr]entityRef
 	closed atomic.Bool
 }
 
 // NewTrackingScope creates a new tracking scope.
 func NewTrackingScope() *TrackingScope {
 	return &TrackingScope{
-		keys: make(map[uintptr]struct{}),
+		keys: make(map[uintptr]entityRef),
 	}
 }
 
-// track adds a key to the scope's tracked set.
-func (s *TrackingScope) track(key uintptr) {
+// track records a key and the entity reference it was stored with, so Close can
+// delete only the entries this scope actually created.
+func (s *TrackingScope) track(key uintptr, ref entityRef) {
 	if s == nil {
 		return
 	}
@@ -318,7 +369,7 @@ func (s *TrackingScope) track(key uintptr) {
 	defer s.mu.Unlock()
 	// Check keys != nil inside lock to prevent race with Close()
 	if s.keys != nil {
-		s.keys[key] = struct{}{}
+		s.keys[key] = ref
 	}
 }
 
@@ -334,10 +385,11 @@ func (s *TrackingScope) Close() {
 	s.keys = nil
 	s.mu.Unlock()
 
-	// Clear all tracked entities from the global tracker
+	// Clear all tracked entities from the global tracker, leaving alone any
+	// address that has since been taken over by a different entity.
 	tracker := globalTracker.Load()
-	for key := range keys {
-		tracker.Delete(key)
+	for key, ref := range keys {
+		tracker.deleteMatching(key, ref)
 	}
 }
 
@@ -425,12 +477,13 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 	}
 
 	key := getEntityKey(entity)
+	ref := weakRef[T]{p: weak.Make(entity)}
 	tracker := globalTracker.Load()
-	tracker.Store(key, originals)
+	tracker.Store(key, originals, ref)
 
 	// Register with scope if provided
 	if scope != nil {
-		scope.track(key)
+		scope.track(key, ref)
 	}
 }
 
@@ -450,7 +503,7 @@ func GetOriginal[T any](entity *T, column string) any {
 		return nil
 	}
 
-	if originals, ok := globalTracker.Load().Load(getEntityKey(entity)); ok {
+	if originals, ok := globalTracker.Load().Load(getEntityKey(entity), entity); ok {
 		if orig, exists := originals[column]; exists {
 			return orig
 		}
@@ -465,7 +518,7 @@ func GetOriginals[T any](entity *T) map[string]any {
 		return nil
 	}
 
-	if originals, ok := globalTracker.Load().Load(getEntityKey(entity)); ok {
+	if originals, ok := globalTracker.Load().Load(getEntityKey(entity), entity); ok {
 		result := make(map[string]any, len(originals))
 		maps.Copy(result, originals)
 		return result
@@ -485,7 +538,7 @@ func isDirty[T any](entity *T, column string, modelInfo *ModelInfo) bool {
 	}
 
 	// Load also touches the LRU entry, preventing eviction of actively-used entities
-	orig, ok := globalTracker.Load().Load(getEntityKey(entity))
+	orig, ok := globalTracker.Load().Load(getEntityKey(entity), entity)
 	if !ok {
 		return true // Not tracked = treat as dirty (new entity)
 	}
@@ -518,7 +571,7 @@ func getDirty[T any](entity *T, modelInfo *ModelInfo) map[string]any {
 	}
 
 	val := reflect.ValueOf(entity).Elem()
-	orig, tracked := globalTracker.Load().Load(getEntityKey(entity))
+	orig, tracked := globalTracker.Load().Load(getEntityKey(entity), entity)
 
 	// Pre-allocate with reasonable capacity
 	dirty := make(map[string]any, 4)
@@ -549,7 +602,7 @@ func IsTracked[T any](entity *T) bool {
 	if entity == nil {
 		return false
 	}
-	_, ok := globalTracker.Load().Load(getEntityKey(entity))
+	_, ok := globalTracker.Load().Load(getEntityKey(entity), entity)
 	return ok
 }
 
@@ -567,7 +620,7 @@ func hasDirtyFields[T any](entity *T, modelInfo *ModelInfo) bool {
 		return false
 	}
 
-	orig, tracked := globalTracker.Load().Load(getEntityKey(entity))
+	orig, tracked := globalTracker.Load().Load(getEntityKey(entity), entity)
 	if !tracked {
 		return true // Untracked entities are considered dirty
 	}

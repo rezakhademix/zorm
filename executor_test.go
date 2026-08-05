@@ -2,9 +2,13 @@ package zorm
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // =============================================================================
@@ -817,4 +821,81 @@ func TestModelInfo_MultipleRelationsExcluded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTerminalMethods_SurfaceBuildErr ensures every read terminal method reports
+// a builder validation failure instead of running the query with the offending
+// clause silently missing — which returns a plausible but wrong result.
+//
+// The assertions check the error identity, not merely that some error came back,
+// so an incidental database error cannot masquerade as correct behavior.
+func TestTerminalMethods_SurfaceBuildErr(t *testing.T) {
+	ctx := context.Background()
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE test_models (id INTEGER PRIMARY KEY, name TEXT, user_age INTEGER, extra TEXT);
+		INSERT INTO test_models (id, name, user_age) VALUES (1, 'a', 10), (2, 'b', 20);
+	`); err != nil {
+		t.Fatalf("failed to setup DB: %v", err)
+	}
+
+	// A model whose WHERE clause failed validation. Executed as-is it would scan
+	// the whole table instead of the intended subset.
+	newBroken := func() *Model[TestModel] {
+		return New[TestModel]().SetDB(db).Where("name; DROP TABLE x", 1)
+	}
+	if newBroken().buildErr == nil {
+		t.Fatal("setup: expected the invalid column to set buildErr")
+	}
+
+	assertBuildErr := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected the builder error to be surfaced, got nil")
+		}
+		if !errors.Is(err, ErrInvalidColumnName) {
+			t.Fatalf("expected the builder error, got a different failure: %v", err)
+		}
+	}
+
+	t.Run("Get", func(t *testing.T) {
+		_, err := newBroken().Get(ctx)
+		assertBuildErr(t, err)
+	})
+	t.Run("Count", func(t *testing.T) {
+		_, err := newBroken().Count(ctx)
+		assertBuildErr(t, err)
+	})
+	t.Run("Exists", func(t *testing.T) {
+		_, err := newBroken().Exists(ctx)
+		assertBuildErr(t, err)
+	})
+	t.Run("Sum", func(t *testing.T) {
+		_, err := newBroken().Sum(ctx, "user_age")
+		assertBuildErr(t, err)
+	})
+	t.Run("Avg", func(t *testing.T) {
+		_, err := newBroken().Avg(ctx, "user_age")
+		assertBuildErr(t, err)
+	})
+	t.Run("Pluck", func(t *testing.T) {
+		_, err := newBroken().Pluck(ctx, "name")
+		assertBuildErr(t, err)
+	})
+	t.Run("Cursor", func(t *testing.T) {
+		_, err := newBroken().Cursor(ctx)
+		assertBuildErr(t, err)
+	})
+	t.Run("CountOver", func(t *testing.T) {
+		_, err := newBroken().CountOver(ctx, "name")
+		assertBuildErr(t, err)
+	})
+	t.Run("Delete", func(t *testing.T) {
+		assertBuildErr(t, newBroken().Delete(ctx))
+	})
 }

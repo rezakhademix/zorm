@@ -926,22 +926,24 @@ func TestScalarQuery_WhereColumnValidation(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Invalid column name should be rejected
+	// An invalid column name is rejected loudly: dropping the predicate would
+	// silently widen the result set.
 	q := Query[string]().
 		SetDB(db).
 		Table("users").
 		Select("name").
 		Where("id; DROP TABLE users;--", 1)
 
-	// Query should still work but the malicious where should be ignored
-	results, err := q.Get(ctx)
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
+	if q.buildErr == nil {
+		t.Fatal("expected buildErr for an invalid WHERE column")
 	}
 
-	// Should return all users since the invalid WHERE was skipped
-	if len(results) != 4 {
-		t.Errorf("expected 4 results (invalid WHERE skipped), got %d", len(results))
+	results, err := q.Get(ctx)
+	if !errors.Is(err, ErrInvalidColumnName) {
+		t.Fatalf("expected ErrInvalidColumnName from Get, got %v", err)
+	}
+	if results != nil {
+		t.Errorf("expected no results on a rejected query, got %v", results)
 	}
 }
 
@@ -1134,26 +1136,17 @@ func TestScalarQuery_OrderByInvalidDirection(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Invalid direction should default to DESC
-	names, err := Query[string]().
+	// An invalid direction is rejected rather than silently coerced to DESC,
+	// which would order the result set the opposite way from the request.
+	_, err := Query[string]().
 		SetDB(db).
 		Table("users").
 		Select("name").
 		OrderBy("id", "INVALID").
 		Get(ctx)
 
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-
-	// With DESC order by id, Diana (4), Charlie (3), Bob (2), Alice (1)
-	if len(names) != 4 {
-		t.Fatalf("expected 4 names, got %d", len(names))
-	}
-
-	// First should be Diana (highest id)
-	if names[0] != "Diana" {
-		t.Errorf("expected first name 'Diana' with invalid direction defaulting to DESC, got %q", names[0])
+	if !errors.Is(err, ErrInvalidColumnName) {
+		t.Fatalf("expected ErrInvalidColumnName for an invalid direction, got %v", err)
 	}
 }
 
@@ -1554,8 +1547,9 @@ func TestScalarQuery_WhereInvalidType(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Non-string, non-map type should be ignored
-	names, err := Query[string]().
+	// A non-string, non-map condition is a caller mistake: report it instead of
+	// running a query without the intended filter.
+	_, err := Query[string]().
 		SetDB(db).
 		Table("users").
 		Select("name").
@@ -1563,13 +1557,8 @@ func TestScalarQuery_WhereInvalidType(t *testing.T) {
 		OrderBy("id", "ASC").
 		Get(ctx)
 
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-
-	// Should return all 4 users since invalid Where is skipped
-	if len(names) != 4 {
-		t.Errorf("expected 4 names with invalid Where type, got %d", len(names))
+	if err == nil {
+		t.Fatal("expected an error for a non-string, non-map WHERE condition")
 	}
 }
 
@@ -2015,5 +2004,81 @@ func TestScalarQuery_BuildErrPreservedInClone(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid") {
 		t.Errorf("expected error to mention 'invalid', got %q", err.Error())
+	}
+}
+
+// ==================== ScalarQuery WHERE hardening ====================
+// ScalarQuery must apply the same operator/raw-string validation as Model.
+// Without it the operator argument lands verbatim in the SQL text.
+
+func TestScalarQuery_RejectsInvalidOperator(t *testing.T) {
+	q := Query[string]().
+		Table("users").
+		Select("name").
+		Where("id", "= 1 OR 1=1 --", 5)
+
+	if q.buildErr == nil {
+		t.Fatal("expected buildErr for an invalid operator, got nil")
+	}
+
+	query, _ := q.Print()
+	if strings.Contains(query, "1=1") {
+		t.Errorf("operator text leaked into SQL: %q", query)
+	}
+}
+
+func TestScalarQuery_AcceptsValidOperator(t *testing.T) {
+	q := Query[string]().Table("users").Select("name").Where("age", ">", 18)
+	if q.buildErr != nil {
+		t.Fatalf("unexpected buildErr for a valid operator: %v", q.buildErr)
+	}
+
+	query, args := q.Print()
+	if !strings.Contains(query, "age > $1") {
+		t.Errorf("expected %q in SQL, got %q", "age > $1", query)
+	}
+	if len(args) != 1 || args[0] != 18 {
+		t.Errorf("expected args [18], got %v", args)
+	}
+}
+
+func TestScalarQuery_NonStringOperatorDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("ScalarQuery.Where panicked on a non-string operator: %v", r)
+		}
+	}()
+
+	q := Query[string]().Table("users").Select("name").Where("age", 42, 18)
+	if q.buildErr == nil {
+		t.Error("expected buildErr for a non-string operator, got nil")
+	}
+}
+
+func TestScalarQuery_RejectsRawStringWithComment(t *testing.T) {
+	q := Query[string]().Table("users").Select("name").Where("1=1; DROP TABLE users --")
+
+	if q.buildErr == nil {
+		t.Fatal("expected buildErr for a raw WHERE string with a comment and statement separator, got nil")
+	}
+
+	query, _ := q.Print()
+	if strings.Contains(query, "DROP TABLE") {
+		t.Errorf("raw string leaked into SQL: %q", query)
+	}
+}
+
+func TestScalarQuery_BuildErrSurfacedByGet(t *testing.T) {
+	db := setupScalarTestDB(t)
+	defer db.Close()
+
+	_, err := Query[string]().SetDB(db).
+		Table("users").
+		Select("name").
+		Where("id", "BOGUS", 1).
+		Get(context.Background())
+
+	if err == nil {
+		t.Fatal("expected Get to surface the buildErr, got nil")
 	}
 }

@@ -1525,3 +1525,57 @@ func TestPaginate_WithGroupBy(t *testing.T) {
 		t.Errorf("expected 3 data items, got %d", len(result.Data))
 	}
 }
+
+// TestFind_DoesNotMutateReceiver verifies that Find leaves the model's WHERE
+// state untouched, so the same model can be reused for a second lookup.
+// Previously Find called m.Where directly, so consecutive Find calls
+// accumulated both primary-key predicates and the second one matched nothing.
+func TestFind_DoesNotMutateReceiver(t *testing.T) {
+	db := setupExDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	m := New[ExModel]().SetDB(db)
+
+	first, err := m.Find(ctx, 1)
+	if err != nil {
+		t.Fatalf("first Find failed: %v", err)
+	}
+	if first.Name != "A" {
+		t.Errorf("expected first Find to return A, got %q", first.Name)
+	}
+
+	if len(m.wheres) != 0 {
+		t.Errorf("Find mutated the receiver: wheres = %v", m.wheres)
+	}
+
+	second, err := m.Find(ctx, 2)
+	if err != nil {
+		t.Fatalf("second Find failed: %v", err)
+	}
+	if second.Name != "B" {
+		t.Errorf("expected second Find to return B, got %q", second.Name)
+	}
+}
+
+// TestFind_PreservesExistingConditions verifies the clone keeps the conditions
+// the caller already put on the model.
+func TestFind_PreservesExistingConditions(t *testing.T) {
+	db := setupExDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	m := New[ExModel]().SetDB(db).Where("value", ">", 15)
+
+	if _, err := m.Find(ctx, 1); !errors.Is(err, ErrRecordNotFound) {
+		t.Errorf("expected ErrRecordNotFound for id=1 with value > 15, got %v", err)
+	}
+
+	got, err := m.Find(ctx, 2)
+	if err != nil {
+		t.Fatalf("Find(2) failed: %v", err)
+	}
+	if got.Name != "B" {
+		t.Errorf("expected B, got %q", got.Name)
+	}
+}
