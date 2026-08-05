@@ -272,6 +272,52 @@ func (MorphMany[T]) NewModel(ctx context.Context, db *sql.DB) any {
 	return m
 }
 
+// trackRelatedResults records dirty-tracking baselines for the entities a relation
+// load produced, so an eagerly- or lazily-loaded entity supports Save() exactly like
+// one fetched directly through Get/First/Find.
+//
+// It goes through NewModel because tracking needs the related type as a type
+// parameter, not as a reflect.Type: the relation config is the only value on the
+// loader path that still carries it. The *Model[R] it hands back is used purely as
+// the vehicle for R — one allocation per relation load, not per row.
+//
+// MorphTo relations are not tracked. Their target type is decided per row by the
+// type column, so MorphTo.NewModel returns nil and this degrades to a no-op.
+func (m *Model[T]) trackRelatedResults(ctx context.Context, relConfig any, results []any) {
+	if len(results) == 0 {
+		return
+	}
+
+	rel, ok := relConfig.(interface {
+		NewModel(context.Context, *sql.DB) any
+	})
+	if !ok {
+		return
+	}
+
+	if tracker, ok := rel.NewModel(ctx, m.db).(interface {
+		trackDynamic([]any, *TrackingScope)
+	}); ok {
+		tracker.trackDynamic(results, m.trackingScope)
+	}
+}
+
+// trackDynamic stores dirty-tracking baselines for boxed entities produced by a
+// relation load. It is the typed half of trackRelatedResults: the tracker holds a
+// weak reference typed by the entity's own type parameter (see weakRef in
+// dirty.go), which is why this has to run on a *Model[R] rather than on the
+// parent model.
+//
+// Elements that are not *T are skipped rather than panicking: a caller mixing
+// types has a bug elsewhere, and dropping tracking is the harmless outcome.
+func (m *Model[T]) trackDynamic(results []any, scope *TrackingScope) {
+	for _, r := range results {
+		if entity, ok := r.(*T); ok {
+			trackOriginalsWithScope(entity, m.modelInfo, scope)
+		}
+	}
+}
+
 // TableOverrider interface allows relations to specify a custom table name.
 type TableOverrider interface {
 	GetOverrideTable() string
@@ -650,6 +696,8 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 		return err
 	}
 
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
+
 	// 4.5 Recursive Loading
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
@@ -847,6 +895,8 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 		return err
 	}
 
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
+
 	// 5. Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
@@ -993,6 +1043,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 	if err != nil {
 		return err
 	}
+
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
@@ -1212,7 +1264,7 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 	}
 	defer rows.Close()
 
-	return m.scanRowsDynamic(rows, relatedInfo)
+	return m.scanRowsDynamic(ctx, rows, relatedInfo)
 }
 
 func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, constraints *relationConstraints) error {
@@ -1315,10 +1367,12 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	}
 	defer rows.Close()
 
-	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	relatedResults, err := m.scanRowsDynamic(ctx, rows, relatedInfo)
 	if err != nil {
 		return err
 	}
+
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
@@ -1508,10 +1562,12 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	}
 	defer rows.Close()
 
-	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	relatedResults, err := m.scanRowsDynamic(ctx, rows, relatedInfo)
 	if err != nil {
 		return err
 	}
+
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
@@ -1630,6 +1686,8 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 	if err != nil {
 		return err
 	}
+
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
@@ -1797,6 +1855,8 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 		return err
 	}
 
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
+
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
 			return err
@@ -1914,10 +1974,12 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 	}
 	defer rows.Close()
 
-	relatedResults, err := m.scanRowsDynamic(rows, relatedInfo)
+	relatedResults, err := m.scanRowsDynamic(ctx, rows, relatedInfo)
 	if err != nil {
 		return err
 	}
+
+	m.trackRelatedResults(ctx, relConfig, relatedResults)
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
 		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {

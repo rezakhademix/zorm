@@ -203,7 +203,7 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 	}
 	defer rows.Close()
 
-	results, err := m.scanRows(rows)
+	results, err := m.scanRows(ctx, rows)
 	if err != nil {
 		return nil, WrapQueryError("SCAN", query, args, err)
 	}
@@ -914,7 +914,11 @@ func (m *Model[T]) fillScanDestinations(fields []*FieldInfo, val reflect.Value, 
 // It uses pre-calculated field mapping and reused destination slice for performance.
 // Automatically tracks original values for dirty checking.
 // If a tracking scope is configured, entities are registered with the scope.
-func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
+//
+// ctx is the context driving the query, not the model's stored one: an AfterFind
+// hook that issues DB work has to be cancellable with the caller's request, and
+// hooks reading request-scoped values need the caller's context to find them.
+func (m *Model[T]) scanRows(ctx context.Context, rows *sql.Rows) ([]*T, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -948,7 +952,7 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 
 		// AfterFind Hook
 		if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
-			if err := hook.AfterFind(m.ctx); err != nil {
+			if err := hook.AfterFind(ctx); err != nil {
 				return nil, err
 			}
 		}
@@ -1194,7 +1198,13 @@ func (m *Model[T]) applyUpdateValues(ctx context.Context, entity *T, values map[
 // This is used for loading relations with different model types than T.
 // It dynamically creates instances based on the provided ModelInfo.
 // Optimized to cache field mapping and reuse destination slices.
-func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any, error) {
+//
+// Every relation kind — eager With, lazy Load/LoadSlice, and nested loads — funnels
+// through here, so this is where a related entity gets the same post-scan treatment
+// scanRows gives a directly-fetched one: the AfterFind hook and accessors. Dirty
+// tracking needs the concrete type parameter and is applied by the loaders via
+// trackDynamic.
+func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInfo *ModelInfo) ([]any, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -1231,10 +1241,27 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 			return nil, err
 		}
 
-		results = append(results, val.Interface())
+		entity := val.Interface()
+
+		// AfterFind Hook. Asserting on the boxed pointer works the same way the
+		// typed path's assertion does — the dynamic type is *Related.
+		if hook, ok := entity.(interface{ AfterFind(context.Context) error }); ok {
+			if err := hook.AfterFind(ctx); err != nil {
+				return nil, err
+			}
+		}
+
+		results = append(results, entity)
 	}
 
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Load Accessors
+	loadAccessorsInfo(results, modelInfo)
+
+	return results, nil
 }
 
 // withAutoTx opens a transaction, runs op against a tx-bound clone of the model, and
@@ -1456,9 +1483,18 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Auto-tx: if the entity uses a *Tx hook variant and we're not already in a
 	// transaction, open one so hook DB work rolls back atomically with the INSERT.
 	if m.tx == nil && needsAutoTx(opCreate, entity) {
-		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+		err := m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.Create(ctx, entity)
 		})
+		if err != nil {
+			// The INSERT was rolled back, so the baseline recorded below no
+			// longer describes a row that exists. Leaving it would make the
+			// entity report as tracked and let Save() emit an UPDATE against a
+			// missing row. Field values (including the primary key) are left
+			// alone: in-memory mutations are never rolled back.
+			ClearOriginals(entity)
+		}
+		return err
 	}
 
 	// Auto-set created_at if it exists and the caller left it zero.
@@ -2965,8 +3001,25 @@ func (m *Model[T]) loadAccessors(results []*T) {
 	if len(results) == 0 {
 		return
 	}
+	// Reuse the reflection-only core so the typed and relation paths cannot
+	// drift apart. The boxing costs one interface header per entity, which is
+	// negligible next to the reflect method calls the core performs anyway.
+	boxed := make([]any, len(results))
+	for i, r := range results {
+		boxed[i] = r
+	}
+	loadAccessorsInfo(boxed, m.modelInfo)
+}
 
-	// Check if T has Attributes map[string]any
+// loadAccessorsInfo is the reflection-only implementation behind loadAccessors.
+// It takes boxed *Struct pointers and their ModelInfo so relation loaders — which
+// only ever know the related type as a reflect.Type — get identical behavior.
+func loadAccessorsInfo(results []any, info *ModelInfo) {
+	if len(results) == 0 {
+		return
+	}
+
+	// Check if the model has Attributes map[string]any
 	// We inspect the first element
 	val := reflect.ValueOf(results[0]).Elem()
 	attrField := val.FieldByName("Attributes")
@@ -2976,7 +3029,7 @@ func (m *Model[T]) loadAccessors(results []*T) {
 	}
 
 	// Use cached accessors from ModelInfo
-	accessorIndices := m.modelInfo.Accessors
+	accessorIndices := info.Accessors
 	if len(accessorIndices) == 0 {
 		return
 	}
