@@ -86,30 +86,20 @@ func TestScope_RegisteredBetween(t *testing.T) {
 	}
 }
 
-// TestScope_SearchActiveAdmins documents two zorm quirks that the original
-// scope hits. The scope LOOKS correct, but the emitted SQL is not what you'd
-// expect. Both are real findings in the current codebase (zorm @ main):
+// TestScope_SearchActiveAdmins verifies a scope combining top-level Where
+// calls with a nested Where(func(q){...}).OrWhere(...) group:
 //
-//  1. OrWhere(col, op, val) — the three-arg form — does NOT mirror Where's
-//     three-arg form. Where has explicit operator-parsing in case 2
-//     (query.go:123-139); OrWhere calls addWhere directly and skips it. So
-//     OrWhere("email", "ILIKE", "%a%") ends up as `email = ?` with TWO trailing
-//     args (`"ILIKE"` then `"%a%"`), corrupting the placeholder/arg alignment
-//     for everything that follows.
+//  1. OrWhere(col, op, val) — the three-arg form — mirrors Where's three-arg
+//     form, so OrWhere("email", "ILIKE", "%a%") emits `email ILIKE ?` with a
+//     single bind arg.
 //
-//  2. The Where(func(q){...}) grouping helper strips both "AND " and "OR "
-//     prefixes from each nested condition and joins them with a single space
-//     (query.go:163-169). So a nested `Where(...).OrWhere(...)` produces
-//     `(condA condB)` with no connector — invalid SQL.
-//
-// The assertions below intentionally lock down the *actual* (buggy) output
-// emitted today, so this test will fail loudly if zorm fixes either quirk —
-// at which point the scope can be revisited.
+//  2. The Where(func(q){...}) grouping helper preserves the AND/OR connectors
+//     between nested predicates: `(name ILIKE $4 OR email ILIKE $5)`.
 func TestScope_SearchActiveAdmins(t *testing.T) {
 	since := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
 	sql, args := New[ScopeUser]().Scope(SearchActiveAdmins("alice", since)).Print()
 
-	// Top-level ANDed conditions are fine.
+	// Top-level ANDed conditions.
 	for _, want := range []string{
 		"role = $1",
 		"active = $2",
@@ -120,20 +110,17 @@ func TestScope_SearchActiveAdmins(t *testing.T) {
 		}
 	}
 
-	// Quirk #1+#2 manifested: the OR is silently dropped and the second
-	// clause loses its ILIKE operator (collapses to `email = $5`).
-	const buggyGroup = "(name ILIKE $4 email = $5)"
-	if !strings.Contains(sql, buggyGroup) {
-		t.Errorf("expected the (known-buggy) group %q in SQL, got %q", buggyGroup, sql)
+	// The grouped OR search keeps both its connector and its operator.
+	const wantGroup = "(name ILIKE $4 OR email ILIKE $5)"
+	if !strings.Contains(sql, wantGroup) {
+		t.Errorf("expected group %q in SQL, got %q", wantGroup, sql)
 	}
 
 	if !strings.Contains(sql, "ORDER BY last_login DESC") {
 		t.Errorf("expected 'ORDER BY last_login DESC', got %q", sql)
 	}
 
-	// Quirk #1 manifests in the args: the literal string "ILIKE" leaks in
-	// as a value at index 4, shifting the real email pattern to index 5.
-	wantArgs := []any{"admin", true, since, "%alice%", "ILIKE", "%alice%"}
+	wantArgs := []any{"admin", true, since, "%alice%", "%alice%"}
 	if len(args) != len(wantArgs) {
 		t.Fatalf("expected %d args, got %d (%v)", len(wantArgs), len(args), args)
 	}

@@ -89,40 +89,70 @@ func (m *Model[T]) queryerForWrite() interface {
 	return GetGlobalDB()
 }
 
+// writeDB returns the *sql.DB to open transactions and prepare statements on
+// for write operations. It mirrors queryerForWrite's routing order so an
+// auto-opened transaction lands on the same handle as the SQL it wraps.
+func (m *Model[T]) writeDB() *sql.DB {
+	if resolver := GetGlobalResolver(); resolver != nil {
+		if db := resolver.Primary(); db != nil {
+			return db
+		}
+	}
+	if m.db != nil {
+		return m.db
+	}
+	return GetGlobalDB()
+}
+
+// stmtCacheKey namespaces a cached statement by the database handle it was
+// prepared on. A *sql.Stmt is bound to the handle that created it, so without
+// this a statement could be served to a caller on a different database — a
+// SetDB target, another replica, or the primary.
+func stmtCacheKey(db *sql.DB, query string) string {
+	return fmt.Sprintf("%p|%s", db, query)
+}
+
 // prepareStmtWithQueryer prepares a statement using the cache.
 // Callers must only invoke this when m.stmtCache != nil.
 // It takes a queryer interface to allow reuse between read and write operations.
+//
+// Statements prepared on a *sql.DB are cached per handle. Statements prepared
+// on a *sql.Tx are never cached: they die with their transaction, so caching
+// them would hand a closed statement to a later caller.
 func (m *Model[T]) prepareStmtWithQueryer(ctx context.Context, query string, q interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }) (*sql.Stmt, func(), error) {
-	// Try to get from cache
-	if stmt, release := m.stmtCache.Get(query); stmt != nil {
-		return stmt, release, nil
-	}
+	switch handle := q.(type) {
+	case *sql.DB:
+		key := stmtCacheKey(handle, query)
+		if stmt, release := m.stmtCache.Get(key); stmt != nil {
+			return stmt, release, nil
+		}
 
-	// Not in cache — prepare and store atomically to avoid a race between
-	// a concurrent Put and the subsequent Get.
-	var stmt *sql.Stmt
-	var err error
+		// Not in cache — prepare and store atomically to avoid a race between
+		// a concurrent Put and the subsequent Get.
+		stmt, err := handle.PrepareContext(ctx, query)
+		if err != nil {
+			return nil, nil, err
+		}
 
-	if db, ok := q.(*sql.DB); ok {
-		stmt, err = db.PrepareContext(ctx, query)
-	} else if tx, ok := q.(*sql.Tx); ok {
-		stmt, err = tx.PrepareContext(ctx, query)
-	} else {
+		// PutAndGet atomically stores and returns the statement with an incremented
+		// ref count, preventing eviction between Put and Get.
+		cachedStmt, release := m.stmtCache.PutAndGet(key, stmt)
+		return cachedStmt, release, nil
+
+	case *sql.Tx:
+		stmt, err := handle.PrepareContext(ctx, query)
+		if err != nil {
+			return nil, nil, err
+		}
+		return stmt, func() { _ = stmt.Close() }, nil
+
+	default:
 		return nil, nil, fmt.Errorf("unable to prepare statement: invalid queryer type")
 	}
-
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// PutAndGet atomically stores and returns the statement with an incremented
-	// ref count, preventing eviction between Put and Get.
-	cachedStmt, release := m.stmtCache.PutAndGet(query, stmt)
-	return cachedStmt, release, nil
 }
 
 // prepareStmt returns a prepared statement for the given query.
@@ -202,8 +232,10 @@ func (m *Model[T]) First(ctx context.Context) (*T, error) {
 }
 
 // Find finds a record by ID.
+// Uses Clone() so the primary-key condition is not accumulated on the receiver,
+// which lets the same model be reused for further queries.
 func (m *Model[T]) Find(ctx context.Context, id any) (*T, error) {
-	return m.Where(m.modelInfo.PrimaryKey, id).First(ctx)
+	return m.Clone().Where(m.modelInfo.PrimaryKey, id).First(ctx)
 }
 
 // FindOrFail finds a record by ID or returns an error.
@@ -216,6 +248,9 @@ func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
+	if m.buildErr != nil {
+		return nil, m.buildErr
+	}
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
 	}
@@ -294,6 +329,7 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		}
 		sb.WriteString(" FROM ")
 		sb.WriteString(tableName)
+		q.buildJoinClause(&sb)
 		q.buildWhereClause(&sb)
 
 		if len(q.groupBys) > 0 {
@@ -310,6 +346,7 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	} else {
 		sb.WriteString("SELECT COUNT(*) FROM ")
 		sb.WriteString(tableName)
+		q.buildJoinClause(&sb)
 		q.buildWhereClause(&sb)
 	}
 
@@ -345,6 +382,9 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 // It uses "SELECT 1 FROM table WHERE conditions LIMIT 1" for efficiency.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
+	if m.buildErr != nil {
+		return false, m.buildErr
+	}
 	// Clone to avoid mutating shared state (thread-safe)
 	q := m.Clone()
 	q.limit = 1
@@ -358,6 +398,7 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 	sb.WriteString("SELECT 1 FROM ")
 	sb.WriteString(tableName)
 
+	q.buildJoinClause(&sb)
 	q.buildWhereClause(&sb)
 	sb.WriteString(" LIMIT 1")
 
@@ -397,6 +438,9 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
+	if m.buildErr != nil {
+		return 0, m.buildErr
+	}
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
 	}
@@ -415,6 +459,7 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 	sb.WriteString(") FROM ")
 	sb.WriteString(tableName)
 
+	q.buildJoinClause(&sb)
 	q.buildWhereClause(&sb)
 
 	query := sb.String()
@@ -453,6 +498,9 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
+	if m.buildErr != nil {
+		return 0, m.buildErr
+	}
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
 	}
@@ -471,6 +519,7 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	sb.WriteString(") FROM ")
 	sb.WriteString(tableName)
 
+	q.buildJoinClause(&sb)
 	q.buildWhereClause(&sb)
 
 	query := sb.String()
@@ -507,9 +556,24 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 // CountOver returns count of records partitioned by the specified column.
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
+//
+// Keys are normalized with the same conversion the relation loaders use, so a
+// key is always a string regardless of the type the driver scanned the column
+// into (int64 for SQLite integers, []byte for binary/UUID columns on some
+// drivers). Without the normalization a []byte value panics: it is not a valid
+// map key.
+//
+// The key type is part of the signature deliberately. An earlier version
+// returned map[any]int64 while normalizing the keys to strings, which let code
+// written against driver-typed keys (counts[int64(5)]) keep compiling and
+// silently read zero.
+//
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
-func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64, error) {
+func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int64, error) {
+	if m.buildErr != nil {
+		return nil, m.buildErr
+	}
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
 	}
@@ -517,8 +581,10 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64,
 	// Clone to avoid mutating shared state (thread-safe, consistent with Count/Sum/Avg)
 	q := m.Clone()
 
-	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
 	var sb strings.Builder
+	cteArgs := q.buildWithClause(&sb)
+
+	// Build query: SELECT column, COUNT(*) OVER (PARTITION BY column) as count
 	sb.WriteString("SELECT ")
 	sb.WriteString(column)
 	sb.WriteString(", COUNT(*) OVER (PARTITION BY ")
@@ -526,26 +592,51 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[any]int64,
 	sb.WriteString(") as count FROM ")
 	sb.WriteString(q.TableName())
 
+	q.buildJoinClause(&sb)
+
 	// Add WHERE clause
 	q.buildWhereClause(&sb)
 
-	rows, err := q.queryer().QueryContext(ctx, rebind(sb.String()), q.args...)
+	query := sb.String()
+	args := append(cteArgs, q.args...)
+
+	var rows *sql.Rows
+	var err error
+
+	// Use prepared statement if caching is enabled
+	if q.stmtCache != nil {
+		var stmt *sql.Stmt
+		var release func()
+		stmt, release, err = q.prepareStmt(ctx, rebind(query))
+		if err != nil {
+			return nil, WrapQueryError("PREPARE", query, args, err)
+		}
+		defer release()
+
+		rows, err = stmt.QueryContext(ctx, args...)
+	} else {
+		rows, err = q.queryer().QueryContext(ctx, rebind(query), args...)
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, WrapQueryError("SELECT", query, args, err)
 	}
 	defer rows.Close()
 
-	result := make(map[any]int64)
+	result := make(map[string]int64)
 	for rows.Next() {
 		var colVal any
 		var count int64
 		if err := rows.Scan(&colVal, &count); err != nil {
-			return nil, err
+			return nil, WrapQueryError("SCAN", query, args, err)
 		}
-		result[colVal] = count
+		result[anyToKeyString(colVal)] = count
 	}
 
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, WrapQueryError("SCAN", query, args, err)
+	}
+	return result, nil
 }
 
 // buildSelectQuery constructs the SQL SELECT statement from the query builder state.
@@ -582,21 +673,7 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	sb.WriteString(" FROM ")
 	sb.WriteString(m.TableName())
 
-	// Emit JOIN clauses (before WHERE)
-	for _, j := range m.joins {
-		sb.WriteByte(' ')
-		sb.WriteString(j.joinType)
-		sb.WriteByte(' ')
-		sb.WriteString(j.table)
-		if j.col1 != "" {
-			sb.WriteString(" ON ")
-			sb.WriteString(j.col1)
-			sb.WriteByte(' ')
-			sb.WriteString(j.op)
-			sb.WriteByte(' ')
-			sb.WriteString(j.col2)
-		}
-	}
+	m.buildJoinClause(sb)
 
 	m.buildWhereClause(sb)
 
@@ -668,6 +745,25 @@ func (m *Model[T]) buildWithClause(sb *strings.Builder) []any {
 	}
 	sb.WriteString(" ")
 	return args
+}
+
+// buildJoinClause appends the accumulated JOIN clauses to the query builder.
+// Emitted after the FROM clause and before WHERE.
+func (m *Model[T]) buildJoinClause(sb *strings.Builder) {
+	for _, j := range m.joins {
+		sb.WriteByte(' ')
+		sb.WriteString(j.joinType)
+		sb.WriteByte(' ')
+		sb.WriteString(j.table)
+		if j.col1 != "" {
+			sb.WriteString(" ON ")
+			sb.WriteString(j.col1)
+			sb.WriteByte(' ')
+			sb.WriteString(j.op)
+			sb.WriteByte(' ')
+			sb.WriteString(j.col2)
+		}
+	}
 }
 
 // buildWhereClause appends WHERE conditions to the query builder.
@@ -873,6 +969,9 @@ func (m *Model[T]) scanRows(rows *sql.Rows) ([]*T, error) {
 // because it requires all rows to be available for batch loading. Use Get() instead
 // when relation loading is needed.
 func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
+	if m.buildErr != nil {
+		return nil, m.buildErr
+	}
 	if len(m.relations) > 0 || len(m.relationCallbacks) > 0 || len(m.morphRelations) > 0 {
 		return nil, fmt.Errorf("zorm: Cursor does not support eager relation loading (With/WithCallback/WithMorph); use Get() instead")
 	}
@@ -951,8 +1050,35 @@ func (c *Cursor[T]) Close() error {
 	return c.rows.Close()
 }
 
+// findByAttributes runs the lookup half of FirstOrCreate / UpdateOrCreate.
+// Returns (nil, nil) when no row matches.
+func (m *Model[T]) findByAttributes(ctx context.Context, attributes map[string]any) (*T, error) {
+	q := m.Clone()
+	// Sorted so the lookup emits a stable WHERE chain across calls.
+	for _, k := range sortedKeys(attributes) {
+		q = q.Where(k, attributes[k])
+	}
+
+	result, err := q.First(ctx)
+	if err == nil {
+		return result, nil
+	}
+	// Any error other than "record not found" is the caller's problem.
+	if !errors.Is(err, ErrRecordNotFound) {
+		return nil, err
+	}
+	return nil, nil
+}
+
 // FirstOrCreate finds the first record matching attributes or creates it with attributes+values.
 // If found, returns the existing record. If not found, creates a new record with merged attributes+values.
+//
+// Find-then-create is not atomic: a concurrent caller can insert the same row
+// between the two statements. When the INSERT then fails on a duplicate key,
+// FirstOrCreate re-runs the lookup once and returns the row the other caller
+// committed. If that lookup still finds nothing — the conflict was on some
+// other unique constraint, not the one the attributes select for — the
+// duplicate-key error is returned unchanged.
 func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any, values map[string]any) (*T, error) {
 	// Validate inputs
 	if attributes == nil {
@@ -962,21 +1088,12 @@ func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any,
 		values = make(map[string]any)
 	}
 
-	// Build query from attributes
-	q := m.Clone()
-	for k, v := range attributes {
-		q = q.Where(k, v)
-	}
-
-	result, err := q.First(ctx)
-	if err == nil && result != nil {
-		return result, nil
-	}
-
-	// Check if error is specifically "record not found"
-	// Any other error should be returned immediately
-	if err != nil && !errors.Is(err, ErrRecordNotFound) {
+	result, err := m.findByAttributes(ctx, attributes)
+	if err != nil {
 		return nil, err
+	}
+	if result != nil {
+		return result, nil
 	}
 
 	// Not found, create
@@ -991,13 +1108,31 @@ func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any,
 	}
 
 	if err := m.Create(ctx, entity); err != nil {
-		return nil, err
+		if !IsDuplicateKey(err) {
+			return nil, err
+		}
+		// Lost the race: someone inserted a matching row after our lookup.
+		raced, findErr := m.findByAttributes(ctx, attributes)
+		if findErr != nil {
+			return nil, findErr
+		}
+		if raced == nil {
+			// The conflict was on a constraint the attributes do not select
+			// for, so retrying would not help.
+			return nil, err
+		}
+		return raced, nil
 	}
 	return entity, nil
 }
 
 // UpdateOrCreate finds a record matching attributes and updates it with values, or creates it.
 // If found, updates the record with values. If not found, creates a new record with merged attributes+values.
+//
+// Like FirstOrCreate, the find-then-create pair is not atomic. When the INSERT
+// loses to a concurrent caller, UpdateOrCreate re-runs the lookup once and
+// updates the row that caller committed; a duplicate-key conflict the
+// attributes do not select for is returned unchanged.
 func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any, values map[string]any) (*T, error) {
 	// Validate inputs
 	if attributes == nil {
@@ -1007,30 +1142,12 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 		values = make(map[string]any)
 	}
 
-	// Build query from attributes
-	q := m.Clone()
-	for k, v := range attributes {
-		q = q.Where(k, v)
-	}
-
-	result, err := q.First(ctx)
-	if err == nil && result != nil {
-		// Found, update
-		if err := fillStruct(result, values); err != nil {
-			return nil, err
-		}
-		// We need to update only the changed fields? Or all values?
-		// Update() updates all fields of the struct currently.
-		if err := m.Update(ctx, result); err != nil {
-			return nil, err
-		}
-		return result, nil
-	}
-
-	// Check if error is specifically "record not found"
-	// Any other error should be returned immediately
-	if err != nil && !errors.Is(err, ErrRecordNotFound) {
+	result, err := m.findByAttributes(ctx, attributes)
+	if err != nil {
 		return nil, err
+	}
+	if result != nil {
+		return m.applyUpdateValues(ctx, result, values)
 	}
 
 	// Not found, create
@@ -1044,6 +1161,30 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 	}
 
 	if err := m.Create(ctx, entity); err != nil {
+		if !IsDuplicateKey(err) {
+			return nil, err
+		}
+		// Lost the race: update the row the winner inserted instead.
+		raced, findErr := m.findByAttributes(ctx, attributes)
+		if findErr != nil {
+			return nil, findErr
+		}
+		if raced == nil {
+			return nil, err
+		}
+		return m.applyUpdateValues(ctx, raced, values)
+	}
+	return entity, nil
+}
+
+// applyUpdateValues writes values onto an existing entity and persists it.
+func (m *Model[T]) applyUpdateValues(ctx context.Context, entity *T, values map[string]any) (*T, error) {
+	if err := fillStruct(entity, values); err != nil {
+		return nil, err
+	}
+	// Update() writes all fields of the struct, matching the pre-existing
+	// behavior of this path.
+	if err := m.Update(ctx, entity); err != nil {
 		return nil, err
 	}
 	return entity, nil
@@ -1101,10 +1242,7 @@ func (m *Model[T]) scanRowsDynamic(rows *sql.Rows, modelInfo *ModelInfo) ([]any,
 // entity implements a *Tx hook variant so the hook can do additional DB work that
 // rolls back atomically with the parent SQL.
 func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) (err error) {
-	db := m.db
-	if db == nil {
-		db = GetGlobalDB()
-	}
+	db := m.writeDB()
 	if db == nil {
 		return ErrNilDatabase
 	}
@@ -1120,7 +1258,7 @@ func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) (er
 		}
 		if err != nil {
 			if rbErr := sqlTx.Rollback(); rbErr != nil {
-				err = fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
+				err = fmt.Errorf("%w (%w: %v)", err, ErrRollbackFailed, rbErr)
 			}
 			return
 		}
@@ -1304,6 +1442,12 @@ func (m *Model[T]) autoSetCreatedAt(entity *T) {
 //	    return model.WithTx(tx).Create(ctx, entity)
 //	})
 func (m *Model[T]) Create(ctx context.Context, entity *T) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	// Validate input
 	if entity == nil {
 		return ErrNilPointer
@@ -1335,7 +1479,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 	val := reflect.ValueOf(entity).Elem()
 
-	for _, field := range m.modelInfo.Fields {
+	for _, field := range m.modelInfo.OrderedFields {
 		fVal := val.FieldByIndex(field.Index)
 		// Skip auto-increment primary key if zero
 		if field.IsPrimary && field.IsAuto {
@@ -1350,7 +1494,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 
 	sb := GetStringBuilder()
 	sb.WriteString("INSERT INTO ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" (")
 	sb.WriteString(strings.Join(columns, ", "))
 	sb.WriteString(") VALUES (")
@@ -1417,6 +1561,12 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 //	    return model.WithTx(tx).Update(ctx, entity)
 //	})
 func (m *Model[T]) Update(ctx context.Context, entity *T) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	// Validate input
 	if entity == nil {
 		return ErrNilPointer
@@ -1451,7 +1601,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 
 	val := reflect.ValueOf(entity).Elem()
 
-	for _, field := range m.modelInfo.Fields {
+	for _, field := range m.modelInfo.OrderedFields {
 		if field.IsPrimary {
 			continue
 		}
@@ -1469,7 +1619,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	cteArgs := m.buildWithClause(&sb)
 
 	sb.WriteString("UPDATE ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 
@@ -1498,7 +1648,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		var release func()
 		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
-			return WrapQueryError("PREPARE", query, values, err)
+			return WrapQueryError("PREPARE", query, allArgs, err)
 		}
 		defer release()
 
@@ -1508,7 +1658,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	}
 
 	if err != nil {
-		return WrapQueryError("UPDATE", query, values, err)
+		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
 	// Sync originals after successful update to mark entity as clean
@@ -1531,6 +1681,12 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 //	user.Email = "new@email.com"
 //	err := model.UpdateColumns(ctx, user, "name", "email")  // Only updates name and email
 func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...string) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	if entity == nil {
 		return ErrNilPointer
 	}
@@ -1596,7 +1752,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	cteArgs := m.buildWithClause(&sb)
 
 	sb.WriteString("UPDATE ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 
@@ -1618,7 +1774,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		var release func()
 		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
-			return WrapQueryError("PREPARE", query, values, err)
+			return WrapQueryError("PREPARE", query, allArgs, err)
 		}
 		defer release()
 
@@ -1628,7 +1784,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	}
 
 	if err != nil {
-		return WrapQueryError("UPDATE", query, values, err)
+		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
 	// Sync originals after successful update
@@ -1673,6 +1829,12 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 // the same positions as Update — including when the entity is clean and no
 // SQL is issued. Audit-logging hooks therefore see every Save() call.
 func (m *Model[T]) Save(ctx context.Context, entity *T) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	if entity == nil {
 		return ErrNilPointer
 	}
@@ -1781,7 +1943,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	var sb strings.Builder
 	cteArgs := m.buildWithClause(&sb)
 	sb.WriteString("UPDATE ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 	sb.WriteString(" WHERE ")
@@ -1806,7 +1968,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		var release func()
 		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
-			return WrapQueryError("PREPARE", query, values, err)
+			return WrapQueryError("PREPARE", query, allArgs, err)
 		}
 		defer release()
 		result, err = stmt.ExecContext(ctx, allArgs...)
@@ -1815,14 +1977,14 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	}
 
 	if err != nil {
-		return WrapQueryError("UPDATE", query, values, err)
+		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
 	affected, raErr := result.RowsAffected()
 	if raErr != nil {
 		// Driver could not report the row count; we cannot safely tell success
 		// from a version conflict, so refuse to mutate the in-memory baseline.
-		return WrapQueryError("UPDATE", query, values, raErr)
+		return WrapQueryError("UPDATE", query, allArgs, raErr)
 	}
 	if affected == 0 {
 		if hasVersion {
@@ -1830,7 +1992,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 			// callers can pick merge-vs-abort instead of retrying forever.
 			exists, existErr := m.rowExists(ctx, pkVal)
 			if existErr != nil {
-				return WrapQueryError("UPDATE", query, values, existErr)
+				return WrapQueryError("UPDATE", query, allArgs, existErr)
 			}
 			if !exists {
 				return ErrRecordNotFound
@@ -1861,7 +2023,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 // the model's table. Used by Save to distinguish ErrRecordNotFound from
 // ErrOptimisticLock when an optimistic-lock UPDATE matches zero rows.
 func (m *Model[T]) rowExists(ctx context.Context, pkVal any) (bool, error) {
-	q := "SELECT 1 FROM " + m.modelInfo.TableName + " WHERE " + m.modelInfo.PrimaryKey + " = ? LIMIT 1"
+	q := "SELECT 1 FROM " + m.TableName() + " WHERE " + m.modelInfo.PrimaryKey + " = ? LIMIT 1"
 	row := m.queryerForWrite().QueryRowContext(ctx, rebind(q), pkVal)
 	var one int
 	switch err := row.Scan(&one); err {
@@ -1946,7 +2108,7 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 	cteArgs := m.buildWithClause(&sb)
 
 	sb.WriteString("DELETE FROM ")
-	sb.WriteString(m.modelInfo.TableName)
+	sb.WriteString(m.TableName())
 	m.buildWhereClause(&sb)
 
 	query := sb.String()
@@ -1959,7 +2121,7 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 		var release func()
 		stmt, release, err = m.prepareStmtForWrite(ctx, rebind(query))
 		if err != nil {
-			return WrapQueryError("PREPARE", query, m.args, err)
+			return WrapQueryError("PREPARE", query, args, err)
 		}
 		defer release()
 
@@ -1969,7 +2131,7 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 	}
 
 	if err != nil {
-		return WrapQueryError("DELETE", query, m.args, err)
+		return WrapQueryError("DELETE", query, args, err)
 	}
 
 	// AfterDelete Hook (prefers AfterDeleteTx when implemented).
@@ -1983,7 +2145,9 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 // Exec executes the query (Raw or Builder) and returns the result.
 func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 	if m.rawQuery != "" {
-		return m.queryerForWrite().ExecContext(ctx, m.rawQuery, m.rawArgs...)
+		// Rebind like every other execution path, so a raw query written with ?
+		// placeholders works on PostgreSQL here as it does through Get/Print.
+		return m.queryerForWrite().ExecContext(ctx, rebind(m.rawQuery), m.rawArgs...)
 	}
 	// For builder, we assume Delete or Update was called which executes immediately.
 	// But if user wants to build a custom query?
@@ -2108,6 +2272,12 @@ func (m *Model[T]) CreateManyNewPK(ctx context.Context, entities []*T) error {
 }
 
 func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan bool) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	if len(entities) == 0 {
 		return nil
 	}
@@ -2120,47 +2290,18 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 		}
 	}
 
+	// A batch that mixes set and unset auto primary keys cannot share one
+	// column list: including the PK column makes the zero-PK rows insert a
+	// literal 0 instead of being auto-assigned. Split it and give each half the
+	// column list it needs.
+	if !skipPKScan {
+		if autoPK, explicitPK, mixed := m.partitionByAutoPK(entities); mixed {
+			return m.createManyGroups(ctx, autoPK, explicitPK)
+		}
+	}
+
 	// 2. Build Query
-	numFields := len(m.modelInfo.Fields)
-	columns := make([]string, 0, numFields)
-
-	// We need to identify which columns to insert.
-	// We skip the auto-increment PK only when NO entity in the batch has it set.
-	// Checking only entities[0] would silently produce wrong results when later
-	// entities have a non-zero PK (or vice versa).
-
-	// Find the auto PK field (if any) to decide whether to include it.
-	var autoPKField *FieldInfo
-	for _, field := range m.modelInfo.Fields {
-		if field.IsPrimary && field.IsAuto {
-			autoPKField = field
-			break
-		}
-	}
-
-	// Include the auto PK column only if at least one entity has it set.
-	// In skipPKScan mode (CreateManyNewPK), trust the caller and never include.
-	includeAutoPK := false
-	if autoPKField != nil && !skipPKScan {
-		for _, entity := range entities {
-			val := reflect.ValueOf(entity).Elem()
-			if !val.FieldByIndex(autoPKField.Index).IsZero() {
-				includeAutoPK = true
-				break
-			}
-		}
-	}
-
-	// Prepare columns list and field metadata for arg extraction.
-	fieldsToInsert := make([]*FieldInfo, 0, numFields)
-
-	for _, field := range m.modelInfo.Fields {
-		if field.IsPrimary && field.IsAuto && !includeAutoPK {
-			continue
-		}
-		columns = append(columns, field.Column)
-		fieldsToInsert = append(fieldsToInsert, field)
-	}
+	columns, fieldsToInsert := m.insertColumns(entities, skipPKScan)
 
 	// Determine chunk size based on Postgres limit of 65535 parameters.
 	numColumns := len(columns)
@@ -2183,10 +2324,7 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 	tx := m.tx
 	var committed bool
 	if tx == nil {
-		db := m.db
-		if db == nil {
-			db = GetGlobalDB()
-		}
+		db := m.writeDB()
 		if db == nil {
 			return ErrNilDatabase
 		}
@@ -2224,6 +2362,129 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 	}
 
 	return nil
+}
+
+// partitionByAutoPK splits a batch by whether each entity has its
+// auto-increment primary key set. mixed reports whether both groups are
+// non-empty, which is the case no single column list can serve.
+//
+// Entity order is preserved within each group, and the auto-assigned group is
+// returned first so it is inserted before the explicit ids.
+func (m *Model[T]) partitionByAutoPK(entities []*T) (autoPK, explicitPK []*T, mixed bool) {
+	var autoPKField *FieldInfo
+	for _, field := range m.modelInfo.OrderedFields {
+		if field.IsPrimary && field.IsAuto {
+			autoPKField = field
+			break
+		}
+	}
+	if autoPKField == nil {
+		return entities, nil, false
+	}
+
+	for _, entity := range entities {
+		if entity == nil {
+			autoPK = append(autoPK, entity)
+			continue
+		}
+		val := reflect.ValueOf(entity).Elem()
+		if val.FieldByIndex(autoPKField.Index).IsZero() {
+			autoPK = append(autoPK, entity)
+		} else {
+			explicitPK = append(explicitPK, entity)
+		}
+	}
+
+	return autoPK, explicitPK, len(autoPK) > 0 && len(explicitPK) > 0
+}
+
+// createManyGroups inserts each group with its own column list, in one
+// transaction so a split batch stays all-or-nothing like an unsplit one.
+func (m *Model[T]) createManyGroups(ctx context.Context, groups ...[]*T) (err error) {
+	if m.tx != nil {
+		for _, group := range groups {
+			if err := m.createManyImpl(ctx, group, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	db := m.writeDB()
+	if db == nil {
+		return ErrNilDatabase
+	}
+	sqlTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	txModel := m.WithTx(&Tx{Tx: sqlTx, ctx: ctx})
+	defer func() {
+		if p := recover(); p != nil {
+			_ = sqlTx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			if rbErr := sqlTx.Rollback(); rbErr != nil {
+				err = fmt.Errorf("%w (%w: %v)", err, ErrRollbackFailed, rbErr)
+			}
+			return
+		}
+		err = sqlTx.Commit()
+	}()
+
+	for _, group := range groups {
+		if err = txModel.createManyImpl(ctx, group, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertColumns determines the columns of a batch INSERT and the field metadata
+// used to extract each row's arguments.
+//
+// The auto-increment primary key is skipped only when NO entity in the batch has
+// it set: deciding from entities[0] alone silently drops the column for a batch
+// that mixes zero and non-zero primary keys. skipPKScan trusts the caller that
+// no entity has it set (CreateManyNewPK) and never includes it.
+func (m *Model[T]) insertColumns(entities []*T, skipPKScan bool) ([]string, []*FieldInfo) {
+	// Find the auto PK field (if any) to decide whether to include it.
+	var autoPKField *FieldInfo
+	for _, field := range m.modelInfo.OrderedFields {
+		if field.IsPrimary && field.IsAuto {
+			autoPKField = field
+			break
+		}
+	}
+
+	includeAutoPK := false
+	if autoPKField != nil && !skipPKScan {
+		for _, entity := range entities {
+			if entity == nil {
+				continue
+			}
+			val := reflect.ValueOf(entity).Elem()
+			if !val.FieldByIndex(autoPKField.Index).IsZero() {
+				includeAutoPK = true
+				break
+			}
+		}
+	}
+
+	numFields := len(m.modelInfo.Fields)
+	columns := make([]string, 0, numFields)
+	fieldsToInsert := make([]*FieldInfo, 0, numFields)
+
+	for _, field := range m.modelInfo.OrderedFields {
+		if field.IsPrimary && field.IsAuto && !includeAutoPK {
+			continue
+		}
+		columns = append(columns, field.Column)
+		fieldsToInsert = append(fieldsToInsert, field)
+	}
+
+	return columns, fieldsToInsert
 }
 
 // createBatch performs a single batch insert query. tx, when non-nil, is the
@@ -2309,6 +2570,12 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 
 // UpdateMany updates records matching the query with values.
 func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	if len(values) == 0 {
 		return nil
 	}
@@ -2328,7 +2595,8 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	var sets []string
 	var setArgs []any
 
-	for k, v := range values {
+	// Sorted so the same call always emits the same SET list.
+	for _, k := range sortedKeys(values) {
 		if err := ValidateColumnName(k); err != nil {
 			return err
 		}
@@ -2338,7 +2606,7 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 		setSb.WriteString(" = ?")
 		sets = append(sets, setSb.String())
 		PutStringBuilder(setSb)
-		setArgs = append(setArgs, v)
+		setArgs = append(setArgs, values[k])
 	}
 
 	var sb strings.Builder
@@ -2382,6 +2650,12 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 //	END, updated_at = $5
 //	WHERE reference_number IN ($6, $7)
 func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColumn string, updates any) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	// Validate column names
 	if err := ValidateColumnName(lookupColumn); err != nil {
 		return err
@@ -2491,10 +2765,7 @@ func (m *Model[T]) updateManyByKeyChunked(ctx context.Context, lookupColumn, tar
 
 	// Start transaction if not already in one
 	if m.tx == nil {
-		db := m.db
-		if db == nil {
-			db = GetGlobalDB()
-		}
+		db := m.writeDB()
 		if db == nil {
 			return ErrNilDatabase
 		}
@@ -2542,11 +2813,22 @@ func (m *Model[T]) updateManyByKeyChunked(ctx context.Context, lookupColumn, tar
 // fine-grained control or want to handle errors per-entity.
 // The prepared statement is reused for each entity, reducing preparation overhead.
 //
+// Unlike CreateMany, BulkInsert runs the create hooks: created_at is auto-set
+// (zero-only) and BeforeCreate/BeforeCreateTx runs for every entity before the
+// first row is inserted, so a hook can still change the values that get written.
+// AfterCreate/AfterCreateTx runs per row as it is inserted.
+//
 // Example:
 //
 //	users := []*User{{Name: "Alice"}, {Name: "Bob"}, {Name: "Charlie"}}
 //	err := model.BulkInsert(ctx, users)
 func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
+	// A rejected builder input must not reach the database: the offending
+	// clause is dropped from the statement, so an unguarded write runs against
+	// a wider set of rows than the caller asked for.
+	if m.buildErr != nil {
+		return m.buildErr
+	}
 	if len(entities) == 0 {
 		return nil
 	}
@@ -2560,21 +2842,41 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 		})
 	}
 
-	// Determine columns from first entity
-	var columns []string
-	var fieldsToInsert []*FieldInfo
-
-	val0 := reflect.ValueOf(entities[0]).Elem()
-	for _, field := range m.modelInfo.Fields {
-		fVal := val0.FieldByIndex(field.Index)
-		if field.IsPrimary && field.IsAuto {
-			if fVal.IsZero() {
-				continue
-			}
+	// Auto-set created_at and run BeforeCreate for the whole batch before the
+	// columns are decided: a hook may set the primary key or any other field,
+	// and those values have to reach the INSERT.
+	for _, entity := range entities {
+		if entity == nil {
+			return ErrNilPointer
 		}
-		columns = append(columns, field.Column)
-		fieldsToInsert = append(fieldsToInsert, field)
+		m.autoSetCreatedAt(entity)
+		if err := m.callBeforeCreate(ctx, entity); err != nil {
+			return err
+		}
 	}
+
+	// A batch mixing set and unset auto primary keys needs two column lists —
+	// see partitionByAutoPK. The hooks above already ran for every entity, so
+	// each group goes straight to the insert.
+	if autoPK, explicitPK, mixed := m.partitionByAutoPK(entities); mixed {
+		if err := m.bulkInsertGroup(ctx, autoPK); err != nil {
+			return err
+		}
+		return m.bulkInsertGroup(ctx, explicitPK)
+	}
+
+	return m.bulkInsertGroup(ctx, entities)
+}
+
+// bulkInsertGroup performs the prepared-statement insert loop for a batch whose
+// entities agree on whether the auto primary key is set. Create hooks other
+// than AfterCreate have already run for these entities.
+func (m *Model[T]) bulkInsertGroup(ctx context.Context, entities []*T) error {
+	if len(entities) == 0 {
+		return nil
+	}
+
+	columns, fieldsToInsert := m.insertColumns(entities, false)
 
 	// Build INSERT query once
 	sb := GetStringBuilder()
@@ -2595,10 +2897,7 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 	PutStringBuilder(sb)
 
 	// Get database connection for preparing
-	db := m.db
-	if db == nil {
-		db = GetGlobalDB()
-	}
+	db := m.writeDB()
 	if db == nil {
 		return ErrNilDatabase
 	}

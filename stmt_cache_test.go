@@ -242,3 +242,45 @@ func TestStmtCache_ClearWithHeldReferences(t *testing.T) {
 	release1()
 	release2()
 }
+
+// TestStmtCache_ShardCapacitySumsToCapacity verifies that the shard capacities
+// add up to exactly the requested capacity. Previously the cache always used 64
+// shards and floored the per-shard capacity at 1, so NewStmtCache(100) could
+// only ever hold 64 statements and any two queries hashing to the same shard
+// evicted each other.
+func TestStmtCache_ShardCapacitySumsToCapacity(t *testing.T) {
+	for _, capacity := range []int{1, 5, 64, 100, 256, 1000} {
+		cache := NewStmtCache(capacity)
+
+		total := 0
+		for _, shard := range cache.shards {
+			if shard.capacity < 1 {
+				t.Fatalf("capacity %d: shard capacity %d < 1", capacity, shard.capacity)
+			}
+			total += shard.capacity
+		}
+		if total != capacity {
+			t.Errorf("capacity %d: shard capacities sum to %d", capacity, total)
+		}
+		if len(cache.shards) > capacity {
+			t.Errorf("capacity %d: %d shards exceeds capacity", capacity, len(cache.shards))
+		}
+	}
+}
+
+// TestStmtCache_HoldsDistinctQueriesUpToCapacity verifies that filling a cache
+// with exactly `capacity` distinct queries does not evict most of them.
+// Perfect retention is not guaranteed under sharding, but losing a third of the
+// cache (which the old capacity/64 split did) defeats the point of the cache.
+func TestStmtCache_HoldsDistinctQueriesUpToCapacity(t *testing.T) {
+	const capacity = 100
+	cache := NewStmtCache(capacity)
+
+	for i := 0; i < capacity; i++ {
+		cache.Put(fmt.Sprintf("SELECT * FROM t WHERE c%d = ?", i), nil)
+	}
+
+	if got := cache.Len(); got < capacity*9/10 {
+		t.Errorf("expected to retain at least %d of %d statements, got %d", capacity*9/10, capacity, got)
+	}
+}

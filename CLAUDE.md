@@ -84,6 +84,9 @@ make clean-test-cache
 
 # Tidy go modules
 make tidy
+
+# Run cross-ORM benchmark suite (zorm vs gorm vs sqlx; ent requires `go generate ./entbench` + -tags=ent)
+make bench
 ```
 
 Direct `go test` is fine for targeted runs:
@@ -109,8 +112,9 @@ go test -v -run TestRelations ./...
 - **errors.go** — Sentinel errors and `IsNotFound` / `IsDuplicateKey` / `IsConnectionError` / etc. helpers, plus `QueryError` with operation/table/constraint context.
 - **postgres.go** — `ConnectPostgres(dsn, *DBConfig)` helper (uses `pgx/v5/stdlib`).
 - **dirty.go** — Change tracking. `Print()` (defined in `query.go`, mirrored in `scalar.go` for `ScalarQuery`) returns SQL+args without executing for debugging.
-- **pkg.go** — `Dialect` enum (`DialectAuto` / `DialectPostgres` / `DialectSQLite`) plus `SetDialect()` / `GetDialect()` package-wide override, driver-name auto-detection via `detectDialect()`, and `buildInClause()` which emits `col = ANY($1)` with a typed-slice arg on Postgres (sidesteps the 65535 bind-param limit) or `col IN (?, ?, ...)` on SQLite. Mixed-type `[]any` slices fall back to the `IN` form; SQLite/fallback inputs larger than `maxInArgs` (65535) return an error instead of producing invalid SQL.
+- **pkg.go** — `Dialect` enum (`DialectAuto` / `DialectPostgres` / `DialectSQLite`) plus `SetDialect()` / `GetDialect()` package-wide override, driver-name auto-detection via `detectDialect()`, and `buildInClause()` which emits `col = ANY($1)` with a typed-slice arg on Postgres (sidesteps the 65535 bind-param limit) or `col IN (?, ?, ...)` on SQLite. Mixed-type `[]any` slices fall back to the `IN` form, as do unsigned values above `MaxInt64` (which have no int64 representation and would wrap); SQLite/fallback inputs larger than `maxInArgs` (65535) return an error instead of producing invalid SQL.
 - **examples/** — `stmt_cache_example.go` standalone usage demo.
+- **benchmarks/** — separate Go module (own `go.mod`); root `./...` commands do **not** cover it. Compares zorm vs gorm vs sqlx (and ent behind `-tags=ent` after `go generate ./entbench`) on identical SQLite workloads. Run via `make bench`.
 
 ### Key Patterns
 
@@ -119,6 +123,8 @@ go test -v -run TestRelations ./...
 **Query state is mutable**: Builder methods modify the receiver in place. `Model[T]` is **not safe for concurrent modification**. For concurrent use, build a base in one goroutine and `Clone()` it per goroutine (or create a fresh `New[T]()` per goroutine). See the doc comment on `Model[T]` in `model.go`.
 
 **Relation methods**: Define relations as methods returning `zorm.HasMany[T]`, `zorm.BelongsTo[T]`, etc. The schema parser accepts either bare name (`Posts`) or suffixed (`PostsRelation`).
+
+**Auto `created_at`**: `Create`/bulk create set a model's `created_at` column to `time.Now()` when the caller left it zero (`autoSetCreatedAt` in `executor.go`). Zero-only — explicit values are preserved.
 
 **Global DB**: Set `zorm.GlobalDB` (or call `zorm.SetGlobalDB(db)` for thread-safety) at startup. Per-query override via `SetDB(db)` or `WithTx(tx)`.
 

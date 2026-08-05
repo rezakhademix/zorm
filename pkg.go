@@ -3,6 +3,8 @@ package zorm
 import (
 	"database/sql"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -204,6 +206,10 @@ func toTypedArraySlice(args []any) (any, bool) {
 			if !ok {
 				return nil, false
 			}
+			// uint is 64 bits wide here: same overflow rule as uint64 below.
+			if uint64(n) > math.MaxInt64 {
+				return nil, false
+			}
 			out[i] = int64(n)
 		}
 		return out, true
@@ -224,8 +230,14 @@ func toTypedArraySlice(args []any) (any, bool) {
 			if !ok {
 				return nil, false
 			}
-			// Cast to int64; values above MaxInt64 are not representable as
-			// PostgreSQL BIGINT and would already be broken elsewhere.
+			// A value above MaxInt64 has no int64 representation: casting it
+			// wraps to a negative number and the query silently matches the
+			// wrong rows. Decline the array fast path so the caller falls back
+			// to placeholders carrying the untouched values, and let the driver
+			// decide whether the value is encodable at all.
+			if n > math.MaxInt64 {
+				return nil, false
+			}
 			out[i] = int64(n)
 		}
 		return out, true
@@ -271,4 +283,19 @@ func toTypedArraySlice(args []any) (any, bool) {
 		return out, true
 	}
 	return nil, false
+}
+
+// sortedKeys returns a map's keys in ascending order.
+//
+// Every place a map decides the ORDER of generated SQL has to go through this:
+// Go randomizes map iteration, so an unsorted walk emits a different statement
+// for the same builder chain on every call. That costs one prepared-statement
+// cache entry per ordering and makes Print() output unstable.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

@@ -239,14 +239,26 @@ func ValidateRawQuery(query string) error {
 
 // ModelInfo holds the reflection data for a model struct.
 type ModelInfo struct {
-	Type            reflect.Type
-	TableName       string
-	PrimaryKey      string
-	Fields          map[string]*FieldInfo // StructFieldName -> FieldInfo
-	Columns         map[string]*FieldInfo // DBColumnName -> FieldInfo
-	RelationFields  map[string][]int      // FieldName -> field index for FieldByIndex (relation fields)
-	Accessors       []int                 // Indices of methods starting with "Get"
-	RelationMethods map[string]int        // MethodName -> Index
+	Type       reflect.Type
+	TableName  string
+	PrimaryKey string
+	// MorphType is the value this model writes into a polymorphic relation's
+	// type column. It comes from a MorphType() string method when the model
+	// declares one, and defaults to the Go struct name. It is the single source
+	// of truth for every morph loader and for MorphTo's TypeMap keys.
+	MorphType string
+	Fields    map[string]*FieldInfo // StructFieldName -> FieldInfo
+	Columns   map[string]*FieldInfo // DBColumnName -> FieldInfo
+	// OrderedFields holds the same *FieldInfo values as Fields, in struct
+	// declaration order (embedded structs flattened in place). Anything that
+	// generates SQL must iterate this, never the maps: Go randomizes map
+	// iteration, so a map-driven column list emits a different statement on
+	// every call, which costs a prepared-statement cache entry per ordering
+	// and makes Print() unstable.
+	OrderedFields   []*FieldInfo
+	RelationFields  map[string][]int // FieldName -> field index for FieldByIndex (relation fields)
+	Accessors       []int            // Indices of methods starting with "Get"
+	RelationMethods map[string]int   // MethodName -> Index
 	// VersionField, when non-nil, points to a field flagged with the `version`
 	// tag modifier. Save() uses it for optimistic concurrency control:
 	// the UPDATE checks the current version in WHERE and increments it.
@@ -336,6 +348,14 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 		info.PrimaryKey = primaryKeyer.PrimaryKey()
 	} else {
 		info.PrimaryKey = "id" // Default
+	}
+
+	// 2b. Determine the polymorphic type value.
+	// Check if T implements MorphType() string
+	if morpher, ok := ptrVal.Interface().(interface{ MorphType() string }); ok {
+		info.MorphType = morpher.MorphType()
+	} else {
+		info.MorphType = typ.Name() // Default: the Go struct name
 	}
 
 	// 3. Parse Fields (including embedded)
@@ -488,6 +508,22 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 			FieldType: field.Type,
 			Index:     finalIndex,
 			Offset:    offset,
+		}
+
+		// An outer field may shadow an embedded one that maps to the same
+		// column. The maps collapse the pair naturally (last write wins); the
+		// ordered slice has to be told, or SQL generation names the column
+		// twice — invalid on PostgreSQL. Replace in place so the slice keeps
+		// both its single entry per column and a stable position.
+		if prev, shadowed := info.Columns[dbCol]; shadowed {
+			for i, f := range info.OrderedFields {
+				if f == prev {
+					info.OrderedFields[i] = fInfo
+					break
+				}
+			}
+		} else {
+			info.OrderedFields = append(info.OrderedFields, fInfo)
 		}
 
 		info.Fields[field.Name] = fInfo

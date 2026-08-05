@@ -2,6 +2,7 @@ package zorm
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 )
 
@@ -544,5 +545,114 @@ func TestSync_NoChanges(t *testing.T) {
 
 	if len(roleIDs) != 2 || roleIDs[0] != 1 || roleIDs[1] != 2 {
 		t.Errorf("expected roles [1, 2], got %v", roleIDs)
+	}
+}
+
+// ==================== Resolver routing for pivot writes ====================
+// Attach, Detach, and Sync are write operations (plus Sync's read of current
+// pivot state, which must be write-consistent). With a primary/replica
+// resolver configured they must route to the primary. The replica here is an
+// empty database: any statement routed to it fails with "no such table".
+
+func setupPivotResolverTest(t *testing.T) (primary *sql.DB, cleanup func()) {
+	t.Helper()
+	primary = setupRelDBExtended(t)
+
+	replica, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open replica database: %v", err)
+	}
+
+	oldDB := GlobalDB
+	GlobalDB = primary
+	ConfigureDBResolver(
+		WithPrimary(primary),
+		WithReplicas(replica),
+	)
+
+	return primary, func() {
+		ClearDBResolver()
+		GlobalDB = oldDB
+		replica.Close()
+		primary.Close()
+	}
+}
+
+func TestRelations_Attach_UsesPrimary(t *testing.T) {
+	primary, cleanup := setupPivotResolverTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := &RelUserExtended{ID: 1}
+
+	if _, err := primary.Exec("INSERT INTO rel_roles (id, name) VALUES (3, 'Viewer')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := New[RelUserExtended]().Attach(ctx, user, "Roles", []any{3}, nil); err != nil {
+		t.Fatalf("Attach with resolver configured failed (routed to replica?): %v", err)
+	}
+
+	var count int
+	if err := primary.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1 AND role_id = 3").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 association on primary, got %d", count)
+	}
+}
+
+func TestRelations_Detach_UsesPrimary(t *testing.T) {
+	primary, cleanup := setupPivotResolverTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := &RelUserExtended{ID: 1} // has roles 1 and 2
+
+	if err := New[RelUserExtended]().Detach(ctx, user, "Roles", []any{2}); err != nil {
+		t.Fatalf("Detach with resolver configured failed (routed to replica?): %v", err)
+	}
+
+	var count int
+	if err := primary.QueryRow("SELECT COUNT(*) FROM rel_role_user WHERE user_id = 1 AND role_id = 2").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("expected role 2 detached on primary, got %d rows", count)
+	}
+}
+
+func TestRelations_Sync_UsesPrimary(t *testing.T) {
+	primary, cleanup := setupPivotResolverTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	user := &RelUserExtended{ID: 1} // has roles 1 and 2
+
+	if _, err := primary.Exec("INSERT INTO rel_roles (id, name) VALUES (3, 'Viewer')"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync to [1, 3]: keeps 1, detaches 2, attaches 3.
+	if err := New[RelUserExtended]().Sync(ctx, user, "Roles", []any{1, 3}, nil); err != nil {
+		t.Fatalf("Sync with resolver configured failed (routed to replica?): %v", err)
+	}
+
+	rows, err := primary.Query("SELECT role_id FROM rel_role_user WHERE user_id = 1 ORDER BY role_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var got []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Errorf("expected roles [1 3] on primary after Sync, got %v", got)
 	}
 }

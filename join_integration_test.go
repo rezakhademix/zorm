@@ -405,3 +405,161 @@ func TestJoin_Print_MultipleJoins(t *testing.T) {
 		t.Errorf("JOIN clauses are out of order in Print() output: %s", query)
 	}
 }
+
+// ==================== Aggregates with JOIN ====================
+// Count, Exists, Sum, and Avg must emit the accumulated JOIN clauses;
+// otherwise WHERE conditions referencing joined tables fail.
+
+func TestJoin_Count(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	count, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		Count(ctx)
+
+	if err != nil {
+		t.Fatalf("Count with JOIN failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected count 2 for Alice's orders, got %d", count)
+	}
+}
+
+func TestJoin_Exists(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	exists, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		Exists(ctx)
+
+	if err != nil {
+		t.Fatalf("Exists with JOIN failed: %v", err)
+	}
+	if !exists {
+		t.Error("expected Exists to return true for Alice's orders")
+	}
+}
+
+func TestJoin_Sum(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	sum, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		Sum(ctx, "join_orders.amount")
+
+	if err != nil {
+		t.Fatalf("Sum with JOIN failed: %v", err)
+	}
+	if sum != 300.0 {
+		t.Errorf("expected sum 300.0 for Alice's orders, got %v", sum)
+	}
+}
+
+func TestJoin_Avg(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	avg, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		Avg(ctx, "join_orders.amount")
+
+	if err != nil {
+		t.Fatalf("Avg with JOIN failed: %v", err)
+	}
+	if avg != 150.0 {
+		t.Errorf("expected avg 150.0 for Alice's orders, got %v", avg)
+	}
+}
+
+func TestJoin_CountWithGroupBy(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// GROUP BY path wraps the count in a subquery; the subquery must also
+	// carry the JOIN clauses.
+	count, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		GroupBy("join_orders.user_id").
+		Count(ctx)
+
+	if err != nil {
+		t.Fatalf("Count with JOIN and GROUP BY failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 group (Alice), got %d", count)
+	}
+}
+
+func TestJoin_Paginate(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	result, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		Select("join_orders.id", "join_orders.user_id", "join_orders.amount").
+		Paginate(ctx, 1, 10)
+
+	if err != nil {
+		t.Fatalf("Paginate with JOIN failed: %v", err)
+	}
+	if result.Total != 2 {
+		t.Errorf("expected total 2, got %d", result.Total)
+	}
+	if len(result.Data) != 2 {
+		t.Errorf("expected 2 rows, got %d", len(result.Data))
+	}
+}
+
+// CountOver builds its own SELECT rather than going through buildSelectQuery,
+// so it needs the JOIN clauses emitted explicitly like the other aggregates.
+func TestJoin_CountOver(t *testing.T) {
+	db := setupJoinDB(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	counts, err := New[JoinOrder]().
+		SetDB(db).
+		Join("join_users", "join_orders.user_id", "=", "join_users.id").
+		Where("join_users.name", "Alice").
+		CountOver(ctx, "join_orders.user_id")
+
+	if err != nil {
+		t.Fatalf("CountOver with JOIN failed: %v", err)
+	}
+	if len(counts) != 1 {
+		t.Fatalf("expected 1 partition for Alice, got %d (%v)", len(counts), counts)
+	}
+	for _, n := range counts {
+		if n != 2 {
+			t.Errorf("expected Alice's 2 orders in the partition, got %d", n)
+		}
+	}
+}

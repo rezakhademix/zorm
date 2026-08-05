@@ -8,9 +8,15 @@ import (
 	"sync/atomic"
 )
 
-// stmtShardCount is the number of shards for the statement cache.
-// Using 64 shards provides good distribution while keeping memory overhead low.
-const stmtShardCount = 64
+// maxStmtShardCount is the upper bound on the number of shards for the
+// statement cache. Up to 64 shards provides good distribution while keeping
+// memory overhead low.
+const maxStmtShardCount = 64
+
+// minStmtShardCapacity is the smallest LRU size a shard may have. Shards are
+// sized from the requested capacity, so a small cache gets fewer shards rather
+// than many one-entry shards that evict each other on every hash collision.
+const minStmtShardCapacity = 8
 
 // StmtCache provides a thread-safe LRU cache for prepared statements.
 // It stores prepared SQL statements and automatically evicts the least
@@ -20,8 +26,16 @@ const stmtShardCount = 64
 // It is safe for concurrent use by multiple goroutines and helps
 // improve performance by reusing prepared statements instead of re-preparing
 // them on every execution.
+//
+// Keys are opaque: the cache never interprets the string it is given. A
+// *sql.Stmt is bound to the *sql.DB it was prepared on, so a key must identify
+// the connection as well as the SQL, or a statement can be handed back to a
+// caller on a different database. When used through WithStmtCache, ZORM does
+// this for you (see stmtCacheKey in executor.go) and never caches statements
+// prepared on a transaction, since those die with it. Callers using Get/Put
+// directly are responsible for both rules.
 type StmtCache struct {
-	shards   [stmtShardCount]*stmtCacheShard
+	shards   []*stmtCacheShard
 	capacity int
 	closed   atomic.Bool // Set to true after Close/Clear to signal release() to close stmts directly
 }
@@ -48,22 +62,30 @@ type cacheEntry struct {
 // be evicted to make room for new entries.
 //
 // A capacity of 0 or negative value will default to 100.
+//
+// The shard count is derived from the capacity so that every shard holds at
+// least minStmtShardCapacity entries, and the shard capacities always sum to
+// exactly the requested capacity.
 func NewStmtCache(capacity int) *StmtCache {
 	if capacity <= 0 {
 		capacity = 100
 	}
 
-	// Distribute capacity across shards
-	shardCapacity := capacity / stmtShardCount
-	if shardCapacity < 1 {
-		shardCapacity = 1
-	}
+	shardCount := min(max(capacity/minStmtShardCapacity, 1), maxStmtShardCount)
 
 	c := &StmtCache{
+		shards:   make([]*stmtCacheShard, shardCount),
 		capacity: capacity,
 	}
 
-	for i := 0; i < stmtShardCount; i++ {
+	// Distribute capacity across shards, handing the remainder to the first
+	// shards so the total matches the requested capacity exactly.
+	base, remainder := capacity/shardCount, capacity%shardCount
+	for i := range c.shards {
+		shardCapacity := base
+		if i < remainder {
+			shardCapacity++
+		}
 		c.shards[i] = &stmtCacheShard{
 			capacity: shardCapacity,
 			items:    make(map[string]*cacheEntry),
@@ -78,7 +100,7 @@ func NewStmtCache(capacity int) *StmtCache {
 func (c *StmtCache) getShard(query string) *stmtCacheShard {
 	h := fnv.New32a()
 	h.Write([]byte(query))
-	return c.shards[h.Sum32()%stmtShardCount]
+	return c.shards[h.Sum32()%uint32(len(c.shards))]
 }
 
 // Get retrieves a cached prepared statement for the given SQL query.
@@ -196,8 +218,7 @@ func (c *StmtCache) release(shard *stmtCacheShard, entry *cacheEntry) {
 
 // Clear closes all cached statements and clears the cache.
 func (c *StmtCache) Clear() {
-	for i := 0; i < stmtShardCount; i++ {
-		shard := c.shards[i]
+	for _, shard := range c.shards {
 		shard.mu.Lock()
 
 		for _, entry := range shard.items {
@@ -225,8 +246,7 @@ func (c *StmtCache) Close() error {
 // Len returns the current number of cached statements.
 func (c *StmtCache) Len() int {
 	total := 0
-	for i := 0; i < stmtShardCount; i++ {
-		shard := c.shards[i]
+	for _, shard := range c.shards {
 		shard.mu.Lock()
 		total += len(shard.items)
 		shard.mu.Unlock()

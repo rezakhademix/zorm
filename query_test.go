@@ -155,6 +155,57 @@ func TestOrWhere(t *testing.T) {
 	}
 }
 
+// TestOrWhereWithOperator tests the 3-arg OrWhere("col", op, value) form.
+// It must produce "OR col op ?" with exactly one bind arg, mirroring Where.
+func TestOrWhereWithOperator(t *testing.T) {
+	m := New[TestModel]().Where("name", "John").OrWhere("age", ">", 18)
+	query, args := m.Print()
+
+	if !strings.Contains(query, "OR age > $2") {
+		t.Errorf("expected query to contain %q, got %q", "OR age > $2", query)
+	}
+	if len(args) != 2 {
+		t.Fatalf("expected 2 args, got %d: %v", len(args), args)
+	}
+	if args[0] != "John" || args[1] != 18 {
+		t.Errorf("expected args [John 18], got %v", args)
+	}
+}
+
+// TestOrWhereInvalidOperator ensures a bogus operator sets buildErr instead
+// of being bound as a value.
+func TestOrWhereInvalidOperator(t *testing.T) {
+	m := New[TestModel]().OrWhere("age", "; DROP TABLE users", 18)
+	if m.buildErr == nil {
+		t.Fatal("expected buildErr for invalid operator, got nil")
+	}
+}
+
+// TestNestedWhereGroupPreservesConnectors ensures a Where(func) group with
+// multiple predicates keeps the AND/OR connectors between them.
+func TestNestedWhereGroupPreservesConnectors(t *testing.T) {
+	m := New[TestModel]().Where(func(q *Model[TestModel]) {
+		q.Where("age", ">", 18).OrWhere("status", "verified")
+	}).Where("active", true)
+	query, args := m.Print()
+
+	if !strings.Contains(query, "(age > $1 OR status = $2)") {
+		t.Errorf("expected query to contain %q, got %q", "(age > $1 OR status = $2)", query)
+	}
+	if len(args) != 3 {
+		t.Fatalf("expected 3 args, got %d: %v", len(args), args)
+	}
+
+	// Multiple AND predicates inside a group.
+	m2 := New[TestModel]().Where(func(q *Model[TestModel]) {
+		q.Where("age", ">", 18).Where("age", "<", 65)
+	})
+	query2, _ := m2.Print()
+	if !strings.Contains(query2, "(age > $1 AND age < $2)") {
+		t.Errorf("expected query to contain %q, got %q", "(age > $1 AND age < $2)", query2)
+	}
+}
+
 // TestWhereIn tests the WhereIn method under the SQLite dialect, which
 // produces the classic spread-placeholder form. The PostgreSQL dialect emits
 // `= ANY($1)` instead and is covered by TestWhereIn_LargeListUsesANYOnPostgres.
@@ -746,25 +797,43 @@ func TestSelect_ValidatesColumns(t *testing.T) {
 	}
 }
 
-// TestOrderBy_ValidatesDirection verifies OrderBy validates direction
+// TestOrderBy_ValidatesDirection verifies OrderBy validates direction.
+// An unrecognized direction used to be silently coerced to DESC, which ordered
+// the result set the opposite way from what the caller asked for; it now sets
+// buildErr like every other rejected builder input.
 func TestOrderBy_ValidatesDirection(t *testing.T) {
 	tests := []struct {
 		direction string
 		expected  string
+		valid     bool
 	}{
-		{"ASC", "ASC"},
-		{"DESC", "DESC"},
-		{"asc", "ASC"},
-		{"desc", "DESC"},
-		{"invalid", "DESC"}, // Should default to DESC
-		{"DROP", "DESC"},    // Injection attempt - should default to DESC
+		{"ASC", "ASC", true},
+		{"DESC", "DESC", true},
+		{"asc", "ASC", true},
+		{"desc", "DESC", true},
+		{"invalid", "", false},
+		{"DROP", "", false}, // Injection attempt
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.direction, func(t *testing.T) {
 			m := New[TestModel]().OrderBy("name", tt.direction)
-			query, _ := m.Print()
 
+			if !tt.valid {
+				if m.buildErr == nil {
+					t.Fatalf("expected buildErr for direction %q", tt.direction)
+				}
+				query, _ := m.Print()
+				if strings.Contains(query, "ORDER BY") {
+					t.Errorf("rejected direction still produced an ORDER BY: %q", query)
+				}
+				return
+			}
+
+			if m.buildErr != nil {
+				t.Fatalf("unexpected buildErr for direction %q: %v", tt.direction, m.buildErr)
+			}
+			query, _ := m.Print()
 			if !strings.Contains(query, "ORDER BY name "+tt.expected) {
 				t.Errorf("expected direction %q, got query %q", tt.expected, query)
 			}
@@ -909,13 +978,18 @@ func TestWhereNotIn_ValidatesColumn(t *testing.T) {
 	}
 }
 
-// TestGroupBy_ValidatesColumns verifies GroupBy validates column names
+// TestGroupBy_ValidatesColumns verifies GroupBy rejects invalid column names
+// by setting buildErr rather than silently grouping by a subset of what the
+// caller asked for.
 func TestGroupBy_ValidatesColumns(t *testing.T) {
 	m := New[TestModel]().GroupBy("status", "role; DROP TABLE users--")
 
-	// Only valid column should be added
-	if len(m.groupBys) != 1 {
-		t.Errorf("expected 1 valid group by column, got %d", len(m.groupBys))
+	if m.buildErr == nil {
+		t.Fatal("expected buildErr for an invalid GROUP BY column")
+	}
+	query, _ := m.Print()
+	if strings.Contains(query, "DROP") {
+		t.Errorf("invalid column leaked into SQL: %q", query)
 	}
 }
 
@@ -1397,5 +1471,156 @@ func TestOrWhereNotIn_ValidatesColumn(t *testing.T) {
 	query2, _ := m2.Print()
 	if strings.Contains(query2, "DROP") {
 		t.Error("Injection attempt should be blocked")
+	}
+}
+
+// TestWhere_NonStringQueryWithArgsDoesNotPanic ensures the operator forms of
+// Where/OrWhere reject a non-string column expression via buildErr instead of
+// panicking on a type assertion. ScalarQuery.Where applies the same rule.
+func TestWhere_NonStringQueryWithArgsDoesNotPanic(t *testing.T) {
+	cases := []struct {
+		name string
+		call func() *Model[TestModel]
+	}{
+		{"Where two args", func() *Model[TestModel] { return New[TestModel]().Where(42, "value") }},
+		{"Where three args", func() *Model[TestModel] { return New[TestModel]().Where(42, ">", 1) }},
+		{"OrWhere two args", func() *Model[TestModel] { return New[TestModel]().OrWhere(42, "value") }},
+		{"OrWhere three args", func() *Model[TestModel] { return New[TestModel]().OrWhere(42, ">", 1) }},
+		{"Where map with args", func() *Model[TestModel] {
+			return New[TestModel]().Where(map[string]any{"name": "x"}, "stray")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked instead of reporting an error: %v", r)
+				}
+			}()
+
+			m := tc.call()
+			if m.buildErr == nil {
+				t.Error("expected buildErr for a non-string query expression, got nil")
+			}
+		})
+	}
+}
+
+// TestNestedWhereGroup_PropagatesInnerBuildErr ensures a validation failure
+// inside a Where(func) group is reported rather than silently dropping the whole
+// group — which would emit a query missing its filter and return extra rows.
+func TestNestedWhereGroup_PropagatesInnerBuildErr(t *testing.T) {
+	m := New[TestModel]().Where(func(q *Model[TestModel]) {
+		q.Where("name; DROP TABLE x", 1)
+	}).Where("active", true)
+
+	if m.buildErr == nil {
+		t.Fatal("expected the inner buildErr to propagate, got nil")
+	}
+
+	if _, err := m.Get(context.Background()); err == nil {
+		t.Error("expected Get to surface the propagated buildErr")
+	}
+}
+
+// TestNestedWhereGroup_PropagatesInnerWhereInErr covers the same hole reached
+// through WhereIn, where losing the group silently widens the result set.
+func TestNestedWhereGroup_PropagatesInnerWhereInErr(t *testing.T) {
+	SetDialect(DialectSQLite)
+	t.Cleanup(func() { SetDialect(DialectAuto) })
+
+	tooMany := make([]any, maxInArgs+1)
+	for i := range tooMany {
+		tooMany[i] = i
+	}
+
+	m := New[TestModel]().Where(func(q *Model[TestModel]) {
+		q.WhereIn("id", tooMany)
+	})
+
+	if m.buildErr == nil {
+		t.Fatal("expected the inner WhereIn error to propagate, got nil")
+	}
+}
+
+// TestNestedWhereGroup_ValidGroupUnaffected guards against overcorrecting.
+func TestNestedWhereGroup_ValidGroupUnaffected(t *testing.T) {
+	m := New[TestModel]().Where(func(q *Model[TestModel]) {
+		q.Where("age", ">", 18).OrWhere("status", "verified")
+	}).Where("active", true)
+
+	if m.buildErr != nil {
+		t.Fatalf("unexpected buildErr on a valid group: %v", m.buildErr)
+	}
+	query, _ := m.Print()
+	if !strings.Contains(query, "(age > $1 OR status = $2)") {
+		t.Errorf("expected the group intact, got %q", query)
+	}
+}
+
+// The operator whitelist and the renderer must agree: every operator accepted
+// by Where must produce valid `column OP ?` SQL, and operators that cannot be
+// rendered that way must be rejected with guidance instead of emitting garbage.
+func TestWhereOperator_WhitelistMatchesRenderer(t *testing.T) {
+	renderable := []struct {
+		op   string
+		want string
+	}{
+		{"=", "age = $1"},
+		{">", "age > $1"},
+		{"<", "age < $1"},
+		{">=", "age >= $1"},
+		{"<=", "age <= $1"},
+		{"<>", "age <> $1"},
+		{"!=", "age != $1"},
+		{"LIKE", "age LIKE $1"},
+		{"ILIKE", "age ILIKE $1"},
+		{"IS NOT", "age IS NOT $1"},
+		{"@>", "age @> $1"},
+		{"<@", "age <@ $1"},
+		{"&&", "age && $1"},
+		{"@@", "age @@ $1"},
+	}
+
+	for _, tc := range renderable {
+		t.Run("renders "+tc.op, func(t *testing.T) {
+			m := New[TestModel]().Where("age", tc.op, 1)
+			if m.buildErr != nil {
+				t.Fatalf("operator %q rejected: %v", tc.op, m.buildErr)
+			}
+			query, args := m.Print()
+			if !strings.Contains(query, tc.want) {
+				t.Errorf("expected %q in SQL, got %q", tc.want, query)
+			}
+			if len(args) != 1 {
+				t.Errorf("expected 1 bind arg, got %d (%v)", len(args), args)
+			}
+		})
+	}
+}
+
+func TestWhereOperator_RejectsNonBinaryOperators(t *testing.T) {
+	// These are real SQL operators but cannot render as `column OP ?` with a
+	// single bind value; they have dedicated builder methods.
+	for _, op := range []string{"IN", "NOT IN", "BETWEEN", "NOT"} {
+		t.Run(op, func(t *testing.T) {
+			m := New[TestModel]().Where("id", op, []any{1, 2})
+			if m.buildErr == nil {
+				query, _ := m.Print()
+				t.Fatalf("operator %q accepted, produced %q", op, query)
+			}
+		})
+	}
+}
+
+func TestWhereOperator_OrWhereMatchesWhere(t *testing.T) {
+	m := New[TestModel]().OrWhere("tags", "@>", "x")
+	if m.buildErr != nil {
+		t.Fatalf("OrWhere rejected a valid operator: %v", m.buildErr)
+	}
+	query, _ := m.Print()
+	if !strings.Contains(query, "OR tags @> $1") {
+		t.Errorf("expected %q, got %q", "OR tags @> $1", query)
 	}
 }

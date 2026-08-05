@@ -147,7 +147,10 @@ err = zorm.New[User]().Where("status", "inactive").DeleteMany(ctx)
 - Automatically chunks large batches to stay within database limits (65535 parameters for PostgreSQL)
 - Uses transactions for multi-chunk inserts to ensure atomicity
 - Returns inserted IDs via `RETURNING` clause
-- Works with all hooks (`BeforeCreate` is NOT called - use `BulkInsert` if you need hooks)
+- Splits a batch that mixes set and unset primary keys into two INSERTs inside one
+  transaction, so explicit IDs are honored and zero-PK rows are still auto-assigned
+- Auto-sets `created_at` (when the column exists and the field is zero), but runs
+  **no create hooks** — use `BulkInsert` if you need `BeforeCreate` / `AfterCreate`
 
 ```go
 // For very large datasets, CreateMany automatically chunks
@@ -158,6 +161,32 @@ for i := range largeDataset {
 err := zorm.New[User]().CreateMany(ctx, largeDataset)
 // Automatically split into multiple INSERT statements within a transaction
 ```
+
+**BulkInsert** - Insert many records *with* the create hooks:
+
+```go
+users := []*User{
+    {Name: "Alice", Email: "alice@example.com"},
+    {Name: "Bob", Email: "bob@example.com"},
+}
+err := zorm.New[User]().BulkInsert(ctx, users)
+// BeforeCreate ran for both entities before the first INSERT;
+// AfterCreate runs per row as it is inserted; IDs are populated.
+```
+
+`BulkInsert` reuses one prepared statement across the batch instead of building a
+single multi-row INSERT. Pick it over `CreateMany` when you need hooks; pick
+`CreateMany` when you want the fewest round trips.
+
+| | `CreateMany` | `BulkInsert` |
+| --- | --- | --- |
+| SQL shape | one multi-row INSERT (chunked) | one prepared statement, executed per row |
+| `created_at` auto-set | yes | yes |
+| `BeforeCreate` / `AfterCreate` | no | yes |
+| Mixed set/unset primary keys | split into two INSERTs in one transaction | inserted as two groups |
+
+`BulkInsert` runs `BeforeCreate` for the whole batch *before* the first row is
+written, so a hook may still change the values that get inserted.
 
 **UpdateManyByKey** - Efficient batch updates using CASE WHEN syntax:
 
@@ -217,13 +246,15 @@ err = zorm.New[Order]().
 | `Sum(ctx, column)`    | Sum of column values                  | `float64, error` |
 | `Avg(ctx, column)`    | Average of column values              | `float64, error` |
 | `Pluck(ctx, column)`  | Get single column values              | `[]any, error`   |
+| `CountOver(ctx, column)` | Count rows per partition of a column | `map[string]int64, error` |
 
 ### Write Methods
 
 | Method                                      | Description                                      |
 | ------------------------------------------- | ------------------------------------------------ |
 | `Create(ctx, entity)`                       | Insert single record                             |
-| `CreateMany(ctx, entities)`                 | Insert multiple records                          |
+| `CreateMany(ctx, entities)`                 | Insert multiple records in one statement         |
+| `BulkInsert(ctx, entities)`                 | Insert multiple records, running the create hooks |
 | `Update(ctx, entity)`                       | Update all non-PK columns by primary key         |
 | `Save(ctx, entity)`                         | Update only dirty columns; optimistic-lock aware |
 | `UpdateMany(ctx, values)`                   | Update multiple records matching query           |
@@ -305,7 +336,7 @@ zorm.New[User]().Where(&User{Name: "John", Age: 25}).Get(ctx)
 zorm.New[User]().Where(func(q *zorm.Model[User]) {
     q.Where("age", ">", 18)
 }).Where("active", true).Get(ctx)
-// WHERE (age > ?) AND active = ?
+// WHERE (age > $1) AND active = $2
 
 // NULL checks
 zorm.New[User]().WhereNull("deleted_at").Get(ctx)
@@ -319,7 +350,48 @@ zorm.New[User]().WhereNotIn("status", []any{"banned", "archived"}).Get(ctx)
 zorm.New[User]().Where("age", ">", 18).OrWhere("verified", true).Get(ctx)
 zorm.New[User]().OrWhereNotIn("status", []any{"banned", "archived"}).Get(ctx)
 zorm.New[User]().OrWhereIn("id", []any{1, 2, 3}).Get(ctx)
+
+// Raw fragment with bound arguments — any fragment containing ? is treated as
+// raw SQL, with the arguments bound in order
+zorm.New[User]().
+    Where("id IN (SELECT user_id FROM memberships WHERE role = ?)", "admin").
+    Get(ctx)
 ```
+
+**Security note on the raw form.** It is an escape hatch. The fragment is checked
+for SQL comments and statement separators, but that cannot stop *logical*
+injection (`"active = ? OR 1=1"`). Keep the fragment a trusted constant and pass
+user input as bound arguments — never concatenate it into the string.
+
+### Input validation
+
+Builder methods validate what you give them. Invalid input — a column name,
+operator, `ORDER BY` direction, lock mode, CTE name or `HAVING` expression that
+fails validation — records a build error instead of quietly changing the query.
+The error is returned by the terminal call:
+
+```go
+users, err := zorm.New[User]().
+    Where("name; DROP TABLE users", "John").  // rejected here
+    Get(ctx)                                   // reported here
+
+if errors.Is(err, zorm.ErrInvalidColumnName) {
+    // the query never ran
+}
+```
+
+Rules worth knowing:
+
+- **Write methods refuse to run with a build error.** This matters most for
+  `UpdateMany` / `UpdateManyByKey`: a dropped `WHERE` would otherwise turn a
+  targeted update into a table-wide one.
+- **Errors propagate out of nested scopes.** A rejected condition inside a
+  `Where(func)` group or a `WithCallback` callback fails the outer query rather
+  than silently dropping the group or the relation filter.
+- **`OrderBy` rejects an unrecognized direction.** Earlier versions coerced
+  anything that was not `ASC`/`DESC` to `DESC`, which silently ordered results the
+  opposite way from the request. `"asc"`, `"ASC"`, `"desc"` and `"DESC"` are
+  unaffected.
 
 ### Exists Check
 
@@ -340,6 +412,32 @@ for _, email := range emails {
     fmt.Println(email)
 }
 ```
+
+### CountOver (Counts per Partition)
+
+`CountOver` counts rows per distinct value of a column using
+`COUNT(*) OVER (PARTITION BY ...)`:
+
+```go
+// How many orders does each customer have, among orders over $100?
+counts, err := zorm.New[Order]().
+    Where("amount", ">", 100).
+    CountOver(ctx, "customer_id")
+
+for customerID, n := range counts {
+    fmt.Printf("customer %s has %d orders\n", customerID, n)
+}
+```
+
+Keys are normalized to strings regardless of the type the driver scanned the
+column into — SQLite hands back `int64` for integers, some drivers hand back
+`[]byte` for binary and UUID columns, and a `[]byte` cannot be a map key at all.
+The return type is `map[string]int64` for that reason; it was `map[any]int64` in
+earlier versions, and making the key type explicit turns an out-of-date lookup
+(`counts[int64(5)]`) into a compile error rather than a silent zero.
+
+`CountOver` honors JOINs, CTEs, `WHERE` and the statement cache like the other
+aggregates.
 
 ### Scalar Queries (Type-Safe Single Column)
 
@@ -417,6 +515,13 @@ user, err := zorm.New[User]().UpdateOrCreate(ctx,
     map[string]any{"name": "John Updated"},       // Values to set
 )
 ```
+
+Find-then-create is not atomic: a concurrent caller can insert the same row
+between the two statements. When the INSERT loses that race with a duplicate-key
+error, the lookup is retried once and the winning row is returned (or, for
+`UpdateOrCreate`, updated). A duplicate-key conflict on some *other* unique
+constraint — one the search attributes do not select for — is returned to you
+unchanged, since retrying could not resolve it.
 
 ### Pagination
 
@@ -707,12 +812,17 @@ users, _ := zorm.New[User]().With("Posts", "Profile").Get(ctx)
 users, _ := zorm.New[User]().With("Posts.Comments").Get(ctx)
 
 // Load with constraints
+// Limit applies per parent: each user gets up to 5 published posts, not 5
+// posts shared across all users. OrderBy decides which 5 each user keeps.
 users, _ := zorm.New[User]().WithCallback("Posts", func(q *zorm.Model[Post]) {
     q.Where("published", true).
       OrderBy("created_at", "DESC").
       Limit(5)
 }).Get(ctx)
 ```
+
+A validation failure inside the callback is returned by `Get` / `Load`; the
+relation is not loaded unfiltered.
 
 ### Lazy Loading
 
@@ -778,6 +888,10 @@ err = zorm.New[User]().Detach(ctx, user, "Roles", nil)
 - **Detaches** IDs that are in the database but not in the new list
 - **Keeps** IDs that exist in both (no duplicate entry errors)
 
+The read, the DELETE and the INSERT run in a single transaction, so a failing
+attach cannot leave the association half-synced. When the model is already bound
+to a transaction (`WithTx`), that one is used instead of opening a nested one.
+
 ```go
 user := &User{ID: 1}
 // Current roles in DB: [1, 2, 3]
@@ -822,19 +936,37 @@ type Image struct {
     ImageableID   int64
 }
 
+// The value stored in the type column is the parent's morph type: its
+// MorphType() method when declared, otherwise its Go struct name ("User").
+func (u User) MorphType() string { return "users" }
+func (p Post) MorphType() string { return "posts" }
+
 // MorphOne: User has one Image
 func (u User) AvatarRelation() zorm.MorphOne[Image] {
     return zorm.MorphOne[Image]{
-        Type: "ImageableType",  // Type column
-        ID:   "ImageableID",    // ID column
+        Type: "imageable_type",  // Type column
+        ID:   "imageable_id",    // ID column
     }
 }
 
 // MorphMany: Post has many Images
 func (p Post) ImagesRelation() zorm.MorphMany[Image] {
     return zorm.MorphMany[Image]{
-        Type: "ImageableType",
-        ID:   "ImageableID",
+        Type: "imageable_type",
+        ID:   "imageable_id",
+    }
+}
+
+// MorphTo: the inverse. Type/ID are column names here too, and the TypeMap
+// keys are the same morph type values written into the type column.
+func (i Image) ImageableRelation() zorm.MorphTo[any] {
+    return zorm.MorphTo[any]{
+        Type: "imageable_type",
+        ID:   "imageable_id",
+        TypeMap: map[string]any{
+            "users": User{},
+            "posts": Post{},
+        },
     }
 }
 
@@ -876,6 +1008,10 @@ Transaction features:
 - Auto-rollback on error return
 - Auto-rollback on panic (re-panics after rollback)
 - Auto-commit on nil return
+- Routed to the primary when a `DBResolver` is configured
+- If the rollback *itself* fails, the returned error matches both your original
+  error and `errors.Is(err, zorm.ErrRollbackFailed)` — worth branching on, since
+  the connection state is then unknown
 
 ---
 
@@ -890,14 +1026,17 @@ import "github.com/rezakhademix/zorm"
 
 // Query errors
 zorm.ErrRecordNotFound     // No matching record
+zorm.ErrRequiresRawQuery   // Exec() called without Raw()
 
 // Model errors
 zorm.ErrInvalidModel       // Invalid model type
 zorm.ErrNilPointer         // Nil pointer passed
+zorm.ErrNoContext          // No context provided
 
 // Relation errors
 zorm.ErrRelationNotFound   // Relation method not found
 zorm.ErrInvalidRelation    // Invalid relation type
+zorm.ErrInvalidConfig      // Invalid relation config (e.g. missing pivot keys)
 
 // Constraint violations
 zorm.ErrDuplicateKey       // Unique constraint violation
@@ -909,17 +1048,21 @@ zorm.ErrCheckViolation     // CHECK constraint violation
 zorm.ErrConnectionFailed   // Connection refused
 zorm.ErrConnectionLost     // Connection lost during operation
 zorm.ErrTimeout            // Operation timeout
+zorm.ErrNilDatabase        // No DB configured (GlobalDB, SetDB or resolver)
 
 // Transaction errors
 zorm.ErrTransactionDeadlock    // Deadlock detected
 zorm.ErrSerializationFailure  // Serialization failure
 zorm.ErrOptimisticLock         // Save() detected concurrent modification
 zorm.ErrSaveUntracked          // Save() called on entity not loaded from DB
+zorm.ErrVersionOverflow        // version column is at its type's maximum
+zorm.ErrRollbackFailed         // rollback failed after a failed transaction
 
 // Schema errors
 zorm.ErrColumnNotFound     // Column doesn't exist
 zorm.ErrTableNotFound      // Table doesn't exist
 zorm.ErrInvalidSyntax      // SQL syntax error
+zorm.ErrInvalidColumnName  // Builder input rejected by validation
 ```
 
 ### Error Helper Functions
@@ -1001,10 +1144,11 @@ err := zorm.New[User]().Save(ctx, user)
   Use `Update` for full-column writes from a hand-built entity.
 
 Hooks: `Save` fires `BeforeUpdate` / `AfterUpdate` (and the `*Tx` variants)
-in the same positions as `Update` whenever it issues SQL. When `Save` is a
-no-op (nothing dirty) it returns `nil` without firing hooks. If the row was
-deleted between load and save and no version column is configured, `Save`
-returns `ErrRecordNotFound`.
+in the same positions as `Update` — including when the entity is clean and no
+SQL is issued, so audit-logging hooks observe every `Save` call. (`BeforeUpdate`
+runs before the dirty set is computed, so a hook that mutates fields turns a
+clean Save into a real UPDATE.) If the row was deleted between load and save
+and no version column is configured, `Save` returns `ErrRecordNotFound`.
 
 ### Optimistic Concurrency
 
@@ -1218,9 +1362,19 @@ sql, args := zorm.New[User]().
     Limit(10).
     Print()
 
-fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > ? ORDER BY name ASC LIMIT 10
+fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > $1 ORDER BY name ASC LIMIT 10
 fmt.Println(args)  // [18]
 ```
+
+Placeholder rewriting is not dialect-dependent — `?` becomes `$N` everywhere
+(SQLite accepts `$N` too), and every execution path sends exactly what `Print`
+reports, including `Exec` on a `Raw` query.
+
+The generated SQL is also stable: clauses built from a map or a struct
+(`Where(map[string]any{...})`, `Where(&User{...})`, `UpdateMany(values)`) are
+emitted in a fixed order rather than Go's randomized map order. `Print()` output
+is therefore safe to assert on in tests, and the statement cache sees one entry
+per builder chain instead of one per iteration order.
 
 ---
 

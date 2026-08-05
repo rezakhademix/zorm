@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -799,5 +800,95 @@ func TestAnyToKeyString_CustomStruct(t *testing.T) {
 	result := anyToKeyString(input)
 	if result != expected {
 		t.Errorf("anyToKeyString(%+v) = %q, want %q", input, result, expected)
+	}
+}
+
+// ==================== setRelationValue ====================
+// All six relation loaders assign through setRelationValue, so its dispatch on
+// the destination field's kind is what keeps HasOne/MorphOne (single value) and
+// HasMany/MorphMany/BelongsToMany (slice) correct. These cases pin that table.
+
+type srvChild struct {
+	ID   int
+	Name string
+}
+
+type srvParent struct {
+	PtrField    *srvChild
+	StructField srvChild
+	PtrSlice    []*srvChild
+	StructSlice []srvChild
+}
+
+func srvChildren(names ...string) []reflect.Value {
+	out := make([]reflect.Value, 0, len(names))
+	for i, n := range names {
+		out = append(out, reflect.ValueOf(&srvChild{ID: i + 1, Name: n}))
+	}
+	return out
+}
+
+func TestSetRelationValue_PointerFieldTakesFirstChild(t *testing.T) {
+	p := &srvParent{}
+	field := reflect.ValueOf(p).Elem().FieldByName("PtrField")
+
+	setRelationValue(field, srvChildren("first", "second"))
+
+	if p.PtrField == nil {
+		t.Fatal("expected pointer field to be set")
+	}
+	if p.PtrField.Name != "first" {
+		t.Errorf("expected the first child, got %q", p.PtrField.Name)
+	}
+}
+
+func TestSetRelationValue_StructFieldTakesFirstChild(t *testing.T) {
+	p := &srvParent{}
+	field := reflect.ValueOf(p).Elem().FieldByName("StructField")
+
+	setRelationValue(field, srvChildren("first", "second"))
+
+	if p.StructField.Name != "first" {
+		t.Errorf("expected the first child, got %q", p.StructField.Name)
+	}
+}
+
+func TestSetRelationValue_PointerSliceTakesAllChildren(t *testing.T) {
+	p := &srvParent{}
+	field := reflect.ValueOf(p).Elem().FieldByName("PtrSlice")
+
+	setRelationValue(field, srvChildren("a", "b", "c"))
+
+	if len(p.PtrSlice) != 3 {
+		t.Fatalf("expected 3 children, got %d", len(p.PtrSlice))
+	}
+	if p.PtrSlice[0].Name != "a" || p.PtrSlice[2].Name != "c" {
+		t.Errorf("children out of order: %v", p.PtrSlice)
+	}
+}
+
+func TestSetRelationValue_StructSliceTakesAllChildren(t *testing.T) {
+	p := &srvParent{}
+	field := reflect.ValueOf(p).Elem().FieldByName("StructSlice")
+
+	setRelationValue(field, srvChildren("a", "b"))
+
+	if len(p.StructSlice) != 2 {
+		t.Fatalf("expected 2 children, got %d", len(p.StructSlice))
+	}
+	if p.StructSlice[1].Name != "b" {
+		t.Errorf("expected second child 'b', got %q", p.StructSlice[1].Name)
+	}
+}
+
+func TestSetRelationValue_NoChildrenLeavesFieldUntouched(t *testing.T) {
+	existing := &srvChild{Name: "kept"}
+	p := &srvParent{PtrField: existing}
+	field := reflect.ValueOf(p).Elem().FieldByName("PtrField")
+
+	setRelationValue(field, nil)
+
+	if p.PtrField != existing {
+		t.Error("expected an empty child set to leave the field untouched")
 	}
 }
