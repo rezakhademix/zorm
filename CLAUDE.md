@@ -141,7 +141,7 @@ go test -v -run TestRelations ./...
 - `BeforeDelete`, `AfterDelete`
 - `AfterFind`
 
-Note: README's hooks table only lists three — the code supports all seven.
+`AfterFind` receives the context passed to the **terminal method** (`Get(ctx)`, …), not the model's stored `m.ctx` — hook-side DB work is cancellable with the caller's request. It fires for relation-loaded entities too: every relation kind funnels through `scanRowsDynamic` (`executor.go`), which runs the same post-scan pipeline as `scanRows` (`AfterFind` + accessors).
 
 **Transactional hooks (`*Tx` variants)**: each of the six **write** hooks has a parallel `Tx` variant that receives the active `*zorm.Tx`:
 
@@ -151,11 +151,13 @@ Note: README's hooks table only lists three — the code supports all seven.
 
 If both the plain and `Tx` variant exist on a model, **only the `Tx` variant fires** (no double-dispatch). When a model implements any `Tx` variant and the operation is called outside an existing transaction, the executor auto-opens one for that call so DB work performed through the passed `*Tx` (e.g. `tx.Tx.ExecContext(...)` or `model.WithTx(tx).<...>`) rolls back atomically with the parent SQL on error. `AfterFind` intentionally has no `Tx` variant — reads don't participate in write transactions.
 
-Gotcha: in-memory mutations to entity fields are **never** rolled back regardless of variant — only DB writes via the passed `*Tx` are. Plain hooks (`BeforeCreate` etc.) still run on a separate connection from the parent SQL, so their DB side effects are not atomic; migrate to the `Tx` variant when atomicity matters.
+When an auto-opened transaction rolls back, `Create` clears the entity's dirty-tracking baseline (`ClearOriginals`) so it no longer reports as tracked — otherwise `Save()` would emit an UPDATE against a row that was rolled back.
 
-**Accessors** (`schema.go` + `executor.go`): methods named `Get<Name>` with zero arguments returning exactly one value are treated as computed attributes. The attribute key is the snake_case of the name after `Get` (`GetFullName()` → `attributes["full_name"]`). Requires the struct to declare `Attributes map[string]any`; without that field, accessors silently no-op.
+Gotcha: in-memory mutations to entity fields are **never** rolled back regardless of variant — only DB writes via the passed `*Tx` are. The primary key `Create` assigned stays set after a rollback; only the tracking baseline is cleared. Plain hooks (`BeforeCreate` etc.) still run on a separate connection from the parent SQL, so their DB side effects are not atomic; migrate to the `Tx` variant when atomicity matters.
 
-**Dirty-tracking memory** (`dirty.go`): originals are kept in a bounded LRU (default 50,000 entries; tunable via `ConfigureDirtyTracking()`). Long-running services that load many distinct entities should use `WithTrackingScope(scope)` (with `defer scope.Close()`) or explicitly `ClearOriginals(entity)` to avoid retaining originals indefinitely.
+**Accessors** (`schema.go` + `executor.go`): methods named `Get<Name>` with zero arguments returning exactly one value are treated as computed attributes. The attribute key is the snake_case of the name after `Get` (`GetFullName()` → `attributes["full_name"]`). Requires the struct to declare `Attributes map[string]any`; without that field, accessors silently no-op. `ModelInfo.Accessors` holds method indices into the **pointer** type's method set (`reflect.PointerTo(typ)`), because the loaders always hold `*T`; `RelationMethods` indices are against the **value** type, since `loadRelations` calls them through `reflect.ValueOf(t)`. Mixing the two selects the wrong method.
+
+**Dirty-tracking memory** (`dirty.go`): relation-loaded entities are tracked too, so `Save()` works on them. Tracking is recorded through the relation config's `NewModel` bridge (`trackRelatedResults` / `trackDynamic` in `relations.go`) because the tracker's weak reference needs the related type as a type parameter, which the loaders only have as a `reflect.Type`. **`MorphTo` targets are not tracked** — their type is resolved per row, so no typed bridge exists. Originals are kept in a bounded LRU (default 50,000 entries; tunable via `ConfigureDirtyTracking()`). Long-running services that load many distinct entities should use `WithTrackingScope(scope)` (with `defer scope.Close()`) or explicitly `ClearOriginals(entity)` to avoid retaining originals indefinitely.
 
 ### Execution Flow
 

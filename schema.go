@@ -365,13 +365,10 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 	// We store valid methods for quick access during scanning and relation loading
 	relationType := reflect.TypeOf((*Relation)(nil)).Elem()
 
+	// Relation methods are indexed against the value type because loadRelations
+	// calls them through reflect.ValueOf(t) on a value T.
 	for i := 0; i < typ.NumMethod(); i++ {
 		method := typ.Method(i)
-
-		// Accessor convention: Starts with "Get", has 0 arguments, returns 1 value
-		if strings.HasPrefix(method.Name, "Get") && method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
-			info.Accessors = append(info.Accessors, i)
-		}
 
 		// Relation Method detection
 		// Must return 1 value that implements Relation interface
@@ -379,6 +376,22 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 			if method.Type.Out(0).Implements(relationType) {
 				info.RelationMethods[method.Name] = i
 			}
+		}
+	}
+
+	// Accessors are indexed against the POINTER type, because that is what the
+	// accessor loaders hold (entities are always *T). The two method sets are
+	// not interchangeable: *T's set also contains the pointer-receiver methods,
+	// so a value-type index silently selects a different method — a model with
+	// an accessor plus, say, a pointer-receiver AfterFind would call the hook
+	// with no context argument and panic inside reflect.
+	ptrType := reflect.PointerTo(typ)
+	for i := 0; i < ptrType.NumMethod(); i++ {
+		method := ptrType.Method(i)
+
+		// Accessor convention: Starts with "Get", has 0 arguments, returns 1 value
+		if strings.HasPrefix(method.Name, "Get") && method.Type.NumIn() == 1 && method.Type.NumOut() == 1 {
+			info.Accessors = append(info.Accessors, i)
 		}
 	}
 
