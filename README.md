@@ -14,11 +14,11 @@ ZORM is a powerful, type-safe, and developer-friendly Go ORM designed for modern
 
 - **Type-Safe**: Full compile-time type safety powered by Go generics
 - **Zero Dependencies**: Built on Go's `database/sql` package, works with any SQL driver
-- **High Performance**: Prepared statement caching and connection pooling
+- **High Performance**: Prepared statement caching, connection pooling, model pooling — see [Advanced Start](#advanced-start)
 - **Relations**: HasOne, HasMany, BelongsTo, BelongsToMany, Polymorphic relations
 - **Fluent API**: Chainable query builder with intuitive method names
 - **Advanced Queries**: CTEs, Subqueries, Full-Text Search, Window Functions
-- **Database Splitting**: Automatic read/write split with replica support
+- **Database Splitting**: Automatic read/write split with replica support — see [Advanced Start](#advanced-start)
 - **Context Support**: All operations respect `context.Context` for cancellation & timeout
 - **Debugging**: `Print()` method to inspect generated SQL without executing
 - **Lifecycle Hooks**: BeforeCreate / AfterCreate, BeforeUpdate / AfterUpdate, BeforeDelete / AfterDelete, AfterFind — plus `*Tx` variants for atomic side effects
@@ -228,6 +228,208 @@ err = zorm.New[Order]().
 - Automatically chunks large maps (500+ entries) with transaction safety
 - Combines with existing WHERE conditions
 - Auto-updates `updated_at` timestamp if the column exists. `Create`/`CreateMany` also auto-populate `created_at` when present and unset.
+
+---
+
+## Advanced Start
+
+Quick Start gets you querying. This section gets you to production: connection
+pool sizing, prepared-statement caching, replica routing, and allocation /
+memory control — in the order you should add them.
+
+### 1. Tune the connection pool
+
+```go
+db, err := zorm.ConnectPostgres(
+    "postgres://user:password@primary.internal/app?sslmode=require",
+    &zorm.DBConfig{
+        MaxOpenConns:    25,              // hard ceiling on concurrent connections
+        MaxIdleConns:    5,               // kept warm between bursts
+        ConnMaxLifetime: time.Hour,       // recycle before the server/proxy does
+        ConnMaxIdleTime: 30 * time.Minute,
+    },
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+zorm.SetGlobalDB(db)  // thread-safe; prefer over assigning zorm.GlobalDB directly
+```
+
+`ConnectPostgres` pings the database before returning, so a bad DSN or an
+unreachable host fails at startup rather than on the first query. Passing `nil`
+for the config leaves Go's `database/sql` defaults in place (unlimited open
+connections, 2 idle).
+
+### 2. Add a statement cache
+
+`StmtCache` is an LRU of `*sql.Stmt` shared by every model that opts in. Build
+one at startup, close it at shutdown:
+
+```go
+cache := zorm.NewStmtCache(200)  // capacity <= 0 defaults to 100
+defer cache.Close()
+
+// Build a base model once, clone it per query — the cache survives Clone()
+base := zorm.New[User]().WithStmtCache(cache)
+
+users, _ := base.Clone().Where("age", ">", 18).Get(ctx)
+adults, _ := base.Clone().Where("age", ">", 21).Get(ctx)  // same SQL shape, reuses the prepared statement
+
+fmt.Println(cache.Len())  // number of live cached statements
+```
+
+The cache pays off when the same *SQL shape* repeats — argument values differ,
+the statement does not. A query built with a different set of clauses is a
+different statement.
+
+**Caching rules worth knowing:**
+
+- **Keyed per connection handle**, not just per SQL string: the key includes the
+  `*sql.DB` pointer. One cache can therefore be shared safely across a primary
+  and every replica — a statement prepared against a replica can never be handed
+  to the primary.
+- **Transactions are never cached.** A statement prepared on a `*sql.Tx` dies
+  with its transaction, so ZORM prepares it fresh and closes it at the end of
+  the operation. Workloads that run almost entirely inside `Transaction(...)`
+  get little benefit from the cache.
+- **Capacity is sharded** across independently locked shards (the shard sizes
+  sum to exactly the capacity you asked for), so concurrent lookups on different
+  queries do not contend on one mutex.
+- `Close()` closes every cached statement; `Clear()` empties the cache but keeps
+  it usable.
+
+### 3. Add replicas
+
+```go
+zorm.ConfigureDBResolver(
+    zorm.WithPrimary(primaryDB),
+    zorm.WithReplicas(replica1, replica2),
+    zorm.WithLoadBalancer(zorm.RoundRobinLB),  // or zorm.RandomLB
+)
+
+// Routing is automatic from here
+users, _ := zorm.New[User]().Get(ctx)      // -> load-balanced replica
+err := zorm.New[User]().Create(ctx, user)  // -> always primary
+
+// Manual overrides
+users, _ = zorm.New[User]().UsePrimary().Get(ctx)   // force primary
+users, _ = zorm.New[User]().UseReplica(0).Get(ctx)  // force a specific replica
+```
+
+**Routing rules worth knowing:**
+
+- **There is no read-after-write stickiness.** A read issued right after a write
+  goes to a replica and may not see the row yet. Call `UsePrimary()` on reads
+  that must observe a just-committed write.
+- **A configured resolver overrides `SetDB(db)`** for reads *and* writes — the
+  resolver is consulted first and never falls back to the model's own handle.
+  Only `WithTx(tx)` escapes the resolver: transactions always run on their own
+  connection, and are therefore always on the primary.
+- **Zero replicas is not an error.** `WithReplicas()` with an empty list routes
+  reads to the primary, which makes it safe to configure the resolver
+  unconditionally and add replicas later.
+- **An out-of-range `UseReplica(i)` silently falls back** to a load-balanced
+  replica rather than failing. Treat the index as a hint, not a guarantee.
+
+### 4. Putting it together
+
+Cache, pool and replicas are meant to be configured once at startup:
+
+```go
+func setup() (*zorm.StmtCache, error) {
+    primary, err := zorm.ConnectPostgres(primaryDSN, &zorm.DBConfig{
+        MaxOpenConns:    25,
+        MaxIdleConns:    5,
+        ConnMaxLifetime: time.Hour,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    // Replicas usually want a larger pool — they take the read traffic
+    replica, err := zorm.ConnectPostgres(replicaDSN, &zorm.DBConfig{
+        MaxOpenConns:    50,
+        MaxIdleConns:    10,
+        ConnMaxLifetime: time.Hour,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    zorm.SetGlobalDB(primary)  // fallback for code paths that bypass the resolver
+    zorm.ConfigureDBResolver(
+        zorm.WithPrimary(primary),
+        zorm.WithReplicas(replica),
+        zorm.WithLoadBalancer(zorm.RoundRobinLB),
+    )
+
+    // One cache for both handles — entries are keyed per handle
+    return zorm.NewStmtCache(200), nil
+}
+
+// In a request handler
+users, err := zorm.New[User]().
+    WithStmtCache(cache).
+    Where("active", true).
+    Limit(50).
+    Get(ctx)  // replica + cached statement
+```
+
+### 5. Allocation and memory control
+
+**Model pooling.** `Acquire[T]()` takes a `Model[T]` from a `sync.Pool` instead
+of allocating one; `Release()` returns it. Worth using on hot paths that build a
+query per request:
+
+```go
+m := zorm.Acquire[User]()
+defer m.Release()
+
+users, err := m.Where("active", true).Limit(20).Get(ctx)
+// `users` stays valid after Release — the entities are separate allocations
+```
+
+`Acquire` binds the current `GlobalDB` at acquire time. Never touch the model
+after `Release()`: its state is cleared and it may already be in use elsewhere.
+
+**Dirty-tracking memory.** Loading an entity stores a baseline so `Save` can
+compute dirty columns. Baselines live in a bounded LRU — 50,000 entities by
+default. A long-running service that streams through many distinct rows should
+bound it explicitly:
+
+```go
+zorm.ConfigureDirtyTracking(10000)  // 0 means unbounded — not recommended for long-lived processes
+```
+
+For a batch job, scope the tracking instead so it is released deterministically:
+
+```go
+scope := zorm.NewTrackingScope()
+defer scope.Close()  // drops the baselines for everything loaded through this model
+
+model := zorm.New[User]().WithTrackingScope(scope)
+users, _ := model.Get(ctx)
+```
+
+`zorm.TrackedEntityCount()` reports the current count (useful as a gauge metric);
+`zorm.ClearAllOriginals()` drops everything at once.
+
+**Large result sets.** Don't materialize what you don't need: use
+[`Cursor`](#cursor-memory-efficient-iteration) to stream row by row, or
+[`Chunk`](#chunking-large-datasets) to process in fixed-size batches.
+
+### What to reach for
+
+| Symptom | Knob |
+| --- | --- |
+| Connection exhaustion / "too many clients" | `DBConfig.MaxOpenConns`, `ConnMaxLifetime` |
+| High CPU parsing the same SQL repeatedly | `WithStmtCache` |
+| Read traffic saturating the primary | `ConfigureDBResolver` + replicas |
+| Stale reads right after a write | `UsePrimary()` on that read |
+| Allocation churn in a hot handler | `Acquire[T]()` / `Release()` |
+| Memory growth in a long-running worker | `ConfigureDirtyTracking`, `TrackingScope` |
+| OOM on a large `Get` | `Cursor` or `Chunk` |
 
 ---
 
@@ -1183,39 +1385,11 @@ Supported version-field kinds: `int`, `int32`, `int64`, `uint`, `uint32`,
 
 ### Statement Caching
 
-Improve performance by reusing prepared statements:
-
-```go
-cache := zorm.NewStmtCache(100)  // Cache up to 100 statements
-defer cache.Close()
-
-model := zorm.New[User]().WithStmtCache(cache)
-
-// Statements are prepared once and reused
-users, _ := model.Clone().Where("age", ">", 18).Get(ctx)
-users, _ := model.Clone().Where("age", ">", 25).Get(ctx)  // Reuses prepared statement
-```
+See [Advanced Start → Add a statement cache](#2-add-a-statement-cache).
 
 ### Read/Write Splitting
 
-```go
-// Configure resolver
-zorm.ConfigureDBResolver(
-    zorm.WithPrimary(primaryDB),
-    zorm.WithReplicas(replica1, replica2),
-    zorm.WithLoadBalancer(zorm.RoundRobinLB),
-)
-
-// Automatic routing
-users, _ := zorm.New[User]().Get(ctx)          // Reads from replica
-err := zorm.New[User]().Create(ctx, user)      // Writes to primary
-
-// Force primary for consistency
-users, _ := zorm.New[User]().UsePrimary().Get(ctx)
-
-// Force specific replica
-users, _ := zorm.New[User]().UseReplica(0).Get(ctx)
-```
+See [Advanced Start → Add replicas](#3-add-replicas).
 
 ### Common Table Expressions (CTEs)
 
