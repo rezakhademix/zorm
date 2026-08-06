@@ -75,7 +75,10 @@ func TestShadowedColumn_UpdateAssignsColumnOnce(t *testing.T) {
 	db, log := newRecordingDB()
 	defer db.Close()
 
-	if err := New[SfDoc]().SetDB(db).Update(context.Background(), &SfDoc{ID: 1, Title: "x"}); err != nil {
+	// CreatedAt must be non-zero: Update drops a zero created_at from the SET
+	// list, and this test is about the assignment appearing once, not twice.
+	doc := &SfDoc{ID: 1, Title: "x", CreatedAt: "2020-01-01"}
+	if err := New[SfDoc]().SetDB(db).Update(context.Background(), doc); err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
 

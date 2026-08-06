@@ -1452,6 +1452,23 @@ func (m *Model[T]) autoSetCreatedAt(entity *T) {
 	}
 }
 
+// createdAtColumn is the column the insert paths auto-populate and the update
+// paths refuse to zero out.
+const createdAtColumn = "created_at"
+
+// isZeroCreatedAt reports whether v is the zero value for its type (nil, the
+// zero time.Time, "", 0, …). Update paths drop created_at from the statement
+// when this holds: an unset field on a partially built entity must not erase
+// the stored creation timestamp. Insert paths fill such a value in instead
+// (see autoSetCreatedAt); an explicit non-zero value is always written.
+func isZeroCreatedAt(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.IsValid() && rv.IsZero()
+}
+
 // Create inserts a new record.
 //
 // Hook Behavior: If the entity implements BeforeCreate(context.Context) error,
@@ -1647,8 +1664,24 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			continue
 		}
 
+		fieldVal := val.FieldByIndex(field.Index)
+
+		// A zero created_at means the caller never populated it — typically a
+		// partially built entity carrying only the PK and the fields being
+		// changed. Writing it would erase the stored creation timestamp.
+		if field.Column == createdAtColumn && fieldVal.IsZero() {
+			continue
+		}
+
 		sets = append(sets, field.Column+" = ?")
-		values = append(values, val.FieldByIndex(field.Index).Interface())
+		values = append(values, fieldVal.Interface())
+	}
+
+	// Everything dropped out (a model whose only writable column is
+	// created_at): emit nothing rather than invalid SQL, but still fire
+	// AfterUpdate so audit hooks observe the call, matching Save's no-op path.
+	if len(sets) == 0 {
+		return m.callAfterUpdate(ctx, entity)
 	}
 
 	var sb strings.Builder
@@ -1775,8 +1808,16 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 			continue
 		}
 
+		fieldVal := val.FieldByIndex(field.Index)
+
+		// Naming created_at is explicit, but a zero value still is not: see
+		// the same guard in Update.
+		if column == createdAtColumn && fieldVal.IsZero() {
+			continue
+		}
+
 		sets = append(sets, column+" = ?")
-		values = append(values, val.FieldByIndex(field.Index).Interface())
+		values = append(values, fieldVal.Interface())
 	}
 
 	if len(sets) == 0 {
@@ -1912,6 +1953,13 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	// Compute dirty set AFTER BeforeUpdate so hook mutations are observed,
 	// and BEFORE auto-touching updated_at so a true no-op stays a no-op.
 	dirty := getDirty(entity, m.modelInfo)
+
+	// A created_at zeroed in memory must not erase the stored timestamp (see
+	// the same guard in Update). Dropped before the updated_at touch below so
+	// a change that consists only of that zeroing stays a full no-op.
+	if v, ok := dirty[createdAtColumn]; ok && isZeroCreatedAt(v) {
+		delete(dirty, createdAtColumn)
+	}
 
 	// If anything changed, auto-touch updated_at (matching Update's behavior).
 	if len(dirty) > 0 {
@@ -2621,11 +2669,23 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	maps.Copy(valuesCopy, values)
 	values = valuesCopy
 
+	// A zero created_at would erase the stored creation timestamp: see the
+	// same guard in Update.
+	if v, ok := values[createdAtColumn]; ok && isZeroCreatedAt(v) {
+		delete(values, createdAtColumn)
+	}
+
 	// Auto-update updated_at if it exists and not provided
 	if _, ok := m.modelInfo.Columns["updated_at"]; ok {
 		if _, exists := values["updated_at"]; !exists {
 			values["updated_at"] = time.Now()
 		}
+	}
+
+	// The created_at drop may have emptied the map on a model with no
+	// updated_at column.
+	if len(values) == 0 {
+		return nil
 	}
 
 	var sets []string
@@ -2721,6 +2781,21 @@ func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColu
 
 	// Get map keys
 	keys := mapVal.MapKeys()
+
+	// Drop entries that would zero created_at: see the same guard in Update.
+	// Filtering here covers both the batched and the chunked path below.
+	if targetColumn == createdAtColumn {
+		kept := keys[:0]
+		for _, key := range keys {
+			if !isZeroCreatedAt(mapVal.MapIndex(key).Interface()) {
+				kept = append(kept, key)
+			}
+		}
+		keys = kept
+		if len(keys) == 0 {
+			return nil
+		}
+	}
 
 	// Execute in single batch or chunked
 	if len(keys) <= maxEntriesPerBatch {

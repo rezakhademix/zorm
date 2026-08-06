@@ -124,11 +124,15 @@ go test -v -run TestRelations ./...
 
 **Relation methods**: Define relations as methods returning `zorm.HasMany[T]`, `zorm.BelongsTo[T]`, etc. The schema parser accepts either bare name (`Posts`) or suffixed (`PostsRelation`).
 
-**Auto `created_at`**: `Create`/bulk create set a model's `created_at` column to `time.Now()` when the caller left it zero (`autoSetCreatedAt` in `executor.go`). Zero-only — explicit values are preserved.
+**Auto `created_at`**: `Create`/bulk create set a model's `created_at` column to `time.Now()` when the caller left it zero (`autoSetCreatedAt` in `executor.go`). Zero-only — explicit values are preserved. The update paths enforce the mirror rule: `Update`, `Save`, `UpdateColumns`, `UpdateMany` and `UpdateManyByKey` **drop `created_at` from the statement when its value is zero** (`isZeroCreatedAt`), so a partially built entity (`&User{ID: 1, Name: "x"}`) can't erase the stored timestamp; a non-zero value is still written everywhere. Because a column can now drop out, `Update` has a `len(sets) == 0` guard that fires `AfterUpdate` and emits no SQL.
 
 **Global DB**: Set `zorm.GlobalDB` (or call `zorm.SetGlobalDB(db)` for thread-safety) at startup. Per-query override via `SetDB(db)` or `WithTx(tx)`.
 
 **Placeholder rebinding**: `rebind()` in `query.go` converts `?` to `$1, $2, …` for PostgreSQL. SQLite (used by tests) keeps `?`. Most query paths apply this automatically; a few relation-loader paths call it explicitly. Relevant when reading generated SQL via `Print()` or hand-writing `Raw(...)` queries.
+
+**Deferred build errors**: builder methods return `*Model[T]` and cannot report errors, so an invalid input (bad column name via `validateColumnNameUncached` in `schema.go`, bad operator, wrong arg count, rejected `WhereRaw` string via `validateWhereRawString` in `query.go`) records `m.buildErr` and drops the clause. Every terminal method checks `m.buildErr` first and returns it — 18 such guards across `executor.go`/`scalar.go`/`relations.go`. Any new terminal method must add that check: skipping it silently widens the statement (an unguarded `Update`/`Delete` then hits more rows than asked). `Clone()` carries `buildErr`; `Reset()` clears it; `GetBuildErr()` inspects it before a terminal call.
+
+**Write guardrails**: `Delete` requires at least one WHERE condition (`ErrInvalidModel` otherwise); use `ForceDeleteAll` to truncate deliberately. `Save` requires a non-zero primary key (use `Create` for inserts) and a dirty-tracking baseline — an untracked entity is rejected rather than rewritten field-by-field. There is **no soft-delete feature**; `deleted_at` only appears in docs as a `WhereNull` example.
 
 **Dialect override**: rebinding + IN-clause shape derive from `detectDialect()` (driver-name sniff). Call `zorm.SetDialect(zorm.DialectSQLite)` at startup to force a dialect — useful for tests using a non-standard driver name or for `Print()` on a model with no bound DB (defaults to Postgres). For large IN-lists on Postgres, pass a typed slice (`[]int64`, `[]string`, `[]float64`, `[]bool`) so `buildInClause` picks the `= ANY($1)` fast path; otherwise the 65535 parameter cap applies.
 
@@ -201,6 +205,9 @@ go vet ./... && staticcheck ./... && golint ./... && make test
 - Integration tests live in files ending `_integration_test.go` and exercise full DB operations against an in-memory SQLite database.
 - Unit tests test isolated logic without a DB.
 - `make test` runs everything with `-race`. Prefer keeping new tests race-clean; if a test exposes a real race in production code, fix the code rather than the test.
+- There is no shared test-DB helper: each test opens its own `sql.Open("sqlite3", ":memory:")` and creates its tables inline. Follow that pattern for new tests.
+- **No test calls `t.Parallel()`** — the suite mutates package-level state (`GlobalDB`, `SetDialect`, `GlobalResolver`, `ConfigureDirtyTracking`). Don't add parallelism without isolating those globals first.
+- `recording_driver_test.go` registers a minimal `database/sql` driver that captures the SQL actually sent. Use it to assert on generated SQL for write paths — `Print()` takes a different code path than execution. It backs the rebind and SQL-determinism tests.
 
 ## Contributing Conventions
 
