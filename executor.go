@@ -352,6 +352,9 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
+	if needsSubquery {
+		args = append(args, q.havingArgs...)
+	}
 
 	var count int64
 	var err error
@@ -708,9 +711,10 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	}
 
 	// Pre-allocate args slice with correct capacity
-	allArgs := make([]any, 0, len(cteArgs)+len(m.args))
+	allArgs := make([]any, 0, len(cteArgs)+len(m.args)+len(m.havingArgs))
 	allArgs = append(allArgs, cteArgs...)
 	allArgs = append(allArgs, m.args...)
+	allArgs = append(allArgs, m.havingArgs...)
 
 	return sb.String(), allArgs
 }
@@ -1005,6 +1009,13 @@ type Cursor[T any] struct {
 // Next prepares the next result row for reading with the Scan method.
 func (c *Cursor[T]) Next() bool {
 	return c.rows.Next()
+}
+
+// Err returns any error encountered during iteration. Call it after Next
+// returns false to distinguish normal exhaustion from an interrupted query.
+// Like sql.Rows.Err, it remains available after Close.
+func (c *Cursor[T]) Err() error {
+	return c.rows.Err()
 }
 
 // Scan scans the current row into a new entity.

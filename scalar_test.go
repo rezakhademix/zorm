@@ -1634,7 +1634,7 @@ func TestScalarQuery_WhereAfterHaving(t *testing.T) {
 		Table("users").
 		Select("role").
 		GroupBy("role").
-		Having("COUNT(*) >= ?", 1)
+		Having("COUNT(*) >= ?", 2)
 
 	// Add WHERE after HAVING
 	q = q.Where("active", 1)
@@ -1647,9 +1647,12 @@ func TestScalarQuery_WhereAfterHaving(t *testing.T) {
 	// Even though WHERE was added after HAVING in code,
 	// SQL execution order is: WHERE -> GROUP BY -> HAVING
 	// The query builder should handle this correctly
-	expected := []string{"admin", "user"}
+	expected := []string{"admin"}
 	if len(roles) != len(expected) {
 		t.Fatalf("expected %d roles, got %d", len(expected), len(roles))
+	}
+	if roles[0] != expected[0] {
+		t.Fatalf("expected role %q, got %q", expected[0], roles[0])
 	}
 }
 

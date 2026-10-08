@@ -689,7 +689,7 @@ func (m *Model[T]) Having(query string, args ...any) *Model[T] {
 		}
 	}
 	m.havings = append(m.havings, query)
-	m.args = append(m.args, args...)
+	m.havingArgs = append(m.havingArgs, args...)
 	return m
 }
 
@@ -1003,7 +1003,7 @@ func (m *Model[T]) GetWheres() []string {
 	return m.wheres
 }
 
-// GetArgs returns the arguments.
+// GetArgs returns the WHERE arguments, matching the clauses returned by GetWheres.
 func (m *Model[T]) GetArgs() []any {
 	return m.args
 }
