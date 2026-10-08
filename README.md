@@ -700,7 +700,13 @@ for cursor.Next() {
     // Process user one at a time
     fmt.Println(user.Name)
 }
+if err := cursor.Err(); err != nil {
+    return err
+}
 ```
+
+Check `cursor.Err()` after iteration: cancellation, timeouts, and driver errors
+also make `Next()` return false. Normal exhaustion returns a nil error.
 
 ### FirstOrCreate & UpdateOrCreate
 

@@ -20,20 +20,21 @@ import (
 //	    Where("active", true).
 //	    Get(ctx)
 type ScalarQuery[T any] struct {
-	db        *sql.DB
-	tx        *sql.Tx
-	tableName string
-	column    string
-	wheres    []string
-	args      []any
-	orderBys  []string
-	groupBys  []string
-	havings   []string
-	distinct  bool
-	limit     int
-	offset    int
-	buildErr  error // Accumulated validation errors surfaced at execution time
-	dialect   Dialect
+	db         *sql.DB
+	tx         *sql.Tx
+	tableName  string
+	column     string
+	wheres     []string
+	args       []any
+	orderBys   []string
+	groupBys   []string
+	havings    []string
+	havingArgs []any // Kept separate so binds follow SQL clause order.
+	distinct   bool
+	limit      int
+	offset     int
+	buildErr   error // Accumulated validation errors surfaced at execution time
+	dialect    Dialect
 }
 
 // Query creates a new scalar query builder for type T.
@@ -318,7 +319,7 @@ func (q *ScalarQuery[T]) Having(query string, args ...any) *ScalarQuery[T] {
 		query = strings.TrimSpace(query) + " ?"
 	}
 	q.havings = append(q.havings, query)
-	q.args = append(q.args, args...)
+	q.havingArgs = append(q.havingArgs, args...)
 	return q
 }
 
@@ -340,10 +341,11 @@ func (q *ScalarQuery[T]) Get(ctx context.Context) ([]T, error) {
 		return nil, q.buildErr
 	}
 	query := q.buildQuery()
+	args := q.queryArgs()
 
-	rows, err := q.queryer().QueryContext(ctx, rebind(query), q.args...)
+	rows, err := q.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
-		return nil, WrapQueryError("SELECT", query, q.args, err)
+		return nil, WrapQueryError("SELECT", query, args, err)
 	}
 	defer rows.Close()
 
@@ -357,13 +359,13 @@ func (q *ScalarQuery[T]) Get(ctx context.Context) ([]T, error) {
 	for rows.Next() {
 		var val T
 		if err := rows.Scan(&val); err != nil {
-			return nil, WrapQueryError("SCAN", query, q.args, err)
+			return nil, WrapQueryError("SCAN", query, args, err)
 		}
 		results = append(results, val)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, WrapQueryError("SCAN", query, q.args, err)
+		return nil, WrapQueryError("SCAN", query, args, err)
 	}
 
 	return results, nil
@@ -509,6 +511,10 @@ func (q *ScalarQuery[T]) Clone() *ScalarQuery[T] {
 		clone.havings = make([]string, len(q.havings))
 		copy(clone.havings, q.havings)
 	}
+	if len(q.havingArgs) > 0 {
+		clone.havingArgs = make([]any, len(q.havingArgs))
+		copy(clone.havingArgs, q.havingArgs)
+	}
 
 	return clone
 }
@@ -536,5 +542,12 @@ func (q *ScalarQuery[T]) queryer() interface {
 // Print returns the SQL query and arguments that would be executed without running it.
 // This is useful for debugging and logging the generated SQL.
 func (q *ScalarQuery[T]) Print() (string, []any) {
-	return rebind(q.buildQuery()), q.args
+	return rebind(q.buildQuery()), q.queryArgs()
+}
+
+// queryArgs assembles SELECT arguments in SQL order: WHERE, then HAVING.
+func (q *ScalarQuery[T]) queryArgs() []any {
+	args := make([]any, 0, len(q.args)+len(q.havingArgs))
+	args = append(args, q.args...)
+	return append(args, q.havingArgs...)
 }

@@ -99,6 +99,7 @@ type Model[T any] struct {
 	orderBys          []string
 	groupBys          []string
 	havings           []string
+	havingArgs        []any // Kept separate so binds follow SQL clause order.
 	distinct          bool
 	distinctOn        []string
 	limit             int
@@ -286,6 +287,7 @@ func (m *Model[T]) reset() {
 	m.orderBys = nil
 	m.groupBys = nil
 	m.havings = nil
+	m.havingArgs = nil
 	m.distinct = false
 	m.distinctOn = nil
 	m.limit = 0
@@ -382,6 +384,10 @@ func (m *Model[T]) Clone() *Model[T] {
 	if len(m.havings) > 0 {
 		newModel.havings = make([]string, len(m.havings))
 		copy(newModel.havings, m.havings)
+	}
+	if len(m.havingArgs) > 0 {
+		newModel.havingArgs = make([]any, len(m.havingArgs))
+		copy(newModel.havingArgs, m.havingArgs)
 	}
 	if len(m.distinctOn) > 0 {
 		newModel.distinctOn = make([]string, len(m.distinctOn))

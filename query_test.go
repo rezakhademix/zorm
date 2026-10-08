@@ -667,7 +667,7 @@ func TestWhere_IssueWithParentheses(t *testing.T) {
 
 // BenchmarkWhere benchmarks the Where method
 func BenchmarkWhere(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		m := New[TestModel]().Where("name", "John").Where("age >", 18)
 		_, _ = m.Print()
 	}
@@ -679,7 +679,7 @@ func BenchmarkWhereMap(b *testing.B) {
 		"name": "John",
 		"age":  30,
 	}
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		m := New[TestModel]().Where(conditions)
 		_, _ = m.Print()
 	}
