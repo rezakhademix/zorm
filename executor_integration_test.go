@@ -619,9 +619,9 @@ func TestCreate_AutoSetsCreatedAt(t *testing.T) {
 		seeded := time.Date(2021, 6, 7, 8, 9, 10, 0, time.UTC)
 		before := time.Now()
 		rows := []*tsModelBoth{
-			{Name: "carol", Age: 25},                        // zero -> auto
-			{Name: "dave", Age: 35, CreatedAt: seeded},      // preserved
-			{Name: "eve", Age: 45},                          // zero -> auto
+			{Name: "carol", Age: 25},                   // zero -> auto
+			{Name: "dave", Age: 35, CreatedAt: seeded}, // preserved
+			{Name: "eve", Age: 45},                     // zero -> auto
 		}
 		if err := New[tsModelBoth]().SetDB(db).CreateMany(ctx, rows); err != nil {
 			t.Fatalf("CreateMany failed: %v", err)

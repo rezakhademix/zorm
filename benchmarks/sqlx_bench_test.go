@@ -135,7 +135,7 @@ func sqlxBulkInsert(b *testing.B, n int) {
 
 	const cols = "(?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	var sb strings.Builder
-	sb.Grow(64 + n*len(cols)+1)
+	sb.Grow(64 + n*len(cols) + 1)
 	sb.WriteString(`INSERT INTO users (name, email, age, score, is_active, nickname, avatar, metadata, created_at) VALUES `)
 	for i := range n {
 		if i > 0 {

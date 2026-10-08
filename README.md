@@ -1707,6 +1707,9 @@ Recorded on Apple M3 Pro / darwin/arm64, SQLite `:memory:`, single connection. R
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+For suspected vulnerabilities, follow the [security policy](SECURITY.md) and
+avoid sharing sensitive details in public issues.
+
 ## License
 
 MIT License - see LICENSE file for details.

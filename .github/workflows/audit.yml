@@ -5,45 +5,125 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CGO_ENABLED: "1" # SQLite integration tests require CGO.
+  GOFLAGS: -mod=readonly
 
 jobs:
-
-  audit:
-    runs-on: ubuntu-22.04
+  quality:
+    name: Formatting and static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.sum
+            benchmarks/go.sum
+      - name: Check formatting
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.go')
+          unformatted=$(gofmt -l "${files[@]}")
+          if [[ -n "$unformatted" ]]; then
+            printf 'Run gofmt on:\n%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Install pinned analysis tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1 # 2026.2.1
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Validate GitHub workflows
+        run: actionlint
+      - name: Vet and analyze both Go modules
+        run: |
+          for module in . benchmarks; do
+            (
+              cd "$module"
+              go mod download
+              go mod verify
+              go vet ./...
+              staticcheck ./...
+            )
+          done
 
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.25.1
+  tests:
+    name: Tests (${{ matrix.module }}, Go ${{ matrix.go }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", benchmarks]
+        go: ["1.25.x", stable]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            go.sum
+            benchmarks/go.sum
+      - name: Verify dependencies
+        run: |
+          go mod download
+          go mod verify
+      - name: Build
+        run: go build ./...
+      - name: Test with race detection and coverage
+        run: go test -race -count=1 -timeout=5m -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Smoke-test benchmarks
+        if: matrix.module == 'benchmarks' && matrix.go == 'stable'
+        run: go test -run='^$' -bench=. -benchtime=1x -timeout=5m ./...
+      - name: Save coverage
+        if: matrix.module == '.' && matrix.go == 'stable'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload coverage to Codecov
+        if: matrix.module == '.' && matrix.go == 'stable' && github.event_name == 'push'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          disable_search: true
+          fail_ci_if_error: false
 
-    - name: Verify dependencies
-      run: go mod verify
-
-    - name: Build
-      run: go build -v ./...
-
-    - name: Run go vet
-      run: go vet ./...
-
-    - name: Install staticcheck
-      run: go install honnef.co/go/tools/cmd/staticcheck@latest
-
-    - name: Run staticcheck
-      run: staticcheck ./...
-
-    - name: Install golint
-      run: go install golang.org/x/lint/golint@latest
-
-    - name: Run golint
-      run: golint ./...
-
-    - name: Run tests
-      run: go test -race -vet=off -coverprofile=./coverage.out ./...
-
-    - name: Codecov
-      uses: codecov/codecov-action@v5
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        slug: rezakhademix/zorm
+  # Preserve the existing check name for branch protection, across all matrix jobs.
+  audit:
+    if: always()
+    needs: [quality, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all checks to pass
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: |
+          [[ "$QUALITY_RESULT" == success && "$TEST_RESULT" == success ]]
