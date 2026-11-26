@@ -2339,6 +2339,9 @@ func (m *Model[T]) syncPivot(ctx context.Context, entity *T, relation string, id
 		key := anyToKeyString(id)
 		currentIDs[key] = id
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	// 4. Determine Attach and Detach
 	var toAttach []any

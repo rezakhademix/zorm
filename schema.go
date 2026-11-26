@@ -344,7 +344,8 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 
 	// 2. Determine Primary Key
 	// Check if T implements PrimaryKey() string
-	if primaryKeyer, ok := ptrVal.Interface().(interface{ PrimaryKey() string }); ok {
+	primaryKeyer, hasCustomPrimaryKey := ptrVal.Interface().(interface{ PrimaryKey() string })
+	if hasCustomPrimaryKey {
 		info.PrimaryKey = primaryKeyer.PrimaryKey()
 	} else {
 		info.PrimaryKey = "id" // Default
@@ -360,6 +361,14 @@ func ParseModelType(typ reflect.Type) *ModelInfo {
 
 	// 3. Parse Fields (including embedded)
 	parseFields(typ, info, []int{})
+	// An explicit method overrides conventional ID fields and field tags.
+	// Keep the column metadata consistent with the key used in WHERE clauses.
+	if hasCustomPrimaryKey {
+		info.PrimaryKey = primaryKeyer.PrimaryKey()
+		for _, field := range info.OrderedFields {
+			field.IsPrimary = field.Column == info.PrimaryKey
+		}
+	}
 
 	// 4. Parse Accessors (Get methods) and Relation Methods
 	// We store valid methods for quick access during scanning and relation loading
