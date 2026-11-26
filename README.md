@@ -41,13 +41,6 @@ Run the command inside your application's Go module. Import ZORM with:
 import "github.com/rezakhademix/zorm"
 ```
 
-Examples are independent recipes: repeated model definitions show different
-configurations, rather than declarations to combine into one package. Short
-query examples assume `ctx := context.Background()` and a configured database.
-Add the fields and tables used by each recipe to your own schema. Handle every
-returned error before using its result; some original examples omit error
-handling to focus on the API.
-
 ### Contents
 
 - [Quick Start](#quick-start)
@@ -89,10 +82,6 @@ db, err := zorm.ConnectPostgres(
 
 zorm.GlobalDB = db
 ```
-
-Check `err` before configuring the global database. `ConnectPostgres` registers
-the pgx driver, opens a pool, and verifies connectivity. Close the pool when the
-application shuts down:
 
 ```go
 // Connect using a DSN from application configuration
