@@ -48,8 +48,10 @@ jobs:
           fi
       - name: Install pinned analysis tools
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1 # 2026.2.1
+          go version
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2 # 2026.2.2; supports Go 1.27.2+ export data.
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          staticcheck -version
       - name: Validate GitHub workflows
         run: actionlint
       - name: Vet and analyze both Go modules
