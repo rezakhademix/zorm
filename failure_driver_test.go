@@ -36,7 +36,7 @@ type failureConnector struct{ failure *failureDB }
 func (c failureConnector) Connect(context.Context) (driver.Conn, error) {
 	return &failureConn{c.failure}, nil
 }
-func (c failureConnector) Driver() driver.Driver { return failureDriver{c.failure} }
+func (c failureConnector) Driver() driver.Driver { return failureDriver(c) }
 
 type failureDriver struct{ failure *failureDB }
 
