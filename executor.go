@@ -1556,17 +1556,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		values = append(values, fVal.Interface())
 	}
 
-	sb := GetStringBuilder()
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(m.TableName())
-	sb.WriteString(" (")
-	sb.WriteString(strings.Join(columns, ", "))
-	sb.WriteString(") VALUES (")
-	writePlaceholdersWithSeparator(sb, len(columns), ", ")
-	sb.WriteString(") RETURNING ")
-	sb.WriteString(m.modelInfo.PrimaryKey)
-	query := sb.String()
-	PutStringBuilder(sb)
+	query := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, 1, m.effectiveDialect())
 
 	// 3. Execute and scan ID directly into the primary key field
 	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
@@ -1575,9 +1565,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	}
 
 	fVal := val.FieldByIndex(pkField.Index)
-	if !fVal.CanSet() {
-		return fmt.Errorf("cannot set primary key field %s", pkField.Name)
-	}
+	// Parsed fields are exported, and the caller supplies an addressable *T.
 
 	var err error
 	// Use prepared statement if caching is enabled
@@ -2266,6 +2254,12 @@ func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 // chunkSize math below catches that case).
 const bulkInsertMaxRowsPerStmt = 5000
 
+// Default-only rows bind no columns; otherwise respect the parameter budget,
+// while always allowing progress for a single unusually wide row.
+func bulkInsertChunkSize(columns int) int {
+	return max(1, min(maxInArgs/max(columns, 1), bulkInsertMaxRowsPerStmt))
+}
+
 // bulkInsertSQLCache memoizes finished INSERT SQL strings keyed by the
 // (table, columns, rowCount, dialect, pk) shape so the hot loop doesn't
 // rebuild the same multi-thousand-byte string per call.
@@ -2327,7 +2321,11 @@ func buildBulkInsertSQL(table, pk string, columns []string, numRows int, dialect
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
 	sb.WriteString(" (")
-	sb.WriteString(cols)
+	if len(columns) == 0 {
+		sb.WriteString(pk)
+	} else {
+		sb.WriteString(cols)
+	}
 	sb.WriteString(") VALUES ")
 
 	paramIdx := 0
@@ -2336,6 +2334,15 @@ func buildBulkInsertSQL(table, pk string, columns []string, numRows int, dialect
 			sb.WriteString(", ")
 		}
 		sb.WriteByte('(')
+		if len(columns) == 0 {
+			// DEFAULT invokes PostgreSQL's sequence; SQLite generates an
+			// integer primary key when its explicit value is NULL.
+			if dialect == DialectPostgres {
+				sb.WriteString("DEFAULT")
+			} else {
+				sb.WriteString("NULL")
+			}
+		}
 		for c := 0; c < len(columns); c++ {
 			if c > 0 {
 				sb.WriteString(", ")
@@ -2389,9 +2396,10 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 	// Auto-set created_at per entity (zero-only) before reading field values
 	// into the batch args slice. Same rules as Create.
 	for _, e := range entities {
-		if e != nil {
-			m.autoSetCreatedAt(e)
+		if e == nil {
+			return ErrNilPointer
 		}
+		m.autoSetCreatedAt(e)
 	}
 
 	// A batch that mixes set and unset auto primary keys cannot share one
@@ -2407,18 +2415,7 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 	// 2. Build Query
 	columns, fieldsToInsert := m.insertColumns(entities, skipPKScan)
 
-	// Determine chunk size based on Postgres limit of 65535 parameters.
-	numColumns := len(columns)
-	if numColumns == 0 {
-		numColumns = 1 // Safety to avoid division by zero
-	}
-
-	chunkSize := 65535 / numColumns
-	if chunkSize > bulkInsertMaxRowsPerStmt {
-		chunkSize = bulkInsertMaxRowsPerStmt
-	} else if chunkSize < 1 {
-		chunkSize = 1
-	}
+	chunkSize := bulkInsertChunkSize(len(columns))
 
 	if len(entities) <= chunkSize {
 		return m.createBatch(ctx, m.tx, entities, columns, fieldsToInsert)
@@ -2662,10 +2659,8 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 			fVal = val.FieldByIndex(pkField.Index)
 		}
 
-		if fVal.CanSet() {
-			if err := rows.Scan(fVal.Addr().Interface()); err != nil {
-				return err
-			}
+		if err := rows.Scan(fVal.Addr().Interface()); err != nil {
+			return err
 		}
 		idx++
 	}
@@ -3009,23 +3004,8 @@ func (m *Model[T]) bulkInsertGroup(ctx context.Context, entities []*T) error {
 
 	columns, fieldsToInsert := m.insertColumns(entities, false)
 
-	// Build INSERT query once
-	sb := GetStringBuilder()
-	sb.WriteString("INSERT INTO ")
-	sb.WriteString(m.TableName())
-	sb.WriteString(" (")
-	sb.WriteString(strings.Join(columns, ", "))
-	sb.WriteString(") VALUES (")
-	for i := range columns {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteByte('?')
-	}
-	sb.WriteString(") RETURNING ")
-	sb.WriteString(m.modelInfo.PrimaryKey)
-	insertQuery := rebind(sb.String())
-	PutStringBuilder(sb)
+	// Use the same default-value handling as Create and CreateMany.
+	insertQuery := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, 1, m.effectiveDialect())
 
 	// Get database connection for preparing
 	db := m.writeDB()
@@ -3066,16 +3046,9 @@ func (m *Model[T]) bulkInsertGroup(ctx context.Context, entities []*T) error {
 
 		// Execute and scan returned ID
 		fVal := val.FieldByIndex(pkField.Index)
-		if fVal.CanSet() {
-			err = stmt.QueryRowContext(ctx, args...).Scan(fVal.Addr().Interface())
-			if err != nil {
-				return WrapQueryError("INSERT", insertQuery, args, err)
-			}
-		} else {
-			_, err = stmt.ExecContext(ctx, args...)
-			if err != nil {
-				return WrapQueryError("INSERT", insertQuery, args, err)
-			}
+		err = stmt.QueryRowContext(ctx, args...).Scan(fVal.Addr().Interface())
+		if err != nil {
+			return WrapQueryError("INSERT", insertQuery, args, err)
 		}
 
 		// AfterCreate Hook (per-entity, prefers AfterCreateTx when implemented).

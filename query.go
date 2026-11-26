@@ -824,50 +824,15 @@ func (m *Model[T]) WhereHas(relation string, callback any) *Model[T] {
 }
 
 func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
-	// 1. Get relation configuration
-	var t T
-	modelType := reflect.TypeOf(t)
-	ptrType := reflect.PointerTo(modelType)
-
-	// Try finding method on ptrType or modelType
-	method, ok := ptrType.MethodByName(relation)
-	if !ok {
-		method, ok = modelType.MethodByName(relation)
-		if !ok {
-			// Try with "Relation" suffix
-			method, ok = ptrType.MethodByName(relation + "Relation")
-			if !ok {
-				method, ok = modelType.MethodByName(relation + "Relation")
-				if !ok {
-					return m // Relation method not found
-				}
-			}
-		}
-	}
-
-	// For whereHasInternal, we need to call the method.
-	// We use the zero value of the model.
-	res0 := reflect.ValueOf(t)
-	// If method is on pointer and res0 is not, we might need a pointer.
-	// But reflect.Value.MethodByName handles this if we use a pointer value.
-	ptrValue := reflect.New(modelType)
-	var methodVal reflect.Value
-	if method.Type.NumIn() > 0 && method.Type.In(0).Kind() == reflect.Pointer {
-		methodVal = ptrValue.MethodByName(method.Name)
-	} else {
-		methodVal = res0.MethodByName(method.Name)
-	}
-
+	// A pointer's method set includes both pointer and value receivers.
+	// Looking up the bound method directly handles both without a second
+	// type lookup or an unreachable receiver-conversion fallback.
+	parent := reflect.New(reflect.TypeFor[T]())
+	methodVal := parent.MethodByName(relation)
 	if !methodVal.IsValid() {
-		// Fallback: try calling via method.Func with receiver
-		if method.Type.NumIn() > 0 {
-			if method.Type.In(0).Kind() == reflect.Pointer {
-				retVals := method.Func.Call([]reflect.Value{ptrValue})
-				return m.applyWhereHas(retVals, subQuery)
-			}
-			retVals := method.Func.Call([]reflect.Value{res0})
-			return m.applyWhereHas(retVals, subQuery)
-		}
+		methodVal = parent.MethodByName(relation + "Relation")
+	}
+	if !methodVal.IsValid() {
 		return m
 	}
 
@@ -967,9 +932,6 @@ func extractQueryConstraints(query any) ([]string, []any) {
 	}
 
 	sqVal := reflect.ValueOf(query)
-	if !sqVal.IsValid() {
-		return nil, nil
-	}
 
 	// Try to get GetWheres and GetArgs methods
 	getWheres := sqVal.MethodByName("GetWheres")
