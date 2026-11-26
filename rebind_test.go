@@ -2,6 +2,29 @@ package zorm
 
 import "testing"
 
+func TestRebind_QuotedIdentifiers(t *testing.T) {
+	original := GetDialect()
+	SetDialect(DialectPostgres)
+	defer SetDialect(original)
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"question mark in identifier", `SELECT "column?" FROM "table?" WHERE id = ?`, `SELECT "column?" FROM "table?" WHERE id = $1`},
+		{"escaped double quote", `SELECT "escaped""?name" FROM users WHERE id = ?`, `SELECT "escaped""?name" FROM users WHERE id = $1`},
+		{"placeholders around identifier", `SELECT ?, "column?", ? FROM users`, `SELECT $1, "column?", $2 FROM users`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rebind(tt.input); got != tt.expected {
+				t.Errorf("rebind() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestRebind(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -5,10 +5,105 @@ import (
 	"database/sql"
 	"runtime"
 	"testing"
+	"time"
 	"weak"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+func TestFastEqual(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	sameTime := now.In(time.FixedZone("offset", 3600))
+	later := now.Add(time.Second)
+	intA, intB, intC := 1, 1, 2
+	int64A, int64B, int64C := int64(1), int64(1), int64(2)
+	stringA, stringB, stringC := "Alice", "Alice", "Bob"
+	boolA, boolB, boolC := true, true, false
+
+	tests := []struct {
+		name      string
+		a         any
+		b         any
+		different any
+	}{
+		{"int", int(1), int(1), int(2)},
+		{"int64", int64(1), int64(1), int64(2)},
+		{"int32", int32(1), int32(1), int32(2)},
+		{"int16", int16(1), int16(1), int16(2)},
+		{"int8", int8(1), int8(1), int8(2)},
+		{"uint", uint(1), uint(1), uint(2)},
+		{"uint64", uint64(1), uint64(1), uint64(2)},
+		{"uint32", uint32(1), uint32(1), uint32(2)},
+		{"uint16", uint16(1), uint16(1), uint16(2)},
+		{"uint8", uint8(1), uint8(1), uint8(2)},
+		{"float64", float64(1.5), float64(1.5), float64(2.5)},
+		{"float32", float32(1.5), float32(1.5), float32(2.5)},
+		{"string", "Alice", "Alice", "Bob"},
+		{"bool", true, true, false},
+		{"time in different zones", now, sameTime, later},
+		{"int pointer", &intA, &intB, &intC},
+		{"int64 pointer", &int64A, &int64B, &int64C},
+		{"string pointer", &stringA, &stringB, &stringC},
+		{"bool pointer", &boolA, &boolB, &boolC},
+		{"time pointer", &now, &sameTime, &later},
+		{"byte slice", []byte("Alice"), []byte("Alice"), []byte("Bob")},
+		{"map", map[string]int{"age": 20}, map[string]int{"age": 20}, map[string]int{"age": 21}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !fastEqual(tt.a, tt.b) || !fastEqual(tt.b, tt.a) {
+				t.Errorf("expected %v and %v to be equal", tt.a, tt.b)
+			}
+			if fastEqual(tt.a, tt.different) || fastEqual(tt.different, tt.a) {
+				t.Errorf("expected %v and %v to differ", tt.a, tt.different)
+			}
+		})
+	}
+}
+
+func TestFastEqual_NilAndDifferentTypes(t *testing.T) {
+	value := 1
+	int64Value := int64(1)
+	text := "Alice"
+	flag := true
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		a        any
+		b        any
+		expected bool
+	}{
+		{"both nil", nil, nil, true},
+		{"nil and value", nil, 1, false},
+		{"nil int pointers", (*int)(nil), (*int)(nil), true},
+		{"nil int64 pointers", (*int64)(nil), (*int64)(nil), true},
+		{"nil string pointers", (*string)(nil), (*string)(nil), true},
+		{"nil bool pointers", (*bool)(nil), (*bool)(nil), true},
+		{"nil time pointers", (*time.Time)(nil), (*time.Time)(nil), true},
+		{"nil and int pointer", (*int)(nil), &value, false},
+		{"nil and int64 pointer", (*int64)(nil), &int64Value, false},
+		{"nil and string pointer", (*string)(nil), &text, false},
+		{"nil and bool pointer", (*bool)(nil), &flag, false},
+		{"nil and time pointer", (*time.Time)(nil), &now, false},
+		{"different numeric types", int(1), int64(1), false},
+		{"pointer and value", &value, value, false},
+		{"different pointer types", &value, &int64Value, false},
+		{"nil interface and typed nil", nil, (*int)(nil), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fastEqual(tt.a, tt.b); got != tt.expected {
+				t.Errorf("fastEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.expected)
+			}
+			if got := fastEqual(tt.b, tt.a); got != tt.expected {
+				t.Errorf("fastEqual(%v, %v) = %v, want %v", tt.b, tt.a, got, tt.expected)
+			}
+		})
+	}
+}
 
 // DirtyUser is a test model for dirty tracking tests
 type DirtyUser struct {

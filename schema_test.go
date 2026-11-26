@@ -3,11 +3,44 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+func TestMustValidateColumnName(t *testing.T) {
+	MustValidateColumnName("users.id")
+	defer func() {
+		err, ok := recover().(error)
+		if !ok || !errors.Is(err, ErrInvalidColumnName) {
+			t.Errorf("expected panic with ErrInvalidColumnName, got %v", err)
+		}
+	}()
+	MustValidateColumnName("name; DROP TABLE users")
+}
+
+func TestFillStruct_UnknownColumnAndInvalidValue(t *testing.T) {
+	entity := &TestModel{Name: "Alice", Age: 20}
+	if err := fillStruct(entity, map[string]any{"unknown_column": "ignored"}); err != nil {
+		t.Fatalf("unknown column should be ignored: %v", err)
+	}
+	if entity.Name != "Alice" || entity.Age != 20 {
+		t.Error("unknown column should not change existing fields")
+	}
+	err := fillStruct(entity, map[string]any{"user_age": "invalid"})
+	if err == nil {
+		t.Fatal("expected an error for an invalid integer")
+	}
+	if !strings.Contains(err.Error(), "field Age (col user_age)") {
+		t.Errorf("conversion error should identify the field and column, got %v", err)
+	}
+	if entity.Age != 20 {
+		t.Errorf("failed conversion should preserve age 20, got %d", entity.Age)
+	}
+}
 
 func TestToSnakeCase(t *testing.T) {
 	tests := []struct {

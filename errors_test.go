@@ -4,8 +4,130 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestWrapQueryError_SQLState(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		expected error
+	}{
+		{"unique violation", "23505", ErrDuplicateKey},
+		{"foreign key violation", "23503", ErrForeignKey},
+		{"not null violation", "23502", ErrNotNullViolation},
+		{"check violation", "23514", ErrCheckViolation},
+		{"deadlock", "40P01", ErrTransactionDeadlock},
+		{"serialization failure", "40001", ErrSerializationFailure},
+		{"connection failure", "08006", ErrConnectionFailed},
+		{"connection does not exist", "08003", ErrConnectionFailed},
+		{"undefined column", "42703", ErrColumnNotFound},
+		{"undefined table", "42P01", ErrTableNotFound},
+		{"syntax error", "42601", ErrInvalidSyntax},
+		{"connection class", "08004", ErrConnectionFailed},
+		{"transaction class", "40003", ErrTransactionDeadlock},
+		{"syntax class", "42501", ErrInvalidSyntax},
+		{"unknown code", "XX000", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := &pgconn.PgError{Code: tt.code, Message: "database operation failed"}
+			args := []any{int64(1)}
+			err := WrapQueryError("SELECT", "SELECT name FROM users WHERE id = $1", args, fmt.Errorf("driver: %w", original))
+			qe := GetQueryError(err)
+			if qe == nil {
+				t.Fatalf("expected QueryError, got %T", err)
+			}
+			if qe.Operation != "SELECT" || qe.Query != "SELECT name FROM users WHERE id = $1" {
+				t.Errorf("query context was lost: %+v", qe)
+			}
+			if !reflect.DeepEqual(qe.Args, args) {
+				t.Errorf("expected args %v, got %v", args, qe.Args)
+			}
+			if tt.expected != nil {
+				if !errors.Is(err, tt.expected) {
+					t.Errorf("expected %v, got %v", tt.expected, err)
+				}
+			} else if !errors.Is(err, original) {
+				t.Error("unknown SQLSTATE should preserve the original error")
+			}
+		})
+	}
+}
+
+func TestWrapQueryError_MessageClassification(t *testing.T) {
+	tests := []struct {
+		name     string
+		message  string
+		expected error
+	}{
+		{"duplicate key", "UNIQUE constraint failed: users.email", ErrDuplicateKey},
+		{"foreign key", "FOREIGN KEY constraint failed", ErrForeignKey},
+		{"not null", "NOT NULL constraint failed: users.name", ErrNotNullViolation},
+		{"check", "CHECK constraint failed: positive_balance", ErrCheckViolation},
+		{"deadlock", "deadlock detected", ErrTransactionDeadlock},
+		{"serialization", "could not serialize access due to concurrent update", ErrSerializationFailure},
+		{"connection failed", "connect: connection refused", ErrConnectionFailed},
+		{"connection lost", "connection reset by peer", ErrConnectionLost},
+		{"timeout", "query timed out", ErrTimeout},
+		{"column", "no such column: missing", ErrColumnNotFound},
+		{"table", "no such table: missing", ErrTableNotFound},
+		{"syntax", "syntax error near SELECT", ErrInvalidSyntax},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := WrapQueryError("SELECT", "SELECT * FROM users", nil, errors.New(tt.message))
+			if !errors.Is(err, tt.expected) {
+				t.Errorf("expected %v, got %v", tt.expected, err)
+			}
+			qe := GetQueryError(err)
+			if qe == nil {
+				t.Fatalf("expected QueryError, got %T", err)
+			}
+			if !strings.Contains(qe.Error(), tt.message) {
+				t.Errorf("expected original message %q in %q", tt.message, qe.Error())
+			}
+		})
+	}
+}
+
+func TestWrapQueryError_ConstraintDetails(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{"PostgreSQL", `insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"`},
+		{"MySQL", "Cannot add or update a child row: table `orders`, CONSTRAINT `orders_user_id_fkey` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := WrapQueryError("INSERT", "INSERT INTO orders (user_id) VALUES (?)", []any{42}, errors.New(tt.message))
+			if !IsForeignKeyViolation(err) {
+				t.Fatalf("expected foreign key violation, got %v", err)
+			}
+			qe := GetQueryError(err)
+			if qe == nil {
+				t.Fatalf("expected QueryError, got %T", err)
+			}
+			if qe.Table != "orders" || qe.Constraint != "orders_user_id_fkey" {
+				t.Errorf("expected orders and orders_user_id_fkey, got table=%q constraint=%q", qe.Table, qe.Constraint)
+			}
+			for _, detail := range []string{"Table: orders", "Constraint: orders_user_id_fkey", "Args: [42]"} {
+				if !strings.Contains(qe.Error(), detail) {
+					t.Errorf("expected %q in %q", detail, qe.Error())
+				}
+			}
+		})
+	}
+}
 
 // =============================================================================
 // ERROR HELPER FUNCTION TESTS

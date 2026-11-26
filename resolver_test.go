@@ -6,6 +6,41 @@ import (
 	"testing"
 )
 
+func TestRandomLoadBalancer(t *testing.T) {
+	first, second := &sql.DB{}, &sql.DB{}
+	tests := []struct {
+		name     string
+		replicas []*sql.DB
+	}{
+		{"empty", nil},
+		{"single replica", []*sql.DB{first}},
+		{"multiple replicas", []*sql.DB{first, second}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lb := &RandomLoadBalancer{}
+			for i := 0; i < 10; i++ {
+				got := lb.Next(tt.replicas)
+				if len(tt.replicas) == 0 {
+					if got != nil {
+						t.Errorf("expected nil without replicas, got %v", got)
+					}
+					continue
+				}
+				found := false
+				for _, replica := range tt.replicas {
+					if got == replica {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("selected connection %p is not a configured replica", got)
+				}
+			}
+		})
+	}
+}
+
 // TestRoundRobinLoadBalancer tests the round-robin load balancing
 func TestRoundRobinLoadBalancer(t *testing.T) {
 	lb := &RoundRobinLoadBalancer{}
