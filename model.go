@@ -126,8 +126,8 @@ type Model[T any] struct {
 	// Statement Cache (optional)
 	stmtCache *StmtCache
 
-	// Omit columns for Update/Save operations
-	omitColumns map[string]bool
+	// Exclude columns for Update/Save operations
+	excludedColumns map[string]bool
 
 	// Tracking scope for batch operations with automatic cleanup
 	trackingScope *TrackingScope
@@ -315,7 +315,7 @@ func (m *Model[T]) reset() {
 		m.morphRelations = make(map[string]map[string][]string)
 	}
 
-	m.omitColumns = nil
+	m.excludedColumns = nil
 	m.trackingScope = nil
 	m.buildErr = nil
 	m.dialect = DialectAuto
@@ -430,10 +430,10 @@ func (m *Model[T]) Clone() *Model[T] {
 		}
 	}
 
-	// Copy omitColumns - only allocate if source has content
-	if len(m.omitColumns) > 0 {
-		newModel.omitColumns = make(map[string]bool, len(m.omitColumns))
-		maps.Copy(newModel.omitColumns, m.omitColumns)
+	// Copy excludedColumns - only allocate if source has content
+	if len(m.excludedColumns) > 0 {
+		newModel.excludedColumns = make(map[string]bool, len(m.excludedColumns))
+		maps.Copy(newModel.excludedColumns, m.excludedColumns)
 	}
 
 	// Copy tracking scope reference (scopes can be shared)

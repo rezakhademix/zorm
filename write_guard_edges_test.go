@@ -37,6 +37,28 @@ func TestWriteGuards_NilEntitiesAndVersionOverflow(t *testing.T) {
 	}
 }
 
+func TestWriteGuards_ExcludingAllColumnsDoesNotBypassValidation(t *testing.T) {
+	ctx := context.Background()
+	m := New[saveItem]().Exclude("name", "value")
+	if err := m.Update(ctx, nil); !errors.Is(err, ErrNilPointer) {
+		t.Errorf("nil Update should be rejected: %v", err)
+	}
+	if err := m.Save(ctx, nil); !errors.Is(err, ErrNilPointer) {
+		t.Errorf("nil Save should be rejected: %v", err)
+	}
+	entity := &saveItem{ID: 1, Name: "untracked"}
+	if err := m.Save(ctx, entity); !errors.Is(err, ErrSaveUntracked) {
+		t.Errorf("untracked Save should be rejected: %v", err)
+	}
+	invalid := m.Clone().Where("invalid;column", 1)
+	if err := invalid.Update(ctx, entity); !errors.Is(err, ErrInvalidColumnName) {
+		t.Errorf("invalid Update should be rejected: %v", err)
+	}
+	if err := invalid.Save(ctx, entity); !errors.Is(err, ErrInvalidColumnName) {
+		t.Errorf("invalid Save should be rejected: %v", err)
+	}
+}
+
 func TestPluckFailures_InvalidColumnsAndMalformedResult(t *testing.T) {
 	ctx := context.Background()
 	db := openFailureDB(t, &failureDB{columns: []string{"id", "value"}, values: [][]driver.Value{{int64(1), int64(2)}}})

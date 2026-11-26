@@ -325,13 +325,34 @@ if err != nil {
     return err
 }
 user.Name = "Jane Updated"
-err = zorm.New[User]().Omit("email", "created_at").Update(ctx, user)
+err = zorm.New[User]().Exclude("email", "created_at").Update(ctx, user)
 ```
 
 `UpdateColumns` also touches `updated_at` unless explicitly included in the
 column list. Passing no columns is a no-op. Pass database column names to
-`UpdateColumns` and `Omit`. `Omit` applies to `Update` and `Save`, rather than
-acting as an insert-field selector.
+`UpdateColumns` and `Exclude`. `Exclude` applies to `Update` and `Save`, rather
+than acting as an insert-field selector.
+
+`Exclude` also works with `Save`: excluded changes stay dirty and can be saved
+later through a builder without those exclusions. Repeated calls accumulate
+exclusions; use `Clone` to keep a shared base query unchanged. Unknown column
+names have no effect, so use the exact mapped database names.
+
+```go
+// Save the changed name while leaving the email change pending
+user, err := zorm.New[User]().Find(ctx, 42)
+if err != nil {
+    return err
+}
+user.Name = "Jane Updated"
+user.Email = "jane.updated@example.com"
+err = zorm.New[User]().Exclude("email").Save(ctx, user)
+```
+
+Exclusions prevent column writes, not in-memory changes made by update hooks
+or automatic timestamp handling. `Save` still manages its optimistic-lock
+version column. `UpdateColumns` uses its own explicit column list and does not
+apply exclusions.
 
 #### Deleting records
 
@@ -853,7 +874,7 @@ zorm.ClearOriginals(user)
 | -------------------------------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------ |
 | `CreateManyNewPK(ctx, entities)`                                                 | Insert rows known to have unset auto-generated keys   | [Fresh inserts](#fresh-inserts-and-atomic-batches)                 |
 | `UpdateColumns(ctx, entity, columns...)`                                         | Write an explicit column list by primary key          | [Selected fields](#updating-selected-fields-including-zero-values) |
-| `Omit(columns...)`                                                               | Exclude columns from `Update` or `Save`               | [Dirty tracking](#inspecting-dirty-fields-and-pending-changes)     |
+| `Exclude(columns...)`                                                            | Exclude columns from `Update` or `Save`               | [Dirty tracking](#inspecting-dirty-fields-and-pending-changes)     |
 | `ForceDeleteAll(ctx)`                                                            | Allow a delete without WHERE                          | [Deleting records](#deleting-records)                              |
 | `Cursor(ctx)`                                                                    | Stream mapped rows                                    | [Cursor](#cursor-memory-efficient-iteration)                       |
 | `Chunk(ctx, size, callback)`                                                     | Process batches using LIMIT/OFFSET                    | [Chunking](#chunking-large-datasets)                               |
@@ -2631,7 +2652,7 @@ fmt.Println(model.GetDirtyFields(user))
 
 // Save one change while leaving another change pending
 user.Email = "alice.updated@example.com"
-if err := model.Clone().Omit("email").Save(ctx, user); err != nil {
+if err := model.Clone().Exclude("email").Save(ctx, user); err != nil {
     return err
 }
 fmt.Println(model.IsDirtyField(user, "email"))   // true

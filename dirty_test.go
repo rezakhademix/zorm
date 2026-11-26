@@ -314,7 +314,7 @@ func TestUpdateColumns(t *testing.T) {
 	}
 }
 
-func TestOmit(t *testing.T) {
+func TestExclude(t *testing.T) {
 	db := setupDirtyDB(t)
 	defer db.Close()
 
@@ -342,10 +342,10 @@ func TestOmit(t *testing.T) {
 	loaded.Name = "Jane Doe"
 	loaded.Email = "jane@example.com"
 
-	// Update using Omit to exclude email
-	err = New[DirtyUser]().SetDB(db).Omit("email").Update(ctx, loaded)
+	// Update using Exclude to exclude email
+	err = New[DirtyUser]().SetDB(db).Exclude("email").Update(ctx, loaded)
 	if err != nil {
-		t.Fatalf("Failed to update with omit: %v", err)
+		t.Fatalf("Failed to update with Exclude: %v", err)
 	}
 
 	// Reload from DB
@@ -359,7 +359,7 @@ func TestOmit(t *testing.T) {
 		t.Errorf("Expected name to be 'Jane Doe', got '%s'", reloaded.Name)
 	}
 
-	// Verify email is still the original (omitted from update)
+	// Verify email is still the original (excluded from update)
 	if reloaded.Email != originalEmail {
 		t.Errorf("Expected email to remain '%s', got '%s'", originalEmail, reloaded.Email)
 	}
@@ -700,9 +700,9 @@ func setupDirtyDBWithUnique(t *testing.T) *sql.DB {
 	return db
 }
 
-// TestUpdateWithOmitPreventsUniqueConflict demonstrates that even with
-// the regular Update() method, using Omit() can prevent unique constraint issues.
-func TestUpdateWithOmitPreventsUniqueConflict(t *testing.T) {
+// TestUpdateWithExcludePreventsUniqueConflict demonstrates that even with
+// the regular Update() method, using Exclude() can prevent unique constraint issues.
+func TestUpdateWithExcludePreventsUniqueConflict(t *testing.T) {
 	db := setupDirtyDBWithUnique(t)
 	defer db.Close()
 
@@ -727,10 +727,10 @@ func TestUpdateWithOmitPreventsUniqueConflict(t *testing.T) {
 	// Only modify name
 	loaded.Name = "Jane Doe"
 
-	// Using Update() with Omit() to exclude the unique field
-	err = New[DirtyUserWithUnique]().SetDB(db).Omit("phone_number").Update(ctx, loaded)
+	// Using Update() with Exclude() to exclude the unique field
+	err = New[DirtyUserWithUnique]().SetDB(db).Exclude("phone_number").Update(ctx, loaded)
 	if err != nil {
-		t.Fatalf("Update with Omit should succeed: %v", err)
+		t.Fatalf("Update with Exclude should succeed: %v", err)
 	}
 
 	// Verify the update worked

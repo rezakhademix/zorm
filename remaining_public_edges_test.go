@@ -165,10 +165,10 @@ func TestDirtyTracking_PartialBaselineTreatsMissingValuesAsDirty(t *testing.T) {
 	}
 }
 
-func TestClone_OmitColumnsAreIndependent(t *testing.T) {
-	original := New[ExModel]().Omit("name")
-	clone := original.Clone().Omit("value")
-	if original.omitColumns["value"] || !clone.omitColumns["name"] || !clone.omitColumns["value"] {
-		t.Error("clone and original share omitted-column state")
+func TestClone_ExcludeColumnsAreIndependent(t *testing.T) {
+	original := New[ExModel]().Exclude("name")
+	clone := original.Clone().Exclude("value")
+	if original.excludedColumns["value"] || !clone.excludedColumns["name"] || !clone.excludedColumns["value"] {
+		t.Error("clone and original share excluded-column state")
 	}
 }

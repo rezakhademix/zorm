@@ -1266,19 +1266,22 @@ func (m *Model[T]) Print() (string, []any) {
 	return rebind(query), args
 }
 
-// Omit excludes columns from Update operations.
-// This is useful when you want to update most fields but exclude specific ones.
+// Exclude excludes columns from Update and Save operations.
+// Column names refer to database columns. Repeated calls add to the exclusions.
+// Excluded changes remain dirty so they can be saved through another model.
 //
 // Example:
 //
-//	err := model.Omit("phone_number", "address").Update(ctx, user)
+//	err := model.Exclude("phone_number", "address").Update(ctx, user)
 //	// Updates all fields EXCEPT phone_number and address
-func (m *Model[T]) Omit(columns ...string) *Model[T] {
-	if m.omitColumns == nil {
-		m.omitColumns = make(map[string]bool)
+//	err = model.Exclude("email").Save(ctx, user)
+//	// Saves dirty fields EXCEPT phone_number, address, and email
+func (m *Model[T]) Exclude(columns ...string) *Model[T] {
+	if m.excludedColumns == nil {
+		m.excludedColumns = make(map[string]bool)
 	}
 	for _, col := range columns {
-		m.omitColumns[col] = true
+		m.excludedColumns[col] = true
 	}
 	return m
 }
