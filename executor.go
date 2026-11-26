@@ -1659,8 +1659,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			continue
 		}
 
-		// Skip omitted columns
-		if m.omitColumns != nil && m.omitColumns[field.Column] {
+		// Skip excluded columns
+		if m.excludedColumns != nil && m.excludedColumns[field.Column] {
 			continue
 		}
 
@@ -1731,7 +1731,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
-	// Omitted and skipped columns retain their previous baseline.
+	// Excluded and skipped columns retain their previous baseline.
 	syncOriginalColumns(entity, m.modelInfo, writtenColumns)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
@@ -1979,9 +1979,9 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		}
 	}
 
-	// Drop omitted columns and the version column (it is managed separately).
+	// Drop excluded columns and the version column (it is managed separately).
 	for col := range dirty {
-		if m.omitColumns != nil && m.omitColumns[col] {
+		if m.excludedColumns != nil && m.excludedColumns[col] {
 			delete(dirty, col)
 		}
 	}
@@ -2097,7 +2097,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		setInt64Version(vVal, loadedVersion+1)
 	}
 
-	// Keep omitted changes pending, and include the managed version increment.
+	// Keep excluded changes pending, and include the managed version increment.
 	if hasVersion {
 		cols = append(cols, m.modelInfo.VersionField.Column)
 	}

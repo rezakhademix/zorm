@@ -473,8 +473,8 @@ func TestSave_Dirty_BaselineRefreshedBetweenRounds(t *testing.T) {
 	}
 }
 
-// 3. Omit() must drop columns from Save even when they are dirty.
-func TestSave_Dirty_OmitDropsDirtyColumn(t *testing.T) {
+// 3. Exclude() must drop columns from Save even when they are dirty.
+func TestSave_Dirty_ExcludeDropsDirtyColumn(t *testing.T) {
 	db := setupComplexDB(t)
 	defer db.Close()
 
@@ -486,15 +486,15 @@ func TestSave_Dirty_OmitDropsDirtyColumn(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	// Marker on score; we WILL mutate score in memory but Omit it on Save.
+	// Marker on score; we WILL mutate score in memory but Exclude it on Save.
 	if _, err := db.Exec(`UPDATE complex_items SET score = 1234 WHERE id = 2`); err != nil {
 		t.Fatalf("marker: %v", err)
 	}
 
 	row.Name = "Kept"
-	row.Score = 9999 // dirty in memory but will be omitted
+	row.Score = 9999 // dirty in memory but will be excluded
 
-	if err := m.Omit("score").Save(ctx, row); err != nil {
+	if err := m.Exclude("score").Save(ctx, row); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -506,7 +506,7 @@ func TestSave_Dirty_OmitDropsDirtyColumn(t *testing.T) {
 		t.Errorf("Name = %q, want Kept", fresh.Name)
 	}
 	if fresh.Score != 1234 {
-		t.Errorf("Score = %d, want 1234 (Omit must exclude even dirty columns)", fresh.Score)
+		t.Errorf("Score = %d, want 1234 (Exclude must exclude even dirty columns)", fresh.Score)
 	}
 }
 

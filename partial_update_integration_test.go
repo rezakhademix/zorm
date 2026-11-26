@@ -9,7 +9,7 @@ import (
 )
 
 func TestPartialUpdate_ExecutionPaths(t *testing.T) {
-	for _, operation := range []string{"UpdateColumns", "UpdateOmit", "SaveOmit"} {
+	for _, operation := range []string{"UpdateColumns", "UpdateExclude", "SaveExclude"} {
 		for _, mode := range []string{"direct", "cached", "transaction", "cached transaction"} {
 			for _, pending := range []int{0, 999} {
 				t.Run(operation+"/"+mode+"/"+strconv.Itoa(pending), func(t *testing.T) {
@@ -33,10 +33,10 @@ func TestPartialUpdate_ExecutionPaths(t *testing.T) {
 						switch operation {
 						case "UpdateColumns":
 							return model.UpdateColumns(ctx, entity, "name")
-						case "UpdateOmit":
-							return model.Clone().Omit("value").Update(ctx, entity)
+						case "UpdateExclude":
+							return model.Clone().Exclude("value").Update(ctx, entity)
 						default:
-							return model.Clone().Omit("value").Save(ctx, entity)
+							return model.Clone().Exclude("value").Save(ctx, entity)
 						}
 					}
 					if mode == "transaction" || mode == "cached transaction" {
@@ -122,7 +122,7 @@ func TestPartialUpdate_ColumnSelection(t *testing.T) {
 }
 
 func TestPartialUpdate_UntrackedEntity(t *testing.T) {
-	for _, operation := range []string{"UpdateColumns", "UpdateOmit", "UpdateAll", "UpdateColumnsAll"} {
+	for _, operation := range []string{"UpdateColumns", "UpdateExclude", "UpdateAll", "UpdateColumnsAll"} {
 		t.Run(operation, func(t *testing.T) {
 			db := setupSaveDB(t)
 			defer db.Close()
@@ -134,8 +134,8 @@ func TestPartialUpdate_UntrackedEntity(t *testing.T) {
 			switch operation {
 			case "UpdateColumns":
 				err = m.UpdateColumns(ctx, entity, "name")
-			case "UpdateOmit":
-				err = m.Clone().Omit("value").Update(ctx, entity)
+			case "UpdateExclude":
+				err = m.Clone().Exclude("value").Update(ctx, entity)
 			case "UpdateAll":
 				err = m.Update(ctx, entity)
 			case "UpdateColumnsAll":
@@ -157,7 +157,7 @@ func TestPartialUpdate_UntrackedEntity(t *testing.T) {
 }
 
 func TestPartialUpdate_FailurePreservesBaseline(t *testing.T) {
-	for _, operation := range []string{"UpdateColumns", "UpdateOmit", "SaveOmit"} {
+	for _, operation := range []string{"UpdateColumns", "UpdateExclude", "SaveExclude"} {
 		for _, failure := range []string{"constraint", "canceled", "prepare"} {
 			t.Run(operation+"/"+failure, func(t *testing.T) {
 				db := setupSaveDB(t)
@@ -190,10 +190,10 @@ func TestPartialUpdate_FailurePreservesBaseline(t *testing.T) {
 				switch operation {
 				case "UpdateColumns":
 					err = m.UpdateColumns(ctx, entity, "name")
-				case "UpdateOmit":
-					err = m.Omit("value").Update(ctx, entity)
-				case "SaveOmit":
-					err = m.Omit("value").Save(ctx, entity)
+				case "UpdateExclude":
+					err = m.Exclude("value").Update(ctx, entity)
+				case "SaveExclude":
+					err = m.Exclude("value").Save(ctx, entity)
 				}
 				if err == nil {
 					t.Fatal("expected write failure")
@@ -249,7 +249,7 @@ func TestPartialUpdate_TimestampsAndVersion(t *testing.T) {
 			t.Errorf("explicit timestamp or excluded name mishandled: %v", m.GetDirtyFields(entity))
 		}
 	})
-	t.Run("managed version and omitted data", func(t *testing.T) {
+	t.Run("managed version and excluded data", func(t *testing.T) {
 		db := setupSaveDB(t)
 		defer db.Close()
 		ctx := context.Background()
@@ -260,11 +260,11 @@ func TestPartialUpdate_TimestampsAndVersion(t *testing.T) {
 		}
 		defer ClearOriginals(entity)
 		entity.Name, entity.Value = "changed", 999
-		if err := m.Clone().Omit("value").Save(ctx, entity); err != nil {
+		if err := m.Clone().Exclude("value", "version").Save(ctx, entity); err != nil {
 			t.Fatal(err)
 		}
 		if entity.Version != 2 || GetOriginal(entity, "version") != int64(2) || !m.IsDirtyField(entity, "value") {
-			t.Errorf("version or omitted baseline incorrect: %v", GetOriginals(entity))
+			t.Errorf("version or excluded baseline incorrect: %v", GetOriginals(entity))
 		}
 		if err := m.Save(ctx, entity); err != nil {
 			t.Fatal(err)
@@ -302,65 +302,74 @@ func (item *partialHookItem) AfterUpdate(context.Context) error {
 }
 
 func TestPartialUpdate_HookMutationsAndErrors(t *testing.T) {
-	for _, stage := range []string{"before", "after"} {
-		for _, rejects := range []bool{false, true} {
-			name := stage + "/success"
-			if rejects {
-				name = stage + "/error"
-			}
-			t.Run(name, func(t *testing.T) {
-				db := setupSaveDB(t)
-				defer db.Close()
-				ctx := context.Background()
-				m := New[partialHookItem]().SetDB(db)
-				entity, err := m.Find(ctx, 1)
-				if err != nil {
-					t.Fatal(err)
+	for _, operation := range []string{"UpdateColumns", "UpdateExclude", "SaveExclude"} {
+		for _, stage := range []string{"before", "after"} {
+			for _, rejects := range []bool{false, true} {
+				name := stage + "/success"
+				if rejects {
+					name = stage + "/error"
 				}
-				defer ClearOriginals(entity)
-				entity.Name = "changed"
-				rejection := errors.New("hook rejected update")
-				hook := func(item *partialHookItem) error {
-					item.Name, item.Value = "hook name", 999
-					if rejects {
-						return rejection
+				t.Run(operation+"/"+name, func(t *testing.T) {
+					db := setupSaveDB(t)
+					defer db.Close()
+					ctx := context.Background()
+					m := New[partialHookItem]().SetDB(db)
+					entity, err := m.Find(ctx, 1)
+					if err != nil {
+						t.Fatal(err)
 					}
-					return nil
-				}
-				if stage == "before" {
-					entity.Before = hook
-				} else {
-					entity.After = hook
-				}
-				err = m.UpdateColumns(ctx, entity, "name")
-				if rejects && !errors.Is(err, rejection) || !rejects && err != nil {
-					t.Fatalf("unexpected hook error: %v", err)
-				}
-				if !m.IsDirtyField(entity, "value") || GetOriginal(entity, "value") != 10 {
-					t.Error("hook mutation to excluded column was marked clean")
-				}
-				var storedName string
-				if err := db.QueryRow(`SELECT name FROM save_items WHERE id = 1`).Scan(&storedName); err != nil {
-					t.Fatal(err)
-				}
-				wantName := "hook name"
-				if stage == "after" {
-					wantName = "changed"
-				} else if rejects {
-					wantName = "A"
-				}
-				if storedName != wantName || GetOriginal(entity, "name") != wantName {
-					t.Errorf("persisted name and baseline differ: stored=%q original=%v want=%q", storedName, GetOriginal(entity, "name"), wantName)
-				}
-				entity.Before, entity.After = nil, nil
-				if err := m.Save(ctx, entity); err != nil {
-					t.Fatal(err)
-				}
-				var storedValue int
-				if err := db.QueryRow(`SELECT name, value FROM save_items WHERE id = 1`).Scan(&storedName, &storedValue); err != nil || storedName != "hook name" || storedValue != 999 || m.HasDirtyFields(entity) {
-					t.Fatalf("Save lost hook mutation: name=%q value=%d err=%v", storedName, storedValue, err)
-				}
-			})
+					defer ClearOriginals(entity)
+					entity.Name = "changed"
+					rejection := errors.New("hook rejected update")
+					hook := func(item *partialHookItem) error {
+						item.Name, item.Value = "hook name", 999
+						if rejects {
+							return rejection
+						}
+						return nil
+					}
+					if stage == "before" {
+						entity.Before = hook
+					} else {
+						entity.After = hook
+					}
+					switch operation {
+					case "UpdateColumns":
+						err = m.UpdateColumns(ctx, entity, "name")
+					case "UpdateExclude":
+						err = m.Clone().Exclude("value").Update(ctx, entity)
+					case "SaveExclude":
+						err = m.Clone().Exclude("value").Save(ctx, entity)
+					}
+					if rejects && !errors.Is(err, rejection) || !rejects && err != nil {
+						t.Fatalf("unexpected hook error: %v", err)
+					}
+					if !m.IsDirtyField(entity, "value") || GetOriginal(entity, "value") != 10 {
+						t.Error("hook mutation to excluded column was marked clean")
+					}
+					var storedName string
+					if err := db.QueryRow(`SELECT name FROM save_items WHERE id = 1`).Scan(&storedName); err != nil {
+						t.Fatal(err)
+					}
+					wantName := "hook name"
+					if stage == "after" {
+						wantName = "changed"
+					} else if rejects {
+						wantName = "A"
+					}
+					if storedName != wantName || GetOriginal(entity, "name") != wantName {
+						t.Errorf("persisted name and baseline differ: stored=%q original=%v want=%q", storedName, GetOriginal(entity, "name"), wantName)
+					}
+					entity.Before, entity.After = nil, nil
+					if err := m.Save(ctx, entity); err != nil {
+						t.Fatal(err)
+					}
+					var storedValue int
+					if err := db.QueryRow(`SELECT name, value FROM save_items WHERE id = 1`).Scan(&storedName, &storedValue); err != nil || storedName != "hook name" || storedValue != 999 || m.HasDirtyFields(entity) {
+						t.Fatalf("Save lost hook mutation: name=%q value=%d err=%v", storedName, storedValue, err)
+					}
+				})
+			}
 		}
 	}
 }
@@ -380,33 +389,45 @@ func (item *partialTxHookItem) BeforeUpdateTx(ctx context.Context, tx *Tx) error
 }
 
 func TestPartialUpdate_AutoTransactionHook(t *testing.T) {
-	db := setupSaveDB(t)
-	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE partial_audit (message TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	m := New[partialTxHookItem]().SetDB(db)
-	entity, err := m.Find(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ClearOriginals(entity)
-	entity.Name = "changed"
-	if err := m.UpdateColumns(ctx, entity, "name"); err != nil {
-		t.Fatal(err)
-	}
-	if !m.IsDirtyField(entity, "value") || GetOriginal(entity, "value") != 10 {
-		t.Error("auto-transaction hook lost excluded mutation")
-	}
-	if err := m.Save(ctx, entity); err != nil {
-		t.Fatal(err)
-	}
-	var stored, auditCount int
-	if err := db.QueryRow(`SELECT value FROM save_items WHERE id = 1`).Scan(&stored); err != nil || stored != 999 {
-		t.Fatalf("pending hook value lost: %d, err=%v", stored, err)
-	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM partial_audit`).Scan(&auditCount); err != nil || auditCount != 2 {
-		t.Fatalf("hook writes did not commit: count=%d, err=%v", auditCount, err)
+	for _, operation := range []string{"UpdateColumns", "UpdateExclude", "SaveExclude"} {
+		t.Run(operation, func(t *testing.T) {
+			db := setupSaveDB(t)
+			defer db.Close()
+			if _, err := db.Exec(`CREATE TABLE partial_audit (message TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			m := New[partialTxHookItem]().SetDB(db)
+			entity, err := m.Find(ctx, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ClearOriginals(entity)
+			entity.Name = "changed"
+			switch operation {
+			case "UpdateColumns":
+				err = m.UpdateColumns(ctx, entity, "name")
+			case "UpdateExclude":
+				err = m.Clone().Exclude("value").Update(ctx, entity)
+			case "SaveExclude":
+				err = m.Clone().Exclude("value").Save(ctx, entity)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !m.IsDirtyField(entity, "value") || GetOriginal(entity, "value") != 10 {
+				t.Error("auto-transaction hook lost excluded mutation")
+			}
+			if err := m.Save(ctx, entity); err != nil {
+				t.Fatal(err)
+			}
+			var stored, auditCount int
+			if err := db.QueryRow(`SELECT value FROM save_items WHERE id = 1`).Scan(&stored); err != nil || stored != 999 {
+				t.Fatalf("pending hook value lost: %d, err=%v", stored, err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM partial_audit`).Scan(&auditCount); err != nil || auditCount != 2 {
+				t.Fatalf("hook writes did not commit: count=%d, err=%v", auditCount, err)
+			}
+		})
 	}
 }

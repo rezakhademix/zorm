@@ -39,7 +39,7 @@ func TestPartialUpdate_ExcludedChangesRemainDirty(t *testing.T) {
 	}
 }
 
-func TestPartialUpdate_OmittedChangesRemainDirty(t *testing.T) {
+func TestPartialUpdate_ExcludePreservesPendingChanges(t *testing.T) {
 	for _, operation := range []string{"Update", "Save"} {
 		t.Run(operation, func(t *testing.T) {
 			db := setupSaveDB(t)
@@ -52,7 +52,7 @@ func TestPartialUpdate_OmittedChangesRemainDirty(t *testing.T) {
 			}
 			defer ClearOriginals(entity)
 			entity.Name, entity.Value = "changed", 999
-			partial := New[saveItem]().SetDB(db).Omit("value")
+			partial := New[saveItem]().SetDB(db).Exclude("value")
 			if operation == "Update" {
 				err = partial.Update(ctx, entity)
 			} else {
@@ -62,7 +62,7 @@ func TestPartialUpdate_OmittedChangesRemainDirty(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !m.IsDirtyField(entity, "value") {
-				t.Error("omitted value must remain dirty")
+				t.Error("excluded value must remain dirty")
 			}
 			if err := m.Save(ctx, entity); err != nil {
 				t.Fatal(err)
@@ -72,7 +72,7 @@ func TestPartialUpdate_OmittedChangesRemainDirty(t *testing.T) {
 				t.Fatal(err)
 			}
 			if stored != 999 {
-				t.Errorf("Save lost omitted change: stored %d, want 999", stored)
+				t.Errorf("Save lost excluded change: stored %d, want 999", stored)
 			}
 		})
 	}
