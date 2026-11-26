@@ -171,7 +171,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrDuplicateKey, err),
+			Err:       fmt.Errorf("%w: %w", ErrDuplicateKey, err),
 		}
 		extractConstraintInfo(qe, err.Error())
 		return qe
@@ -182,7 +182,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrForeignKey, err),
+			Err:       fmt.Errorf("%w: %w", ErrForeignKey, err),
 		}
 		extractConstraintInfo(qe, err.Error())
 		return qe
@@ -193,7 +193,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrNotNullViolation, err),
+			Err:       fmt.Errorf("%w: %w", ErrNotNullViolation, err),
 		}
 		extractConstraintInfo(qe, err.Error())
 		return qe
@@ -204,7 +204,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrCheckViolation, err),
+			Err:       fmt.Errorf("%w: %w", ErrCheckViolation, err),
 		}
 		extractConstraintInfo(qe, err.Error())
 		return qe
@@ -216,7 +216,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrTransactionDeadlock, err),
+			Err:       fmt.Errorf("%w: %w", ErrTransactionDeadlock, err),
 		}
 	}
 
@@ -226,7 +226,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrSerializationFailure, err),
+			Err:       fmt.Errorf("%w: %w", ErrSerializationFailure, err),
 		}
 	}
 
@@ -236,7 +236,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrConnectionFailed, err),
+			Err:       fmt.Errorf("%w: %w", ErrConnectionFailed, err),
 		}
 	}
 
@@ -245,7 +245,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrConnectionLost, err),
+			Err:       fmt.Errorf("%w: %w", ErrConnectionLost, err),
 		}
 	}
 
@@ -254,7 +254,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrTimeout, err),
+			Err:       fmt.Errorf("%w: %w", ErrTimeout, err),
 		}
 	}
 
@@ -264,7 +264,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrColumnNotFound, err),
+			Err:       fmt.Errorf("%w: %w", ErrColumnNotFound, err),
 		}
 	}
 
@@ -273,7 +273,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrTableNotFound, err),
+			Err:       fmt.Errorf("%w: %w", ErrTableNotFound, err),
 		}
 	}
 
@@ -282,7 +282,7 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 			Query:     query,
 			Args:      args,
 			Operation: operation,
-			Err:       fmt.Errorf("%w: %v", ErrInvalidSyntax, err),
+			Err:       fmt.Errorf("%w: %w", ErrInvalidSyntax, err),
 		}
 	}
 
@@ -386,7 +386,7 @@ func wrapBySQLState(operation, query string, args []any, err error, sqlState str
 	}
 
 	if sentinelErr != nil {
-		qe.Err = fmt.Errorf("%w: %v", sentinelErr, err)
+		qe.Err = fmt.Errorf("%w: %w", sentinelErr, err)
 	}
 
 	// Extract constraint info for all PostgreSQL errors

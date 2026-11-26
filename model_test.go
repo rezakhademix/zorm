@@ -3,12 +3,100 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestReset_DropsOversizedState(t *testing.T) {
+	m := New[TestModel]()
+	info := m.modelInfo
+	m.columns = make([]string, maxPooledSliceCap+1)
+	m.wheres = make([]string, maxPooledSliceCap+1)
+	m.args = make([]any, maxPooledSliceCap+1)
+	for i := 0; i <= maxPooledSliceCap; i++ {
+		name := fmt.Sprintf("relation_%d", i)
+		m.relationCallbacks[name] = func(*Model[TestModel]) {}
+		m.morphRelations[name] = map[string][]string{"type": {"Nested"}}
+	}
+
+	m.reset()
+
+	if cap(m.columns) != 0 || cap(m.wheres) != 0 || cap(m.args) != 0 {
+		t.Error("reset should discard oversized query slices")
+	}
+	if m.relationCallbacks == nil || len(m.relationCallbacks) != 0 {
+		t.Error("reset should replace oversized relation callback maps with an empty map")
+	}
+	if m.morphRelations == nil || len(m.morphRelations) != 0 {
+		t.Error("reset should replace oversized morph relation maps with an empty map")
+	}
+	if m.modelInfo != info {
+		t.Error("reset should preserve model metadata")
+	}
+}
+
+func TestClone_IsolatesGroupingState(t *testing.T) {
+	original := New[TestModel]().DistinctBy("name").GroupBy("name").Having("COUNT(*) > ?", 2)
+	clone := original.Clone()
+	if len(clone.groupBys) != 1 || len(clone.havings) != 1 || len(clone.havingArgs) != 1 || len(clone.distinctOn) != 1 {
+		t.Fatal("clone should preserve grouping, having, and distinct state")
+	}
+	clone.groupBys[0] = "id"
+	clone.havings[0] = "COUNT(*) < ?"
+	clone.havingArgs[0] = 10
+	clone.distinctOn[0] = "id"
+
+	if original.groupBys[0] != "name" || original.havings[0] != "COUNT(*) > ?" || original.havingArgs[0] != 2 || original.distinctOn[0] != "name" {
+		t.Error("changing clone grouping state should not change the original")
+	}
+}
+
+func TestClone_IsolatesRawArgs(t *testing.T) {
+	original := New[TestModel]().Raw("SELECT ? AS name", "Alice")
+	clone := original.Clone()
+	if clone.rawQuery != original.rawQuery || len(clone.rawArgs) != 1 || clone.rawArgs[0] != "Alice" {
+		t.Fatal("clone should preserve the raw query and arguments")
+	}
+	clone.rawArgs[0] = "Bob"
+	if original.rawArgs[0] != "Alice" {
+		t.Error("changing clone raw arguments should not change the original")
+	}
+}
+
+func TestConfigureConnectionPool_Settings(t *testing.T) {
+	db, _ := newRecordingDB()
+	defer db.Close()
+	ConfigureConnectionPool(db, 3, 2, time.Hour, time.Minute)
+
+	first, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to acquire first connection: %v", err)
+	}
+	defer first.Close()
+	second, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to acquire second connection: %v", err)
+	}
+	defer second.Close()
+	first.Close()
+	second.Close()
+
+	if stats := db.Stats(); stats.MaxOpenConnections != 3 || stats.Idle != 2 {
+		t.Errorf("expected max open 3 and idle 2, got %+v", stats)
+	}
+	ConfigureConnectionPool(db, 0, -1, 0, 0)
+	if stats := db.Stats(); stats.MaxOpenConnections != 3 || stats.Idle != 2 {
+		t.Errorf("unspecified settings should preserve the pool configuration, got %+v", stats)
+	}
+	ConfigureConnectionPool(db, 3, 0, time.Hour, time.Minute)
+	if stats := db.Stats(); stats.Idle != 0 {
+		t.Errorf("expected no idle connections after disabling idle pooling, got %d", stats.Idle)
+	}
+}
 
 // contextKey is a custom type for context keys to avoid collisions
 type contextKey string

@@ -1662,6 +1662,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	numFields := len(m.modelInfo.Fields)
 	sets := make([]string, 0, numFields)
 	values := make([]any, 0, numFields+1) // +1 for PK value
+	writtenColumns := make([]string, 0, numFields)
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -1686,6 +1687,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 
 		sets = append(sets, field.Column+" = ?")
 		values = append(values, fieldVal.Interface())
+		writtenColumns = append(writtenColumns, field.Column)
 	}
 
 	// Everything dropped out (a model whose only writable column is
@@ -1741,8 +1743,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
-	// Sync originals after successful update to mark entity as clean
-	syncOriginals(entity, m.modelInfo)
+	// Omitted and skipped columns retain their previous baseline.
+	syncOriginalColumns(entity, m.modelInfo, writtenColumns)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {
@@ -1754,6 +1756,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 
 // UpdateColumns updates only the specified columns of the entity.
 // This is useful when you want explicit control over which columns are updated.
+// Only written columns are marked clean; excluded changes remain pending.
+// A partial write on an untracked entity does not establish a baseline for Save.
 //
 // Example:
 //
@@ -1810,6 +1814,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	// Build UPDATE with specified columns
 	var sets []string
 	var values []any
+	var writtenColumns []string
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -1829,6 +1834,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 
 		sets = append(sets, column+" = ?")
 		values = append(values, fieldVal.Interface())
+		writtenColumns = append(writtenColumns, column)
 	}
 
 	if len(sets) == 0 {
@@ -1875,8 +1881,8 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
 
-	// Sync originals after successful update
-	syncOriginals(entity, m.modelInfo)
+	// Only columns that reached SET are now clean.
+	syncOriginalColumns(entity, m.modelInfo, writtenColumns)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {
@@ -2103,8 +2109,11 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		setInt64Version(vVal, loadedVersion+1)
 	}
 
-	// Refresh originals so subsequent Save() sees the new clean baseline.
-	syncOriginals(entity, m.modelInfo)
+	// Keep omitted changes pending, and include the managed version increment.
+	if hasVersion {
+		cols = append(cols, m.modelInfo.VersionField.Column)
+	}
+	syncOriginalColumns(entity, m.modelInfo, cols)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {

@@ -119,6 +119,44 @@ func setupHookReadDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestHook_Cursor_AfterFindAndAccessors(t *testing.T) {
+	db := setupHookReadDB(t)
+	defer db.Close()
+	scope := NewTrackingScope()
+	defer scope.Close()
+	ctx := context.WithValue(context.Background(), hookReadTenantKey, "cursor-tenant")
+	cursor, err := New[HookReadBook]().SetDB(db).WithTrackingScope(scope).
+		OrderBy("id", "ASC").Cursor(ctx)
+	if err != nil {
+		t.Fatalf("Cursor failed: %v", err)
+	}
+	defer cursor.Close()
+
+	count := 0
+	for cursor.Next() {
+		book, err := cursor.Scan(ctx)
+		if err != nil {
+			t.Fatalf("Scan failed: %v", err)
+		}
+		count++
+		if book.AfterFindCalls != 1 || book.SeenTenant != "cursor-tenant" {
+			t.Errorf("expected one hook call with caller context, got %+v", book)
+		}
+		if got := book.Attributes["slug"]; got != "slug-"+book.Title {
+			t.Errorf("expected computed slug for %q, got %v", book.Title, got)
+		}
+		if !IsTracked(book) || GetOriginal(book, "title") != book.Title {
+			t.Errorf("book %d: expected original title to be tracked", book.ID)
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		t.Fatalf("cursor iteration failed: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 books, got %d", count)
+	}
+}
+
 // ---- AfterFind receives the caller's context ----
 
 func TestHook_AfterFind_ReceivesCallerContext(t *testing.T) {

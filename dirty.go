@@ -2,7 +2,6 @@ package zorm
 
 import (
 	"container/list"
-	"maps"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -473,7 +472,7 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 
 	for _, field := range modelInfo.Fields {
 		fVal := val.FieldByIndex(field.Index)
-		originals[field.Column] = fVal.Interface()
+		originals[field.Column] = snapshotValue(fVal.Interface())
 	}
 
 	key := getEntityKey(entity)
@@ -487,6 +486,86 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 	}
 }
 
+// snapshotValue detaches mutable column values from the entity. A shallow copy
+// would let in-place pointer, slice, or map edits also change the baseline.
+func snapshotValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	return cloneSnapshot(reflect.ValueOf(value), make(map[snapshotVisit]reflect.Value)).Interface()
+}
+
+type snapshotVisit struct {
+	typ reflect.Type
+	ptr uintptr
+	len int // Slices sharing a start address can have different lengths.
+}
+
+func cloneSnapshot(v reflect.Value, seen map[snapshotVisit]reflect.Value) reflect.Value {
+	// Treat time as a value, preserving its location and monotonic clock data.
+	if v.Type() == reflect.TypeFor[time.Time]() {
+		return v
+	}
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Slice, reflect.Map:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		visit := snapshotVisit{typ: v.Type(), ptr: uintptr(v.UnsafePointer())}
+		if v.Kind() == reflect.Slice {
+			visit.len = v.Len()
+		}
+		if previous, ok := seen[visit]; ok {
+			return previous
+		}
+		var result reflect.Value
+		switch v.Kind() {
+		case reflect.Pointer:
+			result = reflect.New(v.Type().Elem()).Convert(v.Type())
+			seen[visit] = result
+			result.Elem().Set(cloneSnapshot(v.Elem(), seen))
+		case reflect.Slice:
+			result = reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+			seen[visit] = result
+			for i := 0; i < v.Len(); i++ {
+				result.Index(i).Set(cloneSnapshot(v.Index(i), seen))
+			}
+		case reflect.Map:
+			result = reflect.MakeMapWithSize(v.Type(), v.Len())
+			seen[visit] = result
+			iter := v.MapRange()
+			for iter.Next() {
+				// Keys retain their identity, as required by Go map equality.
+				result.SetMapIndex(iter.Key(), cloneSnapshot(iter.Value(), seen))
+			}
+		}
+		return result
+	case reflect.Interface:
+		result := reflect.New(v.Type()).Elem()
+		if !v.IsNil() {
+			result.Set(cloneSnapshot(v.Elem(), seen))
+		}
+		return result
+	case reflect.Struct:
+		result := reflect.New(v.Type()).Elem()
+		result.Set(v)
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).IsExported() {
+				result.Field(i).Set(cloneSnapshot(v.Field(i), seen))
+			}
+		}
+		return result
+	case reflect.Array:
+		result := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			result.Index(i).Set(cloneSnapshot(v.Index(i), seen))
+		}
+		return result
+	default:
+		return v
+	}
+}
+
 // ClearOriginals removes tracking for an entity.
 // Should be called when entity is deleted or no longer needed to prevent memory leaks.
 func ClearOriginals[T any](entity *T) {
@@ -497,6 +576,7 @@ func ClearOriginals[T any](entity *T) {
 }
 
 // GetOriginal returns the original value of a field before any modifications.
+// Mutable values are returned as detached copies.
 // Returns nil if the entity is not tracked or field doesn't exist.
 func GetOriginal[T any](entity *T, column string) any {
 	if entity == nil {
@@ -505,14 +585,14 @@ func GetOriginal[T any](entity *T, column string) any {
 
 	if originals, ok := globalTracker.Load().Load(getEntityKey(entity), entity); ok {
 		if orig, exists := originals[column]; exists {
-			return orig
+			return snapshotValue(orig)
 		}
 	}
 	return nil
 }
 
 // GetOriginals returns all original values for the entity.
-// Returns a copy to prevent external modification of tracking data.
+// Returns detached copies to prevent external modification of tracking data.
 func GetOriginals[T any](entity *T) map[string]any {
 	if entity == nil {
 		return nil
@@ -520,7 +600,9 @@ func GetOriginals[T any](entity *T) map[string]any {
 
 	if originals, ok := globalTracker.Load().Load(getEntityKey(entity), entity); ok {
 		result := make(map[string]any, len(originals))
-		maps.Copy(result, originals)
+		for column, value := range originals {
+			result[column] = snapshotValue(value)
+		}
 		return result
 	}
 	return nil
@@ -608,9 +690,42 @@ func IsTracked[T any](entity *T) bool {
 
 // syncOriginals updates the stored originals to match current values.
 // Call after a successful save to mark entity as clean.
-// This is called automatically by Update and UpdateColumns after successful execution.
 func syncOriginals[T any](entity *T, modelInfo *ModelInfo) {
 	trackOriginals(entity, modelInfo)
+}
+
+// syncOriginalColumns marks only persisted columns clean. Excluded values must
+// retain their previous baseline so a later Save can still write them.
+func syncOriginalColumns[T any](entity *T, modelInfo *ModelInfo, columns []string) {
+	originals, tracked := globalTracker.Load().Load(getEntityKey(entity), entity)
+	if !tracked {
+		// A partial write cannot establish a safe baseline for an entity whose
+		// other values were never loaded. A full write can, as Update always did.
+		written := make(map[string]bool, len(columns))
+		for _, column := range columns {
+			written[column] = true
+		}
+		for _, field := range modelInfo.Fields {
+			if !field.IsPrimary && !written[field.Column] {
+				return
+			}
+		}
+		syncOriginals(entity, modelInfo)
+		return
+	}
+
+	// Replace the map instead of mutating it: readers can still hold the old
+	// baseline after the tracker's lock has been released.
+	next := make(map[string]any, len(originals))
+	for column, value := range originals {
+		next[column] = value
+	}
+	val := reflect.ValueOf(entity).Elem()
+	for _, column := range columns {
+		field := modelInfo.Columns[column]
+		next[column] = snapshotValue(val.FieldByIndex(field.Index).Interface())
+	}
+	globalTracker.Load().Store(getEntityKey(entity), next, weakRef[T]{p: weak.Make(entity)})
 }
 
 // hasDirtyFields returns true if any non-primary field has changed.

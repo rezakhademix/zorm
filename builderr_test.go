@@ -22,6 +22,13 @@ func TestModelBuilder_InvalidInputSetsBuildErr(t *testing.T) {
 		name  string
 		build func() *Model[TestModel]
 	}{
+		{"DistinctBy", func() *Model[TestModel] { return New[TestModel]().DistinctBy(badColumn) }},
+		{"WhereNull", func() *Model[TestModel] { return New[TestModel]().WhereNull(badColumn) }},
+		{"OrWhereNull", func() *Model[TestModel] { return New[TestModel]().OrWhereNull(badColumn) }},
+		{"WhereNotNull", func() *Model[TestModel] { return New[TestModel]().WhereNotNull(badColumn) }},
+		{"OrWhereNotNull", func() *Model[TestModel] { return New[TestModel]().OrWhereNotNull(badColumn) }},
+		{"CrossJoin", func() *Model[TestModel] { return New[TestModel]().CrossJoin(badColumn) }},
+		{"Join right column", func() *Model[TestModel] { return New[TestModel]().Join("posts", "id", "=", badColumn) }},
 		{"OrderBy column", func() *Model[TestModel] { return New[TestModel]().OrderBy(badColumn, "ASC") }},
 		{"OrderBy direction", func() *Model[TestModel] { return New[TestModel]().OrderBy("name", "DROP") }},
 		{"GroupBy", func() *Model[TestModel] { return New[TestModel]().GroupBy("status", badColumn) }},
