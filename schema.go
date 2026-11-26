@@ -800,6 +800,13 @@ func setFieldValue(field reflect.Value, value any) error {
 		return nil
 	}
 
+	// Older Go versions do not consider slices with defined uint8 element
+	// types convertible to strings. Handle every byte-slice type explicitly.
+	if field.Kind() == reflect.String && val.Kind() == reflect.Slice && valType.Elem().Kind() == reflect.Uint8 {
+		field.SetString(string(val.Bytes()))
+		return nil
+	}
+
 	// Type Conversion
 	if valType.ConvertibleTo(fieldType) {
 		field.Set(val.Convert(fieldType))
@@ -809,8 +816,6 @@ func setFieldValue(field reflect.Value, value any) error {
 	// Common conversions (e.g. int64 -> int, []byte -> string)
 	switch field.Kind() {
 	case reflect.String:
-		// Byte slices, including named byte types, already take the
-		// ConvertibleTo path above.
 		// Fallback to fmt.Sprint
 		field.SetString(fmt.Sprint(value))
 		return nil
