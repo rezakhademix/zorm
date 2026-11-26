@@ -753,10 +753,6 @@ func fillStruct[T any](entity *T, data map[string]any) error {
 		// Get field value using Index (supports embedded structs)
 		fieldVal := val.FieldByIndex(fieldInfo.Index)
 
-		if !fieldVal.CanSet() {
-			continue
-		}
-
 		// Set value with conversion
 		if err := setFieldValue(fieldVal, valData); err != nil {
 			return fmt.Errorf("failed to set field %s (col %s): %w", fieldInfo.Name, colName, err)
@@ -813,11 +809,8 @@ func setFieldValue(field reflect.Value, value any) error {
 	// Common conversions (e.g. int64 -> int, []byte -> string)
 	switch field.Kind() {
 	case reflect.String:
-		if val.Kind() == reflect.Slice && valType.Elem().Kind() == reflect.Uint8 {
-			// []byte to string
-			field.SetString(string(val.Bytes()))
-			return nil
-		}
+		// Byte slices, including named byte types, already take the
+		// ConvertibleTo path above.
 		// Fallback to fmt.Sprint
 		field.SetString(fmt.Sprint(value))
 		return nil

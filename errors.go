@@ -637,7 +637,7 @@ func formatArgs(args []any) string {
 	// Limit output length
 	result := "[" + strings.Join(parts, ", ") + "]"
 	if len(result) > 200 {
-		return result[:197] + "...]"
+		return result[:196] + "...]"
 	}
 	return result
 }

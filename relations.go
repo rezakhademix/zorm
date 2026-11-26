@@ -428,10 +428,8 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 		}
 
 		// Call the method to get the relation config
+		// ParseModel cached only methods returning exactly one Relation.
 		retVals := methodVal.Call(nil)
-		if len(retVals) == 0 {
-			return fmt.Errorf("relation method %s must return a value", relName)
-		}
 
 		relConfig := retVals[0].Interface()
 
@@ -1534,6 +1532,9 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	relatedInfo := ParseModelType(relatedType)
 
 	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Pointer {
+		valConfig = valConfig.Elem()
+	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(modelType.Name()) + "_id"

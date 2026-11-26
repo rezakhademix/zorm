@@ -618,6 +618,10 @@ func isDirty[T any](entity *T, column string, modelInfo *ModelInfo) bool {
 	if entity == nil {
 		return false
 	}
+	field, ok := modelInfo.Columns[column]
+	if !ok {
+		return false
+	}
 
 	// Load also touches the LRU entry, preventing eviction of actively-used entities
 	orig, ok := globalTracker.Load().Load(getEntityKey(entity), entity)
@@ -628,11 +632,6 @@ func isDirty[T any](entity *T, column string, modelInfo *ModelInfo) bool {
 	original, exists := orig[column]
 	if !exists {
 		return true // Column not in originals
-	}
-
-	field, ok := modelInfo.Columns[column]
-	if !ok {
-		return false
 	}
 
 	current := reflect.ValueOf(entity).Elem().FieldByIndex(field.Index).Interface()

@@ -12,6 +12,8 @@ import (
 // failureDB exercises database/sql's real statement, row, and transaction paths
 // while allowing failures that SQLite cannot reliably produce on demand.
 type failureDB struct {
+	pingErr                                                         error
+	onClose                                                         func()
 	prepareErr, queryErr, execErr, beginErr, commitErr, rollbackErr error
 	iterationErr, affectedErr                                       error
 	columns                                                         []string
@@ -53,7 +55,13 @@ func (c *failureConn) Prepare(query string) (driver.Stmt, error) {
 	}
 	return &failureStmt{failure: c.failure, query: query}, nil
 }
-func (*failureConn) Close() error { return nil }
+func (c *failureConn) Close() error {
+	if c.failure.onClose != nil {
+		c.failure.onClose()
+	}
+	return nil
+}
+func (c *failureConn) Ping(context.Context) error { return c.failure.pingErr }
 func (c *failureConn) Begin() (driver.Tx, error) {
 	if c.failure.onBegin != nil {
 		c.failure.onBegin()
