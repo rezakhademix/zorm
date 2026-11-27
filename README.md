@@ -1631,7 +1631,8 @@ unchanged, since retrying could not resolve it.
 
 Use search attributes backed by a database unique constraint. `values` are
 defaults only for `FirstOrCreate`; an existing row is returned unchanged.
-`UpdateOrCreate` applies `values` even when the row already exists. Supply
+`UpdateOrCreate` applies only the columns in `values` (plus the automatic
+`updated_at` timestamp) when the row already exists. Supply
 explicit values for required columns on the creation path.
 
 ```go
@@ -2723,7 +2724,7 @@ err := zorm.New[User]().Save(ctx, user)
 
 `Save` requires:
 
-- a non-zero primary key on the entity (use `Create` to insert); and
+- a non-zero, unchanged primary key on the entity (use `Create` to insert); and
 - a dirty-tracking baseline, i.e. the entity must have been loaded via
   `Find` / `First` / `Get`. A manually-constructed entity is rejected with
   `ErrSaveUntracked` so it cannot silently rewrite columns to zero values.
@@ -3027,6 +3028,8 @@ err := zorm.Transaction(ctx, func(tx *zorm.Tx) error {
 ```
 
 The accepted modes are `UPDATE`, `NO KEY UPDATE`, `SHARE`, and `KEY SHARE`.
+Outside a transaction, these reads use the resolver's primary even if
+`UseReplica` was requested.
 `SKIP LOCKED` and `NOWAIT` are not accepted by `Lock`; use trusted raw SQL
 within a transaction when needed. Locking syntax is PostgreSQL-specific;
 SQLite uses different concurrency controls.
@@ -3087,7 +3090,8 @@ err := zorm.New[User]().Chunk(ctx, 1000, func(users []*User) error {
 })
 ```
 
-Use a positive chunk size and stable ordering. `Chunk` uses LIMIT/OFFSET,
+Use a positive chunk size and stable ordering. A non-positive size returns
+an error before any query or callback runs. `Chunk` uses LIMIT/OFFSET,
 overrides its cloned query's limit/offset for each batch, and stops when the
 callback returns an error or the final batch is exhausted. Modifying the
 rows used by the filter while iterating can shift offsets and skip rows.

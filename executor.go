@@ -46,8 +46,8 @@ func (m *Model[T]) queryer() interface {
 
 // resolveDB determines which database connection to use based on resolver configuration.
 func (m *Model[T]) resolveDB(resolver *DBResolver) *sql.DB {
-	// Manual override: force primary
-	if m.forcePrimary {
+	// Row locks require the primary, regardless of replica preferences.
+	if m.forcePrimary || m.lockMode != "" {
 		return resolver.Primary()
 	}
 
@@ -1209,9 +1209,16 @@ func (m *Model[T]) applyUpdateValues(ctx context.Context, entity *T, values map[
 	if err := fillStruct(entity, values); err != nil {
 		return nil, err
 	}
-	// Update() writes all fields of the struct, matching the pre-existing
-	// behavior of this path.
-	if err := m.Update(ctx, entity); err != nil {
+	// Only supplied columns belong to this write. A projected lookup may
+	// leave other fields zero, and a full lookup may contain stale values.
+	// Keep Update's hooks, timestamp handling, and caller exclusions.
+	q := m.Clone()
+	for _, field := range m.modelInfo.OrderedFields {
+		if _, supplied := values[field.Column]; !supplied && field.Column != "updated_at" {
+			q.Exclude(field.Column)
+		}
+	}
+	if err := q.Update(ctx, entity); err != nil {
 		return nil, err
 	}
 	return entity, nil
@@ -1899,7 +1906,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 // the maximum value of its field type.
 //
 // Save requires:
-//   - a non-zero primary key on entity (use Create for inserts);
+//   - a non-zero, unchanged primary key on entity (use Create for inserts);
 //   - a dirty-tracking baseline, established by loading the entity via
 //     Find / First / Get. A manually-constructed entity is rejected with
 //     ErrSaveUntracked to prevent silent full-column rewrites that would
@@ -1953,6 +1960,13 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	// after to observe any such mutations.
 	if err := m.callBeforeUpdate(ctx, entity); err != nil {
 		return err
+	}
+
+	// The baseline belongs to the loaded row. Check identity after the hook,
+	// since BeforeUpdate may have changed the primary key.
+	pkVal = val.FieldByIndex(pkField.Index).Interface()
+	if !fastEqual(originals[pkField.Column], pkVal) {
+		return fmt.Errorf("zorm: %w: Save requires unchanged primary key %s", ErrInvalidModel, pkField.Column)
 	}
 
 	var loadedVersion int64
@@ -2852,6 +2866,9 @@ func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targe
 	// Pre-allocate args: 2 per CASE entry + 1 for updated_at + existing WHERE args + IN args
 	args := make([]any, 0, len(keys)*3+1+len(m.args))
 	lookupKeys := make([]any, 0, len(keys))
+
+	// CTE arguments precede the CASE values and WHERE arguments in every batch.
+	args = append(args, m.buildWithClause(sb)...)
 
 	// Build: UPDATE table SET target = CASE lookup
 	sb.WriteString("UPDATE ")

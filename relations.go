@@ -1251,9 +1251,11 @@ func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo
 
 	// Apply callback constraints
 	if constraints != nil {
-		for _, w := range constraints.wheres {
-			where.WriteString(" ")
-			where.WriteString(w)
+		if len(constraints.wheres) > 0 {
+			// Callback OR branches must not bypass the relation's key or type.
+			where.WriteString(" AND (")
+			writeWhereConditions(&where, constraints.wheres)
+			where.WriteByte(')')
 		}
 		args = append(args, constraints.args...)
 	}
@@ -1353,9 +1355,11 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 
 	// Apply callback constraints
 	if constraints != nil {
-		for _, w := range constraints.wheres {
-			where.WriteString(" ")
-			where.WriteString(w)
+		if len(constraints.wheres) > 0 {
+			// Callback OR branches must not bypass the relation's key or type.
+			where.WriteString(" AND (")
+			writeWhereConditions(&where, constraints.wheres)
+			where.WriteByte(')')
 		}
 		args = append(args, constraints.args...)
 	}
