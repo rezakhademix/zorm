@@ -18,8 +18,9 @@ type Tx struct {
 // transactionState retains the first baseline for each entity touched by a
 // managed transaction. A rollback restores it; an uncertain outcome invalidates it.
 type transactionState struct {
-	mu        sync.Mutex
-	originals map[uintptr]func(bool)
+	mu          sync.Mutex
+	originals   map[uintptr]func(bool)
+	callerOwned bool
 }
 
 func (s *transactionState) remember(key uintptr, restore func(bool)) {
@@ -29,6 +30,20 @@ func (s *transactionState) remember(key uintptr, restore func(bool)) {
 		if _, exists := s.originals[key]; !exists {
 			s.originals[key] = restore
 		}
+	}
+}
+
+// mergeInto transfers successful savepoint changes to the enclosing transaction.
+func (s *transactionState) mergeInto(parent *transactionState) {
+	if parent == nil {
+		return
+	}
+	s.mu.Lock()
+	originals := s.originals
+	s.originals = nil
+	s.mu.Unlock()
+	for key, restore := range originals {
+		parent.remember(key, restore)
 	}
 }
 

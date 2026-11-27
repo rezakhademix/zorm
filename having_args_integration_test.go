@@ -118,15 +118,12 @@ func TestHavingArgs_ModelTerminals(t *testing.T) {
 				t.Fatalf("Pluck = %v, %v", values, err)
 			}
 			count, err := q.Count(ctx)
-			if err != nil || count != 1 {
-				t.Fatalf("Count = %d, %v, want 1", count, err)
+			if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+				t.Fatalf("expected grouped aggregate rejection, got Count=%d, err=%v", count, err)
 			}
 			page, err := q.Paginate(ctx, 1, 10)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if page.Total != 1 || len(page.Data) != 1 || page.Data[0].Role != "admin" {
-				t.Fatalf("Paginate = %+v", page)
+			if !errors.Is(err, ErrGroupedAggregateRequiresGet) || page != nil {
+				t.Fatalf("expected grouped aggregate rejection, got Paginate=%+v, err=%v", page, err)
 			}
 			cursor, err := q.Cursor(ctx)
 			if err != nil {
@@ -150,10 +147,10 @@ func TestHavingArgs_ModelTerminals(t *testing.T) {
 	if err != nil || value != "admin" {
 		t.Fatalf("scalar First = %q, %v", value, err)
 	}
-	// Scalar Count returns the number of groups that satisfy HAVING.
+	// Scalar Count follows the same grouped-query rejection as Model.Count.
 	count, err := scalar.Count(ctx)
-	if err != nil || count != 1 {
-		t.Fatalf("scalar Count = %d, %v, want 1", count, err)
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+		t.Fatalf("expected grouped aggregate rejection, got scalar Count=%d, err=%v", count, err)
 	}
 }
 
@@ -173,8 +170,8 @@ func TestHavingArgs_CTEAndNestedWhere(t *testing.T) {
 		t.Fatalf("Get = %v, %v", rows, err)
 	}
 	count, err := q.Count(context.Background())
-	if err != nil || count != 1 {
-		t.Fatalf("Count = %d, %v, want 1", count, err)
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+		t.Fatalf("expected grouped aggregate rejection, got Count=%d, err=%v", count, err)
 	}
 }
 

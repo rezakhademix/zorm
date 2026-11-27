@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -66,7 +67,7 @@ type recordingConn struct {
 
 func (c *recordingConn) Prepare(query string) (driver.Stmt, error) {
 	c.log.record(query)
-	return &recordingStmt{}, nil
+	return &recordingStmt{query: query}, nil
 }
 
 func (c *recordingConn) Close() error { return nil }
@@ -78,7 +79,7 @@ type recordingTx struct{}
 func (recordingTx) Commit() error   { return nil }
 func (recordingTx) Rollback() error { return nil }
 
-type recordingStmt struct{}
+type recordingStmt struct{ query string }
 
 func (recordingStmt) Close() error { return nil }
 
@@ -90,26 +91,31 @@ func (recordingStmt) Exec([]driver.Value) (driver.Result, error) {
 	return driver.RowsAffected(1), nil
 }
 
-func (recordingStmt) Query([]driver.Value) (driver.Rows, error) {
-	return &recordingRows{}, nil
+func (s recordingStmt) Query([]driver.Value) (driver.Rows, error) {
+	count := 1
+	if strings.HasPrefix(s.query, "INSERT INTO ") {
+		count += strings.Count(s.query, "), (")
+	}
+	return &recordingRows{remaining: count}, nil
 }
 
-// recordingRows yields a single id row, which is what the INSERT ... RETURNING
-// id paths need in order to reach their normal completion.
+// recordingRows yields one id per input row for INSERT ... RETURNING paths.
 type recordingRows struct {
-	done bool
+	remaining int
+	next      int64
 }
 
 func (*recordingRows) Columns() []string { return []string{"id"} }
 func (*recordingRows) Close() error      { return nil }
 
 func (r *recordingRows) Next(dest []driver.Value) error {
-	if r.done {
+	if r.remaining == 0 {
 		return io.EOF
 	}
-	r.done = true
+	r.remaining--
+	r.next++
 	if len(dest) > 0 {
-		dest[0] = int64(1)
+		dest[0] = r.next
 	}
 	return nil
 }

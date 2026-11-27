@@ -221,7 +221,13 @@ func newLRUTracker(capacity int) *lruTracker {
 
 // getShard returns the shard for the given key.
 func (t *lruTracker) getShard(key uintptr) *lruTrackerShard {
-	return t.shards[key%shardCount]
+	// Pointer alignment leaves the low bits constant for many entity sizes.
+	// Mix the whole address before selecting a shard.
+	hash := uint64(key)
+	hash = (hash ^ (hash >> 30)) * 0xbf58476d1ce4e5b9
+	hash = (hash ^ (hash >> 27)) * 0x94d049bb133111eb
+	hash ^= hash >> 31
+	return t.shards[hash%shardCount]
 }
 
 // Store adds or updates tracking data for an entity. ref identifies the entity
@@ -290,15 +296,20 @@ func (t *lruTracker) Load(key uintptr, entity any) (map[string]any, bool) {
 // transaction. Its commit/rollback is invisible to ZORM, so it cannot be reused
 // outside that transaction without reloading the entity.
 func (t *lruTracker) LoadForTransaction(key uintptr, entity any, tx *sql.Tx) (map[string]any, bool) {
+	originals, _, ok := t.loadTransactionBaseline(key, entity, tx)
+	return originals, ok
+}
+
+func (t *lruTracker) loadTransactionBaseline(key uintptr, entity any, tx *sql.Tx) (map[string]any, *sql.Tx, bool) {
 	shard := t.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	entry, exists := shard.items[key]
 	if !exists || (entry.ref != nil && !entry.ref.matches(entity)) || (entry.tx != nil && entry.tx != tx) {
-		return nil, false
+		return nil, nil, false
 	}
 	shard.lruList.MoveToFront(entry.element)
-	return entry.originals, true
+	return entry.originals, entry.tx, true
 }
 
 func (t *lruTracker) BindTransaction(key uintptr, entity any, tx *sql.Tx) {
@@ -521,7 +532,7 @@ func (m *Model[T]) rememberOriginals(entity *T) {
 		return
 	}
 	key := getEntityKey(entity)
-	originals, tracked := globalTracker.Load().LoadForTransaction(key, entity, m.tx)
+	originals, originalTx, tracked := globalTracker.Load().loadTransactionBaseline(key, entity, m.tx)
 	ref := weakRef[T]{p: weak.Make(entity)}
 	m.txState.remember(key, func(rolledBack bool) {
 		if !rolledBack || !tracked {
@@ -529,6 +540,7 @@ func (m *Model[T]) rememberOriginals(entity *T) {
 			return
 		}
 		globalTracker.Load().Store(key, originals, ref)
+		globalTracker.Load().BindTransaction(key, entity, originalTx)
 		if field := m.modelInfo.VersionField; field != nil {
 			if version, ok := originals[field.Column]; ok {
 				reflect.ValueOf(entity).Elem().FieldByIndex(field.Index).Set(reflect.ValueOf(version))
@@ -548,7 +560,7 @@ func (m *Model[T]) trackOriginals(entity *T) {
 // bindOriginals keeps caller-owned transaction baselines usable for repeated
 // writes inside that transaction, while Save rejects them outside it.
 func (m *Model[T]) bindOriginals(entity *T) {
-	if m.tx != nil && m.txState == nil {
+	if m.tx != nil && (m.txState == nil || m.txState.callerOwned) {
 		globalTracker.Load().BindTransaction(getEntityKey(entity), entity, m.tx)
 	}
 }

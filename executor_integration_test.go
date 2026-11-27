@@ -1444,21 +1444,14 @@ func setupExDBDuplicates(t *testing.T) *sql.DB {
 	return db
 }
 
-// TestCount_WithGroupBy verifies that Count() with GroupBy returns the number
-// of distinct groups, not the count within the first group.
+// TestCount_WithGroupBy verifies that grouped scalar counts require Get.
 func TestCount_WithGroupBy(t *testing.T) {
 	db := setupExDBDuplicates(t)
 	defer db.Close()
 
-	ctx := context.Background()
-	count, err := New[ExModel]().SetDB(db).GroupBy("name").Count(ctx)
-	if err != nil {
-		t.Fatalf("Count with GroupBy failed: %v", err)
-	}
-
-	// 3 distinct groups: A, B, C
-	if count != 3 {
-		t.Errorf("expected count 3 (number of groups), got %d", count)
+	count, err := New[ExModel]().SetDB(db).GroupBy("name").Count(context.Background())
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+		t.Errorf("expected grouped aggregate rejection, got count=%d, err=%v", count, err)
 	}
 }
 
@@ -1480,49 +1473,32 @@ func TestCount_WithDistinct(t *testing.T) {
 	}
 }
 
-// TestCount_WithGroupByAndHaving verifies that Count() with GroupBy and Having
-// only counts groups that match the Having condition.
+// TestCount_WithGroupByAndHaving verifies that HAVING cannot bypass rejection.
 func TestCount_WithGroupByAndHaving(t *testing.T) {
 	db := setupExDBDuplicates(t)
 	defer db.Close()
 
-	ctx := context.Background()
 	count, err := New[ExModel]().SetDB(db).
 		GroupBy("name").
 		Having("COUNT(*) > ?", 1).
-		Count(ctx)
-	if err != nil {
-		t.Fatalf("Count with GroupBy and Having failed: %v", err)
-	}
-
-	// Groups with COUNT(*) > 1: A (2 rows), B (2 rows) -> 2 groups
-	if count != 2 {
-		t.Errorf("expected count 2 (groups with >1 member), got %d", count)
+		Count(context.Background())
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+		t.Errorf("expected grouped aggregate rejection, got count=%d, err=%v", count, err)
 	}
 }
 
-// TestPaginate_WithGroupBy verifies that Paginate correctly computes Total
-// as the number of distinct groups when GroupBy is applied.
+// TestPaginate_WithGroupBy verifies that pagination propagates Count's rejection.
 func TestPaginate_WithGroupBy(t *testing.T) {
 	db := setupExDBDuplicates(t)
 	defer db.Close()
 
-	ctx := context.Background()
 	result, err := New[ExModel]().SetDB(db).
 		Select("name").
 		GroupBy("name").
 		OrderBy("name", "ASC").
-		Paginate(ctx, 1, 10)
-	if err != nil {
-		t.Fatalf("Paginate with GroupBy failed: %v", err)
-	}
-
-	// Total should reflect number of groups (3), not total rows (5)
-	if result.Total != 3 {
-		t.Errorf("expected Total 3 (number of groups), got %d", result.Total)
-	}
-	if len(result.Data) != 3 {
-		t.Errorf("expected 3 data items, got %d", len(result.Data))
+		Paginate(context.Background(), 1, 10)
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || result != nil {
+		t.Errorf("expected grouped aggregate rejection, got result=%+v, err=%v", result, err)
 	}
 }
 

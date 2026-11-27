@@ -13,6 +13,10 @@ var (
 	// ErrRecordNotFound is returned when a query returns no results
 	ErrRecordNotFound = errors.New("zorm: record not found")
 
+	// ErrGroupedAggregateRequiresGet is returned when scalar aggregation uses
+	// GroupBy or Having. Select aggregate expressions and call Get instead.
+	ErrGroupedAggregateRequiresGet = errors.New("zorm: scalar aggregates do not support GroupBy or Having; use Select(...).Get(...)")
+
 	// ErrInvalidModel Model errors
 	// ErrInvalidModel is returned when the model type is invalid
 	ErrInvalidModel = errors.New("zorm: invalid model")

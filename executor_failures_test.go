@@ -21,6 +21,8 @@ func TestReadFailures_PropagateDriverErrors(t *testing.T) {
 		{"Count", func(m *Model[ExModel]) error { _, err := m.Count(ctx); return err }},
 		{"Sum", func(m *Model[ExModel]) error { _, err := m.Sum(ctx, "value"); return err }},
 		{"Avg", func(m *Model[ExModel]) error { _, err := m.Avg(ctx, "value"); return err }},
+		{"Min", func(m *Model[ExModel]) error { _, err := m.Min(ctx, "value"); return err }},
+		{"Max", func(m *Model[ExModel]) error { _, err := m.Max(ctx, "value"); return err }},
 		{"Exists", func(m *Model[ExModel]) error { _, err := m.Exists(ctx); return err }},
 		{"FirstOrCreate", func(m *Model[ExModel]) error {
 			_, err := m.FirstOrCreate(ctx, map[string]any{"name": "A"}, nil)

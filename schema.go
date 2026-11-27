@@ -791,6 +791,19 @@ func fillStruct[T any](entity *T, data map[string]any) error {
 	return nil
 }
 
+// fieldDatabaseValue preserves pointer-receiver Valuer implementations on
+// addressable model fields. database/sql remains responsible for calling Value.
+func fieldDatabaseValue(field reflect.Value) any {
+	value := field.Interface()
+	if _, ok := value.(driver.Valuer); ok {
+		return value
+	}
+	if valuer, ok := field.Addr().Interface().(driver.Valuer); ok {
+		return valuer
+	}
+	return value
+}
+
 // setFieldValue sets a reflect.Value with type conversion.
 func setFieldValue(field reflect.Value, value any) error {
 	if value == nil {
@@ -801,6 +814,16 @@ func setFieldValue(field reflect.Value, value any) error {
 		}
 		// If field is not pointer, we can't set nil. Ignore or error?
 		// Ignore is safer for partial updates.
+		return nil
+	}
+
+	val := reflect.ValueOf(value)
+	valType := val.Type()
+	fieldType := field.Type()
+
+	// Direct assignment if types match
+	if valType.AssignableTo(fieldType) {
+		field.Set(val)
 		return nil
 	}
 
@@ -823,16 +846,6 @@ func setFieldValue(field reflect.Value, value any) error {
 		}
 		// Recurse to set the element
 		return setFieldValue(field.Elem(), value)
-	}
-
-	val := reflect.ValueOf(value)
-	valType := val.Type()
-	fieldType := field.Type()
-
-	// Direct assignment if types match
-	if valType.AssignableTo(fieldType) {
-		field.Set(val)
-		return nil
 	}
 
 	// Older Go versions do not consider slices with defined uint8 element
