@@ -880,16 +880,36 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 		tableName = relTable
 	}
 
+	// Self-relations need a separate name for the child scope. Keep the
+	// callback model in that scope too, so nested WhereHas remains correlated.
+	outerReference := tableReference(m.TableName())
+	relatedReference := tableReference(tableName)
+	if strings.EqualFold(relatedReference, outerReference) {
+		// Replace an existing alias instead of appending a second AS clause.
+		tableName = strings.TrimSpace(tableName)
+		if relatedReference != tableName {
+			tableName = strings.TrimSpace(strings.TrimSuffix(tableName, relatedReference))
+			if strings.HasSuffix(strings.ToUpper(tableName), " AS") {
+				tableName = strings.TrimSpace(tableName[:len(tableName)-3])
+			}
+		}
+		relatedReference = "zorm_related"
+		for strings.EqualFold(relatedReference, outerReference) {
+			relatedReference += "_"
+		}
+		tableName += " AS " + relatedReference
+	}
+
 	// 4. Build EXISTS subquery
 	var sb strings.Builder
 	sb.WriteString("EXISTS (SELECT 1 FROM ")
 	sb.WriteString(tableName)
 	sb.WriteString(" WHERE ")
-	sb.WriteString(tableName)
+	sb.WriteString(relatedReference)
 	sb.WriteByte('.')
 	sb.WriteString(foreignKey)
 	sb.WriteString(" = ")
-	sb.WriteString(m.TableName())
+	sb.WriteString(outerReference)
 	sb.WriteByte('.')
 	sb.WriteString(m.modelInfo.PrimaryKey)
 
@@ -905,6 +925,11 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 			// Create a new model for the related type
 			relatedModel := rel.NewModel(m.ctx, m.db)
 			if relatedModel != nil {
+				if relatedReference != relatedInfo.TableName {
+					if table := reflect.ValueOf(relatedModel).MethodByName("Table"); table.IsValid() {
+						table.Call([]reflect.Value{reflect.ValueOf(relatedReference)})
+					}
+				}
 				fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
 				// Extract constraints from the populated model
 				constraints, args, err = extractQueryConstraints(relatedModel)

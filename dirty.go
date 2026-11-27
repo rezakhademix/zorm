@@ -507,9 +507,9 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 	}
 
 	val := reflect.ValueOf(entity).Elem()
-	originals := make(map[string]any, len(modelInfo.Fields))
+	originals := make(map[string]any, len(modelInfo.OrderedFields))
 
-	for _, field := range modelInfo.Fields {
+	for _, field := range modelInfo.OrderedFields {
 		fVal := val.FieldByIndex(field.Index)
 		originals[field.Column] = snapshotValue(fVal.Interface())
 	}
@@ -747,7 +747,7 @@ func getDirty[T any](entity *T, modelInfo *ModelInfo) map[string]any {
 func getDirtyFromOriginals[T any](entity *T, modelInfo *ModelInfo, originals map[string]any) map[string]any {
 	val := reflect.ValueOf(entity).Elem()
 	dirty := make(map[string]any, 4)
-	for _, field := range modelInfo.Fields {
+	for _, field := range modelInfo.OrderedFields {
 		if field.IsPrimary {
 			continue
 		}
@@ -787,7 +787,7 @@ func syncOriginalColumns[T any](entity *T, modelInfo *ModelInfo, columns []strin
 		for _, column := range columns {
 			written[column] = true
 		}
-		for _, field := range modelInfo.Fields {
+		for _, field := range modelInfo.OrderedFields {
 			if !field.IsPrimary && !written[field.Column] {
 				return
 			}
@@ -830,7 +830,7 @@ func hasDirtyFields[T any](entity *T, modelInfo *ModelInfo) bool {
 
 	val := reflect.ValueOf(entity).Elem()
 
-	for _, field := range modelInfo.Fields {
+	for _, field := range modelInfo.OrderedFields {
 		if field.IsPrimary {
 			continue
 		}

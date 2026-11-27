@@ -652,6 +652,33 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int
 	return result, nil
 }
 
+// tableReference returns the alias, or the table name when no alias is set.
+// Whitespace inside quoted identifiers and subqueries is part of the name.
+func tableReference(table string) string {
+	table = strings.TrimSpace(table)
+	start, depth := 0, 0
+	quoted := false
+	for i, r := range table {
+		switch r {
+		case '"':
+			quoted = !quoted
+		case '(':
+			if !quoted {
+				depth++
+			}
+		case ')':
+			if !quoted {
+				depth--
+			}
+		case ' ', '\t', '\n', '\r':
+			if !quoted && depth == 0 {
+				start = i + 1
+			}
+		}
+	}
+	return table[start:]
+}
+
 // buildSelectQuery constructs the SQL SELECT statement from the query builder state.
 // It handles SELECT with DISTINCT, DISTINCT ON (PostgreSQL), columns, WHERE, GROUP BY,
 // HAVING, ORDER BY, LIMIT, and OFFSET clauses.
@@ -680,6 +707,10 @@ func (m *Model[T]) buildSelectQuery() (string, []any) {
 	if len(m.columns) > 0 {
 		sb.WriteString(strings.Join(m.columns, ", "))
 	} else {
+		if len(m.joins) > 0 {
+			sb.WriteString(tableReference(m.TableName()))
+			sb.WriteByte('.')
+		}
 		sb.WriteString("*")
 	}
 
