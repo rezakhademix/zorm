@@ -235,7 +235,19 @@ func (m *Model[T]) First(ctx context.Context) (*T, error) {
 // Uses Clone() so the primary-key condition is not accumulated on the receiver,
 // which lets the same model be reused for further queries.
 func (m *Model[T]) Find(ctx context.Context, id any) (*T, error) {
-	return m.Clone().Where(m.modelInfo.PrimaryKey, id).First(ctx)
+	return m.lookupQuery().Where(m.modelInfo.PrimaryKey, id).First(ctx)
+}
+
+// lookupQuery groups the caller's scope before mandatory lookup predicates.
+// Every OR branch must satisfy the requested key or attributes.
+func (m *Model[T]) lookupQuery() *Model[T] {
+	q := m.Clone()
+	if len(q.wheres) > 0 {
+		var sb strings.Builder
+		writeWhereConditions(&sb, q.wheres)
+		q.wheres = []string{"AND (" + sb.String() + ")"}
+	}
+	return q
 }
 
 // FindOrFail finds a record by ID or returns an error.
@@ -324,6 +336,8 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 
 		if q.distinct && len(q.columns) > 0 {
 			sb.WriteString(strings.Join(q.columns, ", "))
+		} else if q.distinct {
+			sb.WriteString("*")
 		} else {
 			sb.WriteString("1")
 		}
@@ -348,13 +362,15 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		sb.WriteString(tableName)
 		q.buildJoinClause(&sb)
 		q.buildWhereClause(&sb)
+		if len(q.havings) > 0 {
+			sb.WriteString(" HAVING ")
+			sb.WriteString(strings.Join(q.havings, " AND "))
+		}
 	}
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
-	if needsSubquery {
-		args = append(args, q.havingArgs...)
-	}
+	args = append(args, q.havingArgs...)
 
 	var count int64
 	var err error
@@ -374,6 +390,10 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
 	}
 
+	// An ungrouped HAVING may reject the aggregate row entirely.
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, WrapQueryError("COUNT", query, args, err)
 	}
@@ -398,15 +418,29 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 	var sb strings.Builder
 	cteArgs := q.buildWithClause(&sb)
 
-	sb.WriteString("SELECT 1 FROM ")
+	if len(q.havings) > 0 && len(q.groupBys) == 0 {
+		// HAVING without GROUP BY needs an aggregate SELECT expression.
+		sb.WriteString("SELECT COUNT(*) FROM ")
+	} else {
+		sb.WriteString("SELECT 1 FROM ")
+	}
 	sb.WriteString(tableName)
 
 	q.buildJoinClause(&sb)
 	q.buildWhereClause(&sb)
+	if len(q.groupBys) > 0 {
+		sb.WriteString(" GROUP BY ")
+		sb.WriteString(strings.Join(q.groupBys, ", "))
+	}
+	if len(q.havings) > 0 {
+		sb.WriteString(" HAVING ")
+		sb.WriteString(strings.Join(q.havings, " AND "))
+	}
 	sb.WriteString(" LIMIT 1")
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
+	args = append(args, q.havingArgs...)
 
 	var exists int
 	var err error
@@ -966,20 +1000,30 @@ func (m *Model[T]) scanRows(ctx context.Context, rows *sql.Rows) ([]*T, error) {
 		// Track originals for dirty tracking (with optional scope)
 		m.trackOriginals(entity)
 
+		results = append(results, entity)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	// Hooks may query the database, so release the buffered result set first.
+	for _, entity := range results {
 		// AfterFind Hook
 		if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
 			if err := hook.AfterFind(ctx); err != nil {
 				return nil, err
 			}
 		}
-
-		results = append(results, entity)
 	}
 
 	// Load Accessors
 	m.loadAccessors(results)
 
-	return results, rows.Err()
+	return results, nil
 }
 
 // Cursor returns a cursor for iterating over results one by one.
@@ -1080,7 +1124,9 @@ func (c *Cursor[T]) Close() error {
 // findByAttributes runs the lookup half of FirstOrCreate / UpdateOrCreate.
 // Returns (nil, nil) when no row matches.
 func (m *Model[T]) findByAttributes(ctx context.Context, attributes map[string]any) (*T, error) {
-	q := m.Clone()
+	// This lookup decides a write and must not use a lagging replica. The same
+	// rule applies when recovering from a concurrent duplicate-key insert.
+	q := m.lookupQuery().UsePrimary()
 	// Sorted so the lookup emits a stable WHERE chain across calls.
 	for _, k := range sortedKeys(attributes) {
 		q = q.Where(k, attributes[k])
@@ -1206,6 +1252,23 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 
 // applyUpdateValues writes values onto an existing entity and persists it.
 func (m *Model[T]) applyUpdateValues(ctx context.Context, entity *T, values map[string]any) (*T, error) {
+	// Values may repeat the loaded primary key, but must not redirect the write
+	// to a different row. Validate after conversion, before mutating the entity.
+	if value, supplied := values[m.modelInfo.PrimaryKey]; supplied {
+		field, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
+		if !ok {
+			return nil, fmt.Errorf("zorm: %w: primary key field %q not found", ErrInvalidModel, m.modelInfo.PrimaryKey)
+		}
+		current := reflect.ValueOf(entity).Elem().FieldByIndex(field.Index)
+		candidate := reflect.New(current.Type()).Elem()
+		candidate.Set(reflect.ValueOf(snapshotValue(current.Interface())))
+		if err := setFieldValue(candidate, value); err != nil {
+			return nil, err
+		}
+		if !fastEqual(current.Interface(), candidate.Interface()) {
+			return nil, fmt.Errorf("zorm: %w: UpdateOrCreate requires unchanged primary key %s", ErrInvalidModel, field.Column)
+		}
+	}
 	if err := fillStruct(entity, values); err != nil {
 		return nil, err
 	}
@@ -1273,6 +1336,19 @@ func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInf
 
 		entity := val.Interface()
 
+		results = append(results, entity)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	// Relation hooks need the same released connection as direct read hooks.
+	for _, entity := range results {
 		// AfterFind Hook. Asserting on the boxed pointer works the same way the
 		// typed path's assertion does — the dynamic type is *Related.
 		if hook, ok := entity.(interface{ AfterFind(context.Context) error }); ok {
@@ -1280,12 +1356,6 @@ func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInf
 				return nil, err
 			}
 		}
-
-		results = append(results, entity)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 
 	// Load Accessors
@@ -1592,6 +1662,18 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	return nil
 }
 
+// validateWriteScope rejects constraints the write builders cannot render.
+// Dropping a join or raw query would widen the write beyond the caller's scope.
+func (m *Model[T]) validateWriteScope() error {
+	if m.rawQuery != "" {
+		return fmt.Errorf("zorm: %w: writes cannot be combined with Raw; use Exec to execute raw SQL", ErrInvalidModel)
+	}
+	if len(m.joins) > 0 {
+		return fmt.Errorf("zorm: %w: writes cannot be combined with JOIN; use Exec to execute joined SQL", ErrInvalidModel)
+	}
+	return nil
+}
+
 // Update updates a single record based on its primary key.
 // The entity must not be nil and must have a valid primary key value.
 //
@@ -1611,6 +1693,9 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
 	if err := m.GetBuildErr(); err != nil {
+		return err
+	}
+	if err := m.validateWriteScope(); err != nil {
 		return err
 	}
 	// Validate input
@@ -1756,6 +1841,9 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
 	if err := m.GetBuildErr(); err != nil {
+		return err
+	}
+	if err := m.validateWriteScope(); err != nil {
 		return err
 	}
 	if entity == nil {
@@ -1920,6 +2008,9 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
 	if err := m.GetBuildErr(); err != nil {
+		return err
+	}
+	if err := m.validateWriteScope(); err != nil {
 		return err
 	}
 	if entity == nil {
@@ -2205,10 +2296,8 @@ func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
 // model-level concerns (audit logging, cache invalidation, access control) rather than
 // per-record state inspection.
 func (m *Model[T]) execDelete(ctx context.Context) error {
-	// Delete renders its own statement; raw SQL belongs to Exec and must not
-	// be silently discarded, even when builder conditions are also present.
-	if m.rawQuery != "" {
-		return fmt.Errorf("zorm: %w: Delete cannot be combined with Raw; use Exec to execute raw SQL", ErrInvalidModel)
+	if err := m.validateWriteScope(); err != nil {
+		return err
 	}
 
 	// Auto-tx: see Create for rationale. Delete hooks fire on a zero-value *T,
@@ -2708,6 +2797,9 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	if err := m.GetBuildErr(); err != nil {
 		return err
 	}
+	if err := m.validateWriteScope(); err != nil {
+		return err
+	}
 	if len(values) == 0 {
 		return nil
 	}
@@ -2798,6 +2890,9 @@ func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColu
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
 	if err := m.GetBuildErr(); err != nil {
+		return err
+	}
+	if err := m.validateWriteScope(); err != nil {
 		return err
 	}
 	// Validate column names

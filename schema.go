@@ -439,6 +439,9 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 
 		// Handle Embedded Structs
 		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if field.Tag.Get("zorm") == "-" {
+				continue
+			}
 			newIndex := append(indexPrefix, i)
 			parseFields(field.Type, info, newIndex)
 			continue
