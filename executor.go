@@ -829,11 +829,16 @@ func (m *Model[T]) buildEntityWhereClause(sb *strings.Builder, pkVal any) []any 
 }
 
 // columnMappingCache caches column-to-field mappings per query signature.
-// Key format: "typeName:col1,col2,col3"
-// Note: We use type name (not table name) because different Go types can map to the same table
-// but have different field definitions.
+// Keys include the Go type identity because different types can share a printed
+// name or map to the same database table but have different field definitions.
 // Uses sharded LRU cache to prevent unbounded memory growth.
 var columnMappingCache = newColumnCache(1000) // Cache up to 1000 mappings
+
+// columnCacheKey identifies a model type and its selected columns.
+type columnCacheKey struct {
+	modelType reflect.Type
+	columns   string
+}
 
 // columnCache is a sharded LRU cache for column mappings.
 type columnCache struct {
@@ -843,13 +848,13 @@ type columnCache struct {
 
 type columnCacheShard struct {
 	mu       sync.Mutex
-	items    map[string]*columnCacheEntry
+	items    map[columnCacheKey]*columnCacheEntry
 	lruList  *list.List
 	capacity int
 }
 
 type columnCacheEntry struct {
-	key     string
+	key     columnCacheKey
 	value   []*FieldInfo
 	element *list.Element // Reference to list element for O(1) MoveToFront
 }
@@ -863,7 +868,7 @@ func newColumnCache(capacity int) *columnCache {
 	c := &columnCache{capacity: capacity}
 	for i := 0; i < 64; i++ {
 		c.shards[i] = &columnCacheShard{
-			items:    make(map[string]*columnCacheEntry),
+			items:    make(map[columnCacheKey]*columnCacheEntry),
 			lruList:  list.New(),
 			capacity: shardCapacity,
 		}
@@ -871,13 +876,14 @@ func newColumnCache(capacity int) *columnCache {
 	return c
 }
 
-func (c *columnCache) getShard(key string) *columnCacheShard {
+func (c *columnCache) getShard(key columnCacheKey) *columnCacheShard {
 	h := fnv.New32a()
-	h.Write([]byte(key))
+	h.Write([]byte(key.modelType.String()))
+	h.Write([]byte(key.columns))
 	return c.shards[h.Sum32()%64]
 }
 
-func (c *columnCache) Load(key string) ([]*FieldInfo, bool) {
+func (c *columnCache) Load(key columnCacheKey) ([]*FieldInfo, bool) {
 	shard := c.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -889,7 +895,7 @@ func (c *columnCache) Load(key string) ([]*FieldInfo, bool) {
 	return nil, false
 }
 
-func (c *columnCache) Store(key string, value []*FieldInfo) {
+func (c *columnCache) Store(key columnCacheKey, value []*FieldInfo) {
 	shard := c.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -916,19 +922,16 @@ func (c *columnCache) Store(key string, value []*FieldInfo) {
 // Returns a slice where each element corresponds to the column at that index.
 // Uses caching to avoid repeated lookups for the same column set.
 func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
-	// Build cache key using type name (not table name) to avoid collisions
-	// when different Go types map to the same database table.
-	// Use strings.Builder for efficient key construction.
+	// Use type identity rather than its printed name: different packages may
+	// declare equally named types with different field layouts.
 	sb := GetStringBuilder()
-	sb.WriteString(m.modelInfo.Type.String())
-	sb.WriteByte(':')
 	for i, col := range columns {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
 		sb.WriteString(col)
 	}
-	key := sb.String()
+	key := columnCacheKey{modelType: m.modelInfo.Type, columns: sb.String()}
 	PutStringBuilder(sb)
 
 	// Check cache first
@@ -1671,6 +1674,12 @@ func (m *Model[T]) validateWriteScope() error {
 	if len(m.joins) > 0 {
 		return fmt.Errorf("zorm: %w: writes cannot be combined with JOIN; use Exec to execute joined SQL", ErrInvalidModel)
 	}
+	if m.limit > 0 || m.offset > 0 {
+		return fmt.Errorf("zorm: %w: writes cannot be combined with LIMIT or OFFSET; use Exec to execute bounded SQL", ErrInvalidModel)
+	}
+	if len(m.groupBys) > 0 || len(m.havings) > 0 {
+		return fmt.Errorf("zorm: %w: writes cannot be combined with GROUP BY or HAVING; use Exec to execute grouped SQL", ErrInvalidModel)
+	}
 	return nil
 }
 
@@ -2085,18 +2094,8 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		delete(dirty, createdAtColumn)
 	}
 
-	// If anything changed, auto-touch updated_at (matching Update's behavior).
-	if len(dirty) > 0 {
-		if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
-			if _, alreadyDirty := dirty["updated_at"]; !alreadyDirty {
-				fieldVal := val.FieldByIndex(fieldInfo.Index)
-				if fieldVal.CanSet() {
-					_ = setFieldValue(fieldVal, time.Now())
-					dirty["updated_at"] = fieldVal.Interface()
-				}
-			}
-		}
-	}
+	// Preserve explicit timestamp changes even when that column is excluded.
+	_, updatedAtDirty := dirty["updated_at"]
 
 	// Drop excluded columns and the version column (it is managed separately).
 	for col := range dirty {
@@ -2106,6 +2105,21 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	}
 	if m.modelInfo.VersionField != nil {
 		delete(dirty, m.modelInfo.VersionField.Column)
+	}
+
+	// If anything changed, auto-touch updated_at (matching Update's behavior).
+	if len(dirty) > 0 {
+		if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
+			if !updatedAtDirty {
+				fieldVal := val.FieldByIndex(fieldInfo.Index)
+				if fieldVal.CanSet() {
+					_ = setFieldValue(fieldVal, time.Now())
+					if !m.excludedColumns["updated_at"] {
+						dirty["updated_at"] = fieldVal.Interface()
+					}
+				}
+			}
+		}
 	}
 
 	// No data changes => no-op. Still fire AfterUpdate so audit hooks see the
@@ -2982,8 +2996,8 @@ func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targe
 	}
 	sb.WriteString(" END")
 
-	// Auto-update updated_at if exists
-	if _, ok := m.modelInfo.Columns["updated_at"]; ok {
+	// Auto-update updated_at unless it is the explicit target.
+	if _, ok := m.modelInfo.Columns["updated_at"]; ok && targetColumn != "updated_at" {
 		sb.WriteString(", updated_at = ?")
 		args = append(args, time.Now())
 	}

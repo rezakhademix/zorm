@@ -18,6 +18,25 @@ func TestRawWrites_RejectConflictingQueryState(t *testing.T) {
 	})
 }
 
+func TestWrites_RejectUnsupportedBoundsAndGrouping(t *testing.T) {
+	for _, state := range []string{"limit", "offset", "group", "having"} {
+		t.Run(state, func(t *testing.T) {
+			testRejectedWriteScope(t, func(m *Model[saveItem]) *Model[saveItem] {
+				switch state {
+				case "limit":
+					return m.OrderBy("id", "ASC").Limit(1)
+				case "offset":
+					return m.Offset(1)
+				case "group":
+					return m.GroupBy("value")
+				default:
+					return m.Having("COUNT(*) > ?", 10)
+				}
+			})
+		})
+	}
+}
+
 // Unsupported query state must fail before any write or entity mutation.
 func testRejectedWriteScope(t *testing.T, scope func(*Model[saveItem]) *Model[saveItem]) {
 	t.Helper()

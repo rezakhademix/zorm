@@ -180,6 +180,9 @@ struct contributes its fields to the same table. Unexported fields and relation
 fields are excluded from normal column mapping. Use pointers for nullable
 columns and `zorm:"-"` for application-only fields.
 
+Fields implementing `sql.Scanner` or `driver.Valuer` are database values,
+including pointer scanners such as `*sql.NullString`.
+
 ```go
 type Timestamps struct {
     CreatedAt time.Time
@@ -339,6 +342,9 @@ than acting as an insert-field selector.
 later through a builder without those exclusions. Repeated calls accumulate
 exclusions; use `Clone` to keep a shared base query unchanged. Unknown column
 names have no effect, so use the exact mapped database names.
+
+When every change is excluded, `Save` issues no UPDATE and leaves `updated_at`
+and the managed version unchanged. Update hooks still run.
 
 ```go
 // Save the changed name while leaving the email change pending
@@ -595,6 +601,9 @@ nil values. `UpdateManyByKey` assigns a different value per lookup key.
 Neither method runs per-entity update hooks or performs `Save`'s optimistic
 version check. Unlike `Delete`, `UpdateMany` allows an empty WHERE; add the
 conditions that define the intended batch.
+
+`UpdateManyByKey` preserves supplied timestamps when `updated_at` is the target
+column. Updates to other columns still touch `updated_at` automatically.
 
 ```go
 // Deactivate all users in one department
@@ -1347,9 +1356,12 @@ Rules worth knowing:
 - **Write methods refuse to run with a build error.** This matters most for
   `UpdateMany` / `UpdateManyByKey`: a dropped `WHERE` would otherwise turn a
   targeted update into a table-wide one.
-- **Updates and deletes reject `Raw` and JOIN state.** These write builders
-  cannot render those constraints and return `ErrInvalidModel` instead of
-  discarding them. Use `Raw(...).Exec(ctx)` for raw or joined write SQL.
+- **Unsupported WHERE condition types produce a build error.** This includes
+  nil conditions; use one of the documented string, map, struct, or callback forms.
+- **Updates and deletes reject unsupported query state.** `Raw`, JOINs,
+  positive limits or offsets, grouping, and `HAVING` return `ErrInvalidModel`
+  instead of being discarded. Use `Raw(...).Exec(ctx)` for write SQL that needs
+  those clauses.
 - **Errors propagate out of nested scopes.** A rejected condition inside a
   `Where(func)` group, a `WhereHas` / `WithCallback` callback, or a CTE builder
   fails the outer query rather than silently dropping its filter. CTE builders
@@ -1508,6 +1520,11 @@ roles, err := zorm.Query[string]().
 - `Distinct`, `GroupBy`, `Having`
 - `First` (returns single value), `Count` (returns row count)
 - `SetDB`, `WithTx`, `Clone`, `Print`
+
+Scalar `Count` ignores pagination and ordering, preserves distinct projections,
+and counts groups that satisfy `HAVING`. Without grouping, `HAVING` filters the
+aggregate row count, returning zero when its condition fails. Counting leaves
+the original builder unchanged.
 
 Always supply a table and select a single column compatible with `T`.
 Scalar queries do not load model relations, run model hooks, or track dirty

@@ -3,6 +3,7 @@ package zorm
 import (
 	"container/list"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"math"
 	"reflect"
@@ -686,6 +687,13 @@ var timeType = reflect.TypeOf(time.Time{})
 //   - Pointers to structs (e.g., *Branch) except *time.Time
 //   - Slices of structs or pointers to structs (e.g., []*Post, []Post)
 func isRelationField(t reflect.Type) bool {
+	// Scanner and Valuer implementations describe database values, even when
+	// their underlying type would otherwise look like a relation.
+	if t.Implements(reflect.TypeFor[sql.Scanner]()) ||
+		reflect.PointerTo(t).Implements(reflect.TypeFor[sql.Scanner]()) ||
+		t.Implements(reflect.TypeFor[driver.Valuer]()) {
+		return false
+	}
 	switch t.Kind() {
 	case reflect.Ptr:
 		return isRelationStruct(t.Elem())

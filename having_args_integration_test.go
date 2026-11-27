@@ -150,10 +150,10 @@ func TestHavingArgs_ModelTerminals(t *testing.T) {
 	if err != nil || value != "admin" {
 		t.Fatalf("scalar First = %q, %v", value, err)
 	}
-	// Scalar Count counts WHERE matches; it does not render GROUP BY or HAVING.
+	// Scalar Count returns the number of groups that satisfy HAVING.
 	count, err := scalar.Count(ctx)
-	if err != nil || count != 3 {
-		t.Fatalf("scalar Count = %d, %v, want 3", count, err)
+	if err != nil || count != 1 {
+		t.Fatalf("scalar Count = %d, %v, want 1", count, err)
 	}
 }
 

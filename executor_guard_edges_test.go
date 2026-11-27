@@ -106,8 +106,8 @@ func TestCacheAndAccessorGuards_EmptyAndDefaultStates(t *testing.T) {
 		cache.Close()
 	}
 	columns := newColumnCache(0)
-	columns.Store("one", nil)
-	if _, ok := columns.Load("one"); !ok {
+	columns.Store(columnTestKey("one"), nil)
+	if _, ok := columns.Load(columnTestKey("one")); !ok {
 		t.Error("minimal column cache is unusable")
 	}
 	tracker := newLRUTracker(1)

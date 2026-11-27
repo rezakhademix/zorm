@@ -86,6 +86,33 @@ func TestRebind_EscapedSingleQuotes(t *testing.T) {
 	}
 }
 
+// Escape strings use backslashes as well as doubled quotes; ordinary strings do not.
+func TestRebind_PostgresEscapeStrings(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"escaped quote", `SELECT E'it\'s ?' AS text, ?`, `SELECT E'it\'s ?' AS text, $1`},
+		{"lowercase prefix", `SELECT e'it\'s ?' AS text, ?`, `SELECT e'it\'s ?' AS text, $1`},
+		{"leading escape string", `E'it\'s ?' || ?`, `E'it\'s ?' || $1`},
+		{"even backslashes", `SELECT E'path\\', ?`, `SELECT E'path\\', $1`},
+		{"odd backslashes", `SELECT E'path\\\'? still literal', ?`, `SELECT E'path\\\'? still literal', $1`},
+		{"doubled quotes", `SELECT E'it''s ? and \'quoted\'', ?`, `SELECT E'it''s ? and \'quoted\'', $1`},
+		{"multiple strings", `SELECT ?, E'a\'?b', ?, e'c\'?d', ?`, `SELECT $1, E'a\'?b', $2, e'c\'?d', $3`},
+		{"ordinary backslash", `SELECT 'path\', ?`, `SELECT 'path\', $1`},
+		{"identifier ending in e", `SELECT name'path\', ?`, `SELECT name'path\', $1`},
+		{"identifier with dollar", `SELECT type$e'path\', ?`, `SELECT type$e'path\', $1`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rebind(tc.input); got != tc.want {
+				t.Errorf("rebind() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRebind_PreservesDollarQuotedStrings verifies that `?` inside a
 // PostgreSQL dollar-quoted literal ($$ ... $$ or $tag$ ... $tag$) is left
 // untouched — it is part of the string, not a bind placeholder.

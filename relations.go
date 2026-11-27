@@ -1567,6 +1567,11 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		foreignKey = ToSnakeCase(modelType.Name()) + "_id"
 	}
 
+	tableName := relatedInfo.TableName
+	if override := valConfig.FieldByName("Table").String(); override != "" {
+		tableName = override
+	}
+
 	var sb strings.Builder
 	sb.WriteString("SELECT ")
 	if cols != "" {
@@ -1575,7 +1580,7 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		sb.WriteString("*")
 	}
 	sb.WriteString(" FROM ")
-	sb.WriteString(relatedInfo.TableName)
+	sb.WriteString(tableName)
 	sb.WriteString(" WHERE ")
 	inFrag, args, err := buildInClause(foreignKey, ids, m.effectiveDialect())
 	if err != nil {

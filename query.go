@@ -277,6 +277,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	// 4. Handle String
 	queryStr, ok := query.(string)
 	if !ok {
+		m.buildErr = fmt.Errorf("zorm: Where: unsupported condition type %T", query)
 		return m
 	}
 
@@ -1316,6 +1317,7 @@ func (m *Model[T]) Exclude(columns ...string) *Model[T] {
 // every syntactic context where a `?` is NOT a placeholder:
 //
 //   - single-quoted strings: 'text', with ” as an in-string escape
+//   - PostgreSQL escape strings: E'text', with backslash escapes
 //   - double-quoted identifiers: "col", with "" as an in-string escape
 //   - dollar-quoted strings: $$body$$ and $tag$body$tag$
 //   - line comments: -- to end of line
@@ -1340,9 +1342,19 @@ func rebind(query string) string {
 		c := query[i]
 		switch {
 		case c == '\'':
+			escapeString := i > 0 && (query[i-1] == 'E' || query[i-1] == 'e')
+			if escapeString && i > 1 {
+				previous := query[i-2]
+				escapeString = !isIdentCont(previous) && previous != '$' && previous < 0x80
+			}
 			sb.WriteByte('\'')
 			i++
 			for i < len(query) {
+				if escapeString && query[i] == '\\' && i+1 < len(query) {
+					sb.WriteString(query[i : i+2])
+					i += 2
+					continue
+				}
 				if query[i] == '\'' {
 					sb.WriteByte('\'')
 					i++

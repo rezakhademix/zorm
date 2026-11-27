@@ -387,7 +387,7 @@ func (q *ScalarQuery[T]) First(ctx context.Context) (T, error) {
 }
 
 // Count returns the count of matching rows.
-// This ignores the Select column and uses COUNT(*).
+// Distinct projections and grouped results are counted through a subquery.
 func (q *ScalarQuery[T]) Count(ctx context.Context) (int64, error) {
 	if q.buildErr != nil {
 		return 0, q.buildErr
@@ -395,17 +395,37 @@ func (q *ScalarQuery[T]) Count(ctx context.Context) (int64, error) {
 	sb := GetStringBuilder()
 	defer PutStringBuilder(sb)
 
-	sb.WriteString("SELECT COUNT(*) FROM ")
-	sb.WriteString(q.tableName)
-
-	q.buildWhereClause(sb)
+	clone := q.Clone()
+	clone.limit, clone.offset = 0, 0
+	clone.orderBys = nil
+	needsSubquery := clone.distinct || len(clone.groupBys) > 0
+	if needsSubquery {
+		if clone.column == "" && !clone.distinct {
+			clone.column = "1"
+		}
+		sb.WriteString("SELECT COUNT(*) FROM (")
+		sb.WriteString(clone.buildQuery())
+		sb.WriteString(") AS _count_subquery")
+	} else {
+		sb.WriteString("SELECT COUNT(*) FROM ")
+		sb.WriteString(clone.tableName)
+		clone.buildWhereClause(sb)
+		if len(clone.havings) > 0 {
+			sb.WriteString(" HAVING ")
+			sb.WriteString(strings.Join(clone.havings, " AND "))
+		}
+	}
 
 	query := strings.Clone(sb.String())
+	args := clone.queryArgs()
 
 	var count int64
-	err := q.queryer().QueryRowContext(ctx, rebind(query), q.args...).Scan(&count)
+	err := clone.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
+	if err == sql.ErrNoRows && !needsSubquery && len(clone.havings) > 0 {
+		return 0, nil
+	}
 	if err != nil {
-		return 0, WrapQueryError("COUNT", query, q.args, err)
+		return 0, WrapQueryError("COUNT", query, args, err)
 	}
 	return count, nil
 }
