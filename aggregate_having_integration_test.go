@@ -2,11 +2,12 @@ package zorm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 )
 
-func TestAggregateTerminals_PreserveHaving(t *testing.T) {
+func TestAggregateTerminals_HavingScope(t *testing.T) {
 	for _, grouped := range []bool{false, true} {
 		for _, cached := range []bool{false, true} {
 			for _, minimum := range []int{0, 10} {
@@ -25,15 +26,10 @@ func TestAggregateTerminals_PreserveHaving(t *testing.T) {
 						defer cache.Close()
 						m.WithStmtCache(cache)
 					}
-					wantCount := int64(2)
-					wantExists := true
-					if minimum == 10 {
-						wantCount = 0
-						wantExists = false
-					}
+					wantExists := minimum == 0
 					count, err := m.Count(ctx)
-					if err != nil || count != wantCount {
-						t.Errorf("Count=%d, err=%v, want %d", count, err, wantCount)
+					if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+						t.Errorf("expected grouped aggregate rejection, got Count=%d, err=%v", count, err)
 					}
 					exists, err := m.Exists(ctx)
 					if err != nil || exists != wantExists {

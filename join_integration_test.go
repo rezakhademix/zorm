@@ -3,6 +3,7 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -496,8 +497,7 @@ func TestJoin_CountWithGroupBy(t *testing.T) {
 
 	ctx := context.Background()
 
-	// GROUP BY path wraps the count in a subquery; the subquery must also
-	// carry the JOIN clauses.
+	// A JOIN must not bypass scalar aggregation validation.
 	count, err := New[JoinOrder]().
 		SetDB(db).
 		Join("join_users", "join_orders.user_id", "=", "join_users.id").
@@ -505,11 +505,8 @@ func TestJoin_CountWithGroupBy(t *testing.T) {
 		GroupBy("join_orders.user_id").
 		Count(ctx)
 
-	if err != nil {
-		t.Fatalf("Count with JOIN and GROUP BY failed: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("expected 1 group (Alice), got %d", count)
+	if !errors.Is(err, ErrGroupedAggregateRequiresGet) || count != 0 {
+		t.Errorf("expected grouped aggregate rejection, got count=%d, err=%v", count, err)
 	}
 }
 

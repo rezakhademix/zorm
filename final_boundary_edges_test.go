@@ -105,8 +105,8 @@ func TestFinalBoundaries_BatchHelpersAndCallerTransaction(t *testing.T) {
 	}
 	extra := New[ExModel]().SetDB(openFailureDB(t, &failureDB{columns: []string{"id"}, values: [][]driver.Value{{int64(1)}, {int64(2)}}}))
 	row := &ExModel{Name: "one"}
-	if err := extra.CreateMany(ctx, []*ExModel{row}); err != nil || row.ID != 1 {
-		t.Errorf("extra result rows overwrote target or panicked: %v %v", row, err)
+	if err := extra.CreateMany(ctx, []*ExModel{row}); err == nil || row.ID != 0 {
+		t.Errorf("extra result rows must fail before assigning IDs: %v %v", row, err)
 	}
 }
 

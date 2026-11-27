@@ -44,10 +44,15 @@ func TestSave_EvictionCannotWidenPartialWrite(t *testing.T) {
 				m.Exclude("value")
 			}
 			entity.Before = func() error {
-				// One entry fits per shard. A key offset by shardCount maps to
-				// the same shard, guaranteeing eviction without allocator assumptions.
-				key := getEntityKey(entity) + uintptr(shardCount)
-				globalTracker.Load().Store(key, map[string]any{"name": "filler"}, nil)
+				// One entry fits per shard. Find a colliding key without
+				// relying on pointer alignment or a particular hash function.
+				tracker := globalTracker.Load()
+				entityKey := getEntityKey(entity)
+				key := entityKey + 1
+				for tracker.getShard(key) != tracker.getShard(entityKey) {
+					key++
+				}
+				tracker.Store(key, map[string]any{"name": "filler"}, nil)
 				if IsTracked(entity) {
 					t.Fatal("test did not evict the entity's baseline")
 				}

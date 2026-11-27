@@ -261,14 +261,14 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 			info = ParseModelType(val.Type())
 		}
 		for _, field := range info.OrderedFields {
-			fVal := val.FieldByName(field.Name)
+			fVal := val.FieldByIndex(field.Index)
 			if !fVal.IsZero() {
 				if err := ValidateColumnName(field.Column); err != nil {
 					m.buildErr = fmt.Errorf("Where struct: invalid column name %q: %w", field.Column, err)
 					return m
 				}
 				m.wheres = append(m.wheres, typ+" "+field.Column+" = ?")
-				m.args = append(m.args, val.FieldByIndex(field.Index).Interface())
+				m.args = append(m.args, fVal.Interface())
 			}
 		}
 		return m

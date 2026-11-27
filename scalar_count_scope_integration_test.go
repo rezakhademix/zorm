@@ -2,24 +2,26 @@ package zorm
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 )
 
-// Scalar counts must describe the qualifying rows or groups, without pagination.
-func TestScalarCount_PreservesDistinctAndGrouping(t *testing.T) {
+// Scalar counts preserve distinct projections and reject grouped queries.
+func TestScalarCount_PreservesDistinctAndRejectsGrouping(t *testing.T) {
 	cases := []struct {
-		name  string
-		apply func(*ScalarQuery[int])
-		want  int64
+		name   string
+		apply  func(*ScalarQuery[int])
+		want   int64
+		reject bool
 	}{
-		{"distinct", func(q *ScalarQuery[int]) { q.Select("value").Distinct() }, 1},
-		{"grouped", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value") }, 1},
-		{"grouped-default", func(q *ScalarQuery[int]) { q.GroupBy("value") }, 1},
-		{"having-false", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value").Having("COUNT(*) > ?", 10) }, 0},
-		{"having-true", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value").Having("COUNT(*) > ?", 1) }, 1},
-		{"ungrouped-having-false", func(q *ScalarQuery[int]) { q.Having("COUNT(*) > ?", 10) }, 0},
-		{"ungrouped-having-true", func(q *ScalarQuery[int]) { q.Having("COUNT(*) > ?", 0) }, 2},
+		{"distinct", func(q *ScalarQuery[int]) { q.Select("value").Distinct() }, 1, false},
+		{"grouped", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value") }, 0, true},
+		{"grouped-default", func(q *ScalarQuery[int]) { q.GroupBy("value") }, 0, true},
+		{"having-false", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value").Having("COUNT(*) > ?", 10) }, 0, true},
+		{"having-true", func(q *ScalarQuery[int]) { q.Select("value").GroupBy("value").Having("COUNT(*) > ?", 1) }, 0, true},
+		{"ungrouped-having-false", func(q *ScalarQuery[int]) { q.Having("COUNT(*) > ?", 10) }, 0, true},
+		{"ungrouped-having-true", func(q *ScalarQuery[int]) { q.Having("COUNT(*) > ?", 0) }, 0, true},
 	}
 	for _, tc := range cases {
 		for _, transactional := range []bool{false, true} {
@@ -42,10 +44,13 @@ func TestScalarCount_PreservesDistinctAndGrouping(t *testing.T) {
 					}
 					before, beforeArgs := q.Print()
 					n, err := q.Count(ctx)
-					if err != nil {
+					if tc.reject {
+						if !errors.Is(err, ErrGroupedAggregateRequiresGet) || n != 0 {
+							t.Errorf("expected grouped aggregate rejection, got count=%d, err=%v", n, err)
+						}
+					} else if err != nil {
 						return err
-					}
-					if n != tc.want {
+					} else if n != tc.want {
 						t.Errorf("count=%d, want %d", n, tc.want)
 					}
 					after, afterArgs := q.Print()

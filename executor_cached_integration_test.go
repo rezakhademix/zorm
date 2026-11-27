@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -16,12 +17,14 @@ func TestExecutor_StmtCacheWrites(t *testing.T) {
 		t.Fatalf("failed to open database: %v", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("CREATE TABLE ex_models (id INTEGER PRIMARY KEY, value INTEGER, name TEXT)"); err != nil {
 		t.Fatalf("failed to setup DB: %v", err)
 	}
 	cache := NewStmtCache(10)
 	defer cache.Close()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	model := New[ExModel]().SetDB(db).WithStmtCache(cache)
 
 	entity := &ExModel{Name: "Created", Value: 10}

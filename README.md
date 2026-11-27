@@ -868,6 +868,8 @@ zorm.ClearOriginals(user)
 | `Count(ctx)`             | Count matching records                | `int64, error`            |
 | `Sum(ctx, column)`       | Sum of column values                  | `float64, error`          |
 | `Avg(ctx, column)`       | Average of column values              | `float64, error`          |
+| `Min(ctx, column)`       | Minimum numeric column value          | `float64, error`          |
+| `Max(ctx, column)`       | Maximum numeric column value          | `float64, error`          |
 | `Pluck(ctx, column)`     | Get single column values              | `[]any, error`            |
 | `CountOver(ctx, column)` | Count rows per partition of a column  | `map[string]int64, error` |
 
@@ -886,6 +888,10 @@ zorm.ClearOriginals(user)
 | `DeleteMany(ctx)`                           | Alias for Delete                                  |
 | `FirstOrCreate(ctx, attrs, values)`         | Find first or create new                          |
 | `UpdateOrCreate(ctx, attrs, values)`        | Update existing or create new                     |
+
+`CreateMany` validates that `RETURNING` produces one primary key per input
+before assigning that batch's IDs. A missing or extra returned row is an error;
+when zorm owns the transaction, the batch is rolled back.
 
 ### Query Builder Methods
 
@@ -1203,11 +1209,12 @@ rows, err := zorm.New[ProductRegion]().
     CrossJoin("regions").Get(ctx)
 ```
 
-### Count, Sum, Avg, and grouped reports
+### Count, Sum, Avg, Min, Max, and grouped reports
 
-`Count` returns `int64`; `Sum` and `Avg` return `float64` and return zero for
-an empty aggregate. For exact decimal or financial arithmetic, select into an
-appropriate decimal representation with SQL and a compatible scanner.
+`Count` returns `int64`; `Sum`, `Avg`, `Min`, and `Max` return `float64`
+and return zero for an empty or NULL aggregate. `Min` and `Max` accept numeric
+columns. For exact decimal or financial arithmetic, select into an appropriate
+decimal representation with SQL and a compatible scanner.
 
 ```go
 // Count matching users
@@ -1216,6 +1223,8 @@ count, err := zorm.New[User]().Where("active", true).Count(ctx)
 // Aggregate matching order amounts
 total, err := zorm.New[Order]().Where("status", "paid").Sum(ctx, "amount")
 average, err := zorm.New[Order]().Where("status", "paid").Avg(ctx, "amount")
+minimum, err := zorm.New[Order]().Where("status", "paid").Min(ctx, "amount")
+maximum, err := zorm.New[Order]().Where("status", "paid").Max(ctx, "amount")
 
 // Count distinct names
 count, err = zorm.New[User]().Select("name").Distinct().Count(ctx)
@@ -1243,9 +1252,29 @@ sales, err := zorm.New[CustomerSales]().
     Get(ctx)
 ```
 
-Repeated `Having` calls are joined with AND. `Count` on a grouped query
-counts the resulting groups; use a projected aggregate to obtain the count
-inside each group.
+Repeated `Having` calls are joined with AND. Select `COUNT(*)` as above to
+obtain the count inside each group.
+
+`Count`, `Sum`, `Avg`, `Min`, and `Max` reject builders
+containing `GroupBy` or `Having`, including `Having` without `GroupBy`. They
+return `ErrGroupedAggregateRequiresGet` before preparing or executing SQL and
+leave the builder unchanged. This rule also applies to `ScalarQuery.Count`.
+Previously, grouped `Count` counted result groups, while `Sum` and `Avg`
+ignored grouping and `Having`. Ungrouped aggregation behavior is preserved.
+`Paginate` uses `Count` and propagates this error for grouped queries.
+
+```go
+// Unsupported: a scalar terminal cannot represent grouped results.
+q := zorm.New[Order]().GroupBy("customer_id").Having("COUNT(*) > ?", 1)
+_, err = q.Sum(ctx, "amount")
+if errors.Is(err, zorm.ErrGroupedAggregateRequiresGet) {
+    // Use an explicit projection and Get, as in CustomerSales above.
+}
+```
+
+For the number of groups already fetched with `Get`, use `len(sales)`. To
+aggregate a grouped result set again, write that second aggregation explicitly
+in SQL using `Raw(...).Get(...)`; scalar terminals do not add it implicitly.
 
 ### Raw SQL and affected rows
 
@@ -1521,10 +1550,10 @@ roles, err := zorm.Query[string]().
 - `First` (returns single value), `Count` (returns row count)
 - `SetDB`, `WithTx`, `Clone`, `Print`
 
-Scalar `Count` ignores pagination and ordering, preserves distinct projections,
-and counts groups that satisfy `HAVING`. Without grouping, `HAVING` filters the
-aggregate row count, returning zero when its condition fails. Counting leaves
-the original builder unchanged.
+Scalar `Count` ignores pagination and ordering and preserves distinct
+projections. A builder containing `GroupBy` or `Having` returns
+`ErrGroupedAggregateRequiresGet` before SQL is executed. Use `Get` for grouped
+results, as in Example 3. Counting leaves the original builder unchanged.
 
 Always supply a table and select a single column compatible with `T`.
 Scalar queries do not load model relations, run model hooks, or track dirty

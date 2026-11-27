@@ -751,15 +751,24 @@ func TestUpdateWithExcludePreventsUniqueConflict(t *testing.T) {
 // Memory Management Tests
 // ============================================================
 
+func trackerKeysInShard(tracker *lruTracker, count int) []uintptr {
+	keys := make([]uintptr, 0, count)
+	for key := uintptr(0); len(keys) < count; key++ {
+		if tracker.getShard(key) == tracker.getShard(0) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
 func TestLRUTracker_Eviction(t *testing.T) {
 	// With sharded tracker (256 shards), a capacity of 512 gives 2 per shard.
 	// Use keys that hash to the same shard to test eviction within a shard.
 	tracker := newLRUTracker(512)
 
-	// Keys 256, 512, 768 all map to shard 0 (key % 256 == 0)
-	key1 := uintptr(256)
-	key2 := uintptr(512)
-	key3 := uintptr(768)
+	// Pick colliding keys independently of the hash function.
+	keys := trackerKeysInShard(tracker, 3)
+	key1, key2, key3 := keys[0], keys[1], keys[2]
 
 	// Add 2 entities to shard 0 (at capacity)
 	tracker.Store(key1, map[string]any{"name": "user1"}, nil)
@@ -795,10 +804,9 @@ func TestLRUTracker_AccessOrder(t *testing.T) {
 	// With 256 shards, a capacity of 512 gives each shard capacity of 2
 	tracker := newLRUTracker(512)
 
-	// Keys 256, 512, 768 all map to shard 0 (key % 256 == 0)
-	key1 := uintptr(256)
-	key2 := uintptr(512)
-	key3 := uintptr(768)
+	// Pick colliding keys independently of the hash function.
+	keys := trackerKeysInShard(tracker, 3)
+	key1, key2, key3 := keys[0], keys[1], keys[2]
 
 	// Add 3 entities to the same shard (shard has capacity 2)
 	tracker.Store(key1, map[string]any{"name": "user1"}, nil)

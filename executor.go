@@ -301,12 +301,24 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 	return results, nil
 }
 
+// validateScalarAggregate keeps grouped query rejection consistent across scalar
+// aggregate methods and builders, before any SQL is prepared or executed.
+func validateScalarAggregate(groupBys, havings []string) error {
+	if len(groupBys) > 0 || len(havings) > 0 {
+		return ErrGroupedAggregateRequiresGet
+	}
+	return nil
+}
+
 // Count returns the number of records matching the query.
 // This method is safe for concurrent use - it clones the model before modification.
-// When the query includes GROUP BY, DISTINCT, or DISTINCT ON, the count is wrapped
-// in a subquery to return the correct total number of rows.
+// DISTINCT and DISTINCT ON are counted through a subquery.
+// GroupBy and Having require selected aggregate expressions and Get instead.
 func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return 0, err
+	}
+	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return 0, err
 	}
 	// Clone to avoid mutating shared state (thread-safe)
@@ -318,10 +330,8 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	var sb strings.Builder
 	cteArgs := q.buildWithClause(&sb)
 
-	// When GROUP BY, DISTINCT, or DISTINCT ON is present, a simple COUNT(*)
-	// returns per-group counts (or is redundant for DISTINCT). Wrap the inner
-	// query in a subquery to get the correct total row count.
-	needsSubquery := len(q.groupBys) > 0 || q.distinct || len(q.distinctOn) > 0
+	// Count the distinct projection rather than the underlying table rows.
+	needsSubquery := q.distinct || len(q.distinctOn) > 0
 
 	if needsSubquery {
 		sb.WriteString("SELECT COUNT(*) FROM (SELECT ")
@@ -346,26 +356,12 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		q.buildJoinClause(&sb)
 		q.buildWhereClause(&sb)
 
-		if len(q.groupBys) > 0 {
-			sb.WriteString(" GROUP BY ")
-			sb.WriteString(strings.Join(q.groupBys, ", "))
-		}
-
-		if len(q.havings) > 0 {
-			sb.WriteString(" HAVING ")
-			sb.WriteString(strings.Join(q.havings, " AND "))
-		}
-
 		sb.WriteString(") AS _count_subquery")
 	} else {
 		sb.WriteString("SELECT COUNT(*) FROM ")
 		sb.WriteString(tableName)
 		q.buildJoinClause(&sb)
 		q.buildWhereClause(&sb)
-		if len(q.havings) > 0 {
-			sb.WriteString(" HAVING ")
-			sb.WriteString(strings.Join(q.havings, " AND "))
-		}
 	}
 
 	query := sb.String()
@@ -390,7 +386,6 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&count)
 	}
 
-	// An ungrouped HAVING may reject the aggregate row entirely.
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -418,7 +413,14 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 	var sb strings.Builder
 	cteArgs := q.buildWithClause(&sb)
 
-	if len(q.havings) > 0 && len(q.groupBys) == 0 {
+	// Grouping may refer to aliases defined by the projection. Keep that
+	// projection inside the existence probe instead of discarding its aliases.
+	projected := len(q.columns) > 0 && (len(q.groupBys) > 0 || len(q.havings) > 0)
+	if projected {
+		sb.WriteString("SELECT 1 FROM (SELECT ")
+		sb.WriteString(strings.Join(q.columns, ", "))
+		sb.WriteString(" FROM ")
+	} else if len(q.havings) > 0 && len(q.groupBys) == 0 {
 		// HAVING without GROUP BY needs an aggregate SELECT expression.
 		sb.WriteString("SELECT COUNT(*) FROM ")
 	} else {
@@ -435,6 +437,9 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 	if len(q.havings) > 0 {
 		sb.WriteString(" HAVING ")
 		sb.WriteString(strings.Join(q.havings, " AND "))
+	}
+	if projected {
+		sb.WriteString(") AS _exists_subquery")
 	}
 	sb.WriteString(" LIMIT 1")
 
@@ -475,59 +480,7 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
-	if err := m.GetBuildErr(); err != nil {
-		return 0, err
-	}
-	if err := ValidateColumnName(column); err != nil {
-		return 0, err
-	}
-
-	// Clone to avoid mutating shared state (thread-safe)
-	q := m.Clone()
-	q.limit, q.offset = 0, 0
-	q.orderBys = nil
-
-	tableName := q.TableName()
-	var sb strings.Builder
-	cteArgs := q.buildWithClause(&sb)
-
-	sb.WriteString("SELECT SUM(")
-	sb.WriteString(column)
-	sb.WriteString(") FROM ")
-	sb.WriteString(tableName)
-
-	q.buildJoinClause(&sb)
-	q.buildWhereClause(&sb)
-
-	query := sb.String()
-	args := append(cteArgs, q.args...)
-
-	var result sql.NullFloat64
-	var err error
-
-	// Use prepared statement if caching is enabled
-	if q.stmtCache != nil {
-		var stmt *sql.Stmt
-		var release func()
-		stmt, release, err = q.prepareStmt(ctx, rebind(query))
-		if err != nil {
-			return 0, WrapQueryError("PREPARE", query, args, err)
-		}
-		defer release()
-
-		err = stmt.QueryRowContext(ctx, args...).Scan(&result)
-	} else {
-		err = q.queryer().QueryRowContext(ctx, rebind(query), args...).Scan(&result)
-	}
-
-	if err != nil {
-		return 0, WrapQueryError("SUM", query, args, err)
-	}
-
-	if result.Valid {
-		return result.Float64, nil
-	}
-	return 0, nil
+	return m.aggregateFloat64(ctx, "SUM", column)
 }
 
 // Avg calculates the average of a column.
@@ -535,7 +488,28 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
+	return m.aggregateFloat64(ctx, "AVG", column)
+}
+
+// Min calculates the minimum of a numeric column.
+// Returns 0 if no rows match or the minimum is null.
+// GroupBy and Having require selected aggregate expressions and Get instead.
+func (m *Model[T]) Min(ctx context.Context, column string) (float64, error) {
+	return m.aggregateFloat64(ctx, "MIN", column)
+}
+
+// Max calculates the maximum of a numeric column.
+// Returns 0 if no rows match or the maximum is null.
+// GroupBy and Having require selected aggregate expressions and Get instead.
+func (m *Model[T]) Max(ctx context.Context, column string) (float64, error) {
+	return m.aggregateFloat64(ctx, "MAX", column)
+}
+
+func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string) (float64, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return 0, err
+	}
+	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return 0, err
 	}
 	if err := ValidateColumnName(column); err != nil {
@@ -551,7 +525,9 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	var sb strings.Builder
 	cteArgs := q.buildWithClause(&sb)
 
-	sb.WriteString("SELECT AVG(")
+	sb.WriteString("SELECT ")
+	sb.WriteString(function)
+	sb.WriteByte('(')
 	sb.WriteString(column)
 	sb.WriteString(") FROM ")
 	sb.WriteString(tableName)
@@ -581,7 +557,7 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 	}
 
 	if err != nil {
-		return 0, WrapQueryError("AVG", query, args, err)
+		return 0, WrapQueryError(function, query, args, err)
 	}
 
 	if result.Valid {
@@ -925,10 +901,10 @@ func (m *Model[T]) mapColumns(columns []string) []*FieldInfo {
 	// Use type identity rather than its printed name: different packages may
 	// declare equally named types with different field layouts.
 	sb := GetStringBuilder()
-	for i, col := range columns {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
+	for _, col := range columns {
+		// Length prefixes distinguish column names containing separators.
+		sb.WriteString(strconv.Itoa(len(col)))
+		sb.WriteByte(':')
 		sb.WriteString(col)
 	}
 	key := columnCacheKey{modelType: m.modelInfo.Type, columns: sb.String()}
@@ -1146,6 +1122,53 @@ func (m *Model[T]) findByAttributes(ctx context.Context, attributes map[string]a
 	return nil, nil
 }
 
+// createForLookup isolates PostgreSQL constraint failures so a duplicate-key
+// retry can query the winning row without leaving the transaction aborted.
+func (m *Model[T]) createForLookup(ctx context.Context, entity *T) (retry bool, err error) {
+	if m.tx == nil || m.effectiveDialect() != DialectPostgres {
+		err = m.Create(ctx, entity)
+		return IsDuplicateKey(err), err
+	}
+	const savepoint = "zorm_lookup_create"
+	if _, err = m.tx.ExecContext(ctx, "SAVEPOINT "+savepoint); err != nil {
+		return false, err
+	}
+	state := &transactionState{
+		originals:   make(map[uintptr]func(bool)),
+		callerOwned: m.txState == nil || m.txState.callerOwned,
+	}
+	q := m.Clone()
+	q.txState = state
+	defer func() {
+		p := recover()
+		rolledBack := false
+		if err != nil || p != nil {
+			_, rbErr := m.tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+savepoint)
+			rolledBack = rbErr == nil
+			state.finish(false, rolledBack)
+			if rbErr != nil {
+				err = errors.Join(err, fmt.Errorf("%w: %v", ErrRollbackFailed, rbErr))
+			}
+		}
+		_, releaseErr := m.tx.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+		if err == nil && p == nil {
+			state.mergeInto(m.txState)
+			state.finish(true, false)
+		} else {
+			state.finish(false, false)
+		}
+		retry = rolledBack && releaseErr == nil && IsDuplicateKey(err) && !errors.Is(err, ErrRollbackFailed)
+		if p != nil {
+			panic(p)
+		}
+	}()
+	err = q.Create(ctx, entity)
+	return false, err
+}
+
 // FirstOrCreate finds the first record matching attributes or creates it with attributes+values.
 // If found, returns the existing record. If not found, creates a new record with merged attributes+values.
 //
@@ -1183,8 +1206,8 @@ func (m *Model[T]) FirstOrCreate(ctx context.Context, attributes map[string]any,
 		return nil, err
 	}
 
-	if err := m.Create(ctx, entity); err != nil {
-		if !IsDuplicateKey(err) {
+	if retry, err := m.createForLookup(ctx, entity); err != nil {
+		if !retry {
 			return nil, err
 		}
 		// Lost the race: someone inserted a matching row after our lookup.
@@ -1236,8 +1259,8 @@ func (m *Model[T]) UpdateOrCreate(ctx context.Context, attributes map[string]any
 		return nil, err
 	}
 
-	if err := m.Create(ctx, entity); err != nil {
-		if !IsDuplicateKey(err) {
+	if retry, err := m.createForLookup(ctx, entity); err != nil {
+		if !retry {
 			return nil, err
 		}
 		// Lost the race: update the row the winner inserted instead.
@@ -1295,11 +1318,8 @@ func (m *Model[T]) applyUpdateValues(ctx context.Context, entity *T, values map[
 // It dynamically creates instances based on the provided ModelInfo.
 // Optimized to cache field mapping and reuse destination slices.
 //
-// Every relation kind — eager With, lazy Load/LoadSlice, and nested loads — funnels
-// through here, so this is where a related entity gets the same post-scan treatment
-// scanRows gives a directly-fetched one: the AfterFind hook and accessors. Dirty
-// tracking needs the concrete type parameter and is applied by the loaders via
-// trackDynamic.
+// Related baselines, hooks, and accessors are applied by finishRelatedResults
+// after the rows have released their connection.
 func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInfo *ModelInfo) ([]any, error) {
 	columns, err := rows.Columns()
 	if err != nil {
@@ -1350,27 +1370,13 @@ func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInf
 		return nil, err
 	}
 
-	// Relation hooks need the same released connection as direct read hooks.
-	for _, entity := range results {
-		// AfterFind Hook. Asserting on the boxed pointer works the same way the
-		// typed path's assertion does — the dynamic type is *Related.
-		if hook, ok := entity.(interface{ AfterFind(context.Context) error }); ok {
-			if err := hook.AfterFind(ctx); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	// Load Accessors
-	loadAccessorsInfo(results, modelInfo)
-
 	return results, nil
 }
 
 // withAutoTx opens a transaction, runs op against a tx-bound clone of the model, and
 // commits on success or rolls back on error/panic. Used by write operations when the
-// entity implements a *Tx hook variant so the hook can do additional DB work that
-// rolls back atomically with the parent SQL.
+// entity implements a *Tx hook variant so hook DB work rolls back with the
+// parent SQL, and by batches whose returned rows require atomic validation.
 func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) error {
 	db := m.writeDB()
 	if db == nil {
@@ -1620,7 +1626,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		}
 
 		columns = append(columns, field.Column)
-		values = append(values, fVal.Interface())
+		values = append(values, fieldDatabaseValue(fVal))
 	}
 
 	query := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, 1, m.effectiveDialect())
@@ -1763,7 +1769,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		}
 
 		sets = append(sets, field.Column+" = ?")
-		values = append(values, fieldVal.Interface())
+		values = append(values, fieldDatabaseValue(fieldVal))
 		writtenColumns = append(writtenColumns, field.Column)
 	}
 
@@ -1788,8 +1794,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	if !ok {
 		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
 	}
-	pkVal := val.FieldByIndex(pkField.Index).Interface()
-	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
+	values = append(values, m.buildEntityWhereClause(&sb, fieldDatabaseValue(val.FieldByIndex(pkField.Index)))...)
 
 	query := sb.String()
 
@@ -1918,7 +1923,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		}
 
 		sets = append(sets, column+" = ?")
-		values = append(values, fieldVal.Interface())
+		values = append(values, fieldDatabaseValue(fieldVal))
 		writtenColumns = append(writtenColumns, column)
 	}
 
@@ -1937,8 +1942,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 
 	// Scope the write to the entity and the caller's conditions.
 	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
-	pkVal := val.FieldByIndex(pkField.Index).Interface()
-	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
+	values = append(values, m.buildEntityWhereClause(&sb, fieldDatabaseValue(val.FieldByIndex(pkField.Index)))...)
 
 	query := sb.String()
 	allArgs := append(cteArgs, values...)
@@ -2141,7 +2145,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 
 	for _, col := range cols {
 		sets = append(sets, col+" = ?")
-		values = append(values, dirty[col])
+		values = append(values, fieldDatabaseValue(val.FieldByIndex(m.modelInfo.Columns[col].Index)))
 	}
 
 	if hasVersion {
@@ -2161,7 +2165,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
-	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
+	values = append(values, m.buildEntityWhereClause(&sb, fieldDatabaseValue(val.FieldByIndex(pkField.Index)))...)
 
 	if hasVersion {
 		sb.WriteString(" AND ")
@@ -2202,7 +2206,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		if hasVersion {
 			// Distinguish "row deleted by another tx" from "version stale" so
 			// callers can pick merge-vs-abort instead of retrying forever.
-			exists, existErr := m.rowExists(ctx, pkVal)
+			exists, existErr := m.rowExists(ctx, fieldDatabaseValue(val.FieldByIndex(pkField.Index)))
 			if existErr != nil {
 				return WrapQueryError("UPDATE", query, allArgs, existErr)
 			}
@@ -2725,8 +2729,8 @@ func (m *Model[T]) insertColumns(entities []*T, skipPKScan bool) ([]string, []*F
 }
 
 // createBatch performs a single batch insert query. tx, when non-nil, is the
-// active transaction to run inside; pass nil to run against the model's
-// configured writer (m.queryerForWrite()).
+// active transaction to run inside; otherwise an owned transaction keeps
+// returned-row validation atomic against the model's configured writer.
 func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, columns []string, fieldsToInsert []*FieldInfo) error {
 	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 	if !ok {
@@ -2752,55 +2756,73 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 			} else {
 				fv = val.FieldByIndex(fi.Index)
 			}
-			args = append(args, fv.Interface())
+			args = append(args, fieldDatabaseValue(fv))
 		}
 	}
 	*argsP = args
 
-	// Choose the executor: explicit tx > model's stmt cache > raw writer.
-	var rows *sql.Rows
-	var err error
-	switch {
-	case tx != nil:
-		rows, err = tx.QueryContext(ctx, query, args...)
-	case m.stmtCache != nil:
-		var stmt *sql.Stmt
-		var release func()
-		stmt, release, err = m.prepareStmtForWrite(ctx, query)
+	if tx == nil {
+		tx = m.tx
+	}
+	// Prepare cached statements before opening a transaction: preparing through
+	// the pool afterward could wait on the transaction's sole connection.
+	var stmt *sql.Stmt
+	if tx == nil && m.stmtCache != nil {
+		prepared, release, err := m.prepareStmtForWrite(ctx, query)
 		if err != nil {
 			return WrapQueryError("PREPARE", query, args, err)
 		}
 		defer release()
-		rows, err = stmt.QueryContext(ctx, args...)
-	default:
-		rows, err = m.queryerForWrite().QueryContext(ctx, query, args...)
+		stmt = prepared
 	}
-	if err != nil {
-		return WrapQueryError("INSERT", query, args, err)
-	}
-	defer rows.Close()
 
-	// Scan IDs back.
-	idx := 0
-	for rows.Next() {
-		if idx >= len(entities) {
-			break
-		}
-		entity := entities[idx]
-		val := reflect.ValueOf(entity).Elem()
-		var fVal reflect.Value
-		if len(pkField.Index) == 1 {
-			fVal = val.Field(pkField.Index[0])
+	run := func(tx *sql.Tx) error {
+		var rows *sql.Rows
+		var err error
+		if stmt != nil {
+			txStmt := tx.StmtContext(ctx, stmt)
+			defer txStmt.Close()
+			rows, err = txStmt.QueryContext(ctx, args...)
 		} else {
-			fVal = val.FieldByIndex(pkField.Index)
+			rows, err = tx.QueryContext(ctx, query, args...)
 		}
+		if err != nil {
+			return WrapQueryError("INSERT", query, args, err)
+		}
+		defer rows.Close()
 
-		if err := rows.Scan(fVal.Addr().Interface()); err != nil {
+		// Buffer IDs until every input has a returned row. Assigning while scanning
+		// would attach a later row's ID to an input skipped by a database trigger.
+		ids := make([]reflect.Value, 0, len(entities))
+		for rows.Next() {
+			if len(ids) == len(entities) {
+				return fmt.Errorf("zorm: INSERT returned more than %d rows", len(entities))
+			}
+			id := reflect.New(pkField.FieldType)
+			if err := rows.Scan(id.Interface()); err != nil {
+				return err
+			}
+			ids = append(ids, id.Elem())
+		}
+		if err := rows.Err(); err != nil {
 			return err
 		}
-		idx++
+		if len(ids) != len(entities) {
+			return fmt.Errorf("zorm: INSERT returned %d rows for %d entities", len(ids), len(entities))
+		}
+		for i, id := range ids {
+			reflect.ValueOf(entities[i]).Elem().FieldByIndex(pkField.Index).Set(id)
+		}
+		return nil
 	}
-	return rows.Err()
+	if tx != nil {
+		return run(tx)
+	}
+	// A trigger can skip rows in one statement too. Roll back when its
+	// RETURNING rows cannot be matched to all inputs.
+	return m.withAutoTx(ctx, func(txm *Model[T]) error {
+		return run(txm.tx)
+	})
 }
 
 // UpdateMany updates records matching the query with values.
@@ -3185,7 +3207,7 @@ func (m *Model[T]) bulkInsertGroup(ctx context.Context, entities []*T) error {
 
 		// Extract values using cached field indices
 		for i, field := range fieldsToInsert {
-			args[i] = val.FieldByIndex(field.Index).Interface()
+			args[i] = fieldDatabaseValue(val.FieldByIndex(field.Index))
 		}
 
 		// Execute and scan returned ID
