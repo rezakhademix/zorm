@@ -1055,7 +1055,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			fkVal = fieldVal.Interface()
 		}
 
-		if isZero(fkVal) {
+		// A non-nil pointer makes zero a present key rather than SQL NULL.
+		if fieldVal.Kind() != reflect.Pointer && isZero(fkVal) {
 			continue
 		}
 
@@ -1741,7 +1742,8 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 			fkVal = fieldVal.Interface()
 		}
 
-		if isZero(fkVal) {
+		// A non-nil pointer makes zero a present key rather than SQL NULL.
+		if fieldVal.Kind() != reflect.Pointer && isZero(fkVal) {
 			continue
 		}
 

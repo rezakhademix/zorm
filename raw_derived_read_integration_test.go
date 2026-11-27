@@ -23,6 +23,11 @@ func TestRaw_DerivedReadsRejectBeforeSQL(t *testing.T) {
 		{"CountOver", func(m *Model[saveItem]) error { _, err := m.CountOver(ctx, "name"); return err }},
 		{"Pluck", func(m *Model[saveItem]) error { _, err := m.Pluck(ctx, "id"); return err }},
 		{"Find", func(m *Model[saveItem]) error { _, err := m.Find(ctx, 2); return err }},
+		{"Paginate", func(m *Model[saveItem]) error { _, err := m.Paginate(ctx, 1, 10); return err }},
+		{"SimplePaginate", func(m *Model[saveItem]) error { _, err := m.SimplePaginate(ctx, 1, 10); return err }},
+		{"Chunk", func(m *Model[saveItem]) error {
+			return m.Chunk(ctx, 10, func([]*saveItem) error { t.Error("rejected Raw query invoked callback"); return nil })
+		}},
 		{"FirstOrCreate", func(m *Model[saveItem]) error {
 			_, err := m.FirstOrCreate(ctx, map[string]any{"name": "new"}, nil)
 			return err

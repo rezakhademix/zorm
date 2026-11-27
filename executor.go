@@ -235,13 +235,20 @@ func (m *Model[T]) First(ctx context.Context) (*T, error) {
 // Uses Clone() so the primary-key condition is not accumulated on the receiver,
 // which lets the same model be reused for further queries.
 func (m *Model[T]) Find(ctx context.Context, id any) (*T, error) {
-	return m.lookupQuery().Where(m.modelInfo.PrimaryKey, id).First(ctx)
+	column := m.modelInfo.PrimaryKey
+	if len(m.joins) > 0 {
+		column = tableReference(m.TableName()) + "." + column
+	}
+	return m.lookupQuery().Where(column, id).First(ctx)
 }
 
 // lookupQuery groups the caller's scope before mandatory lookup predicates.
 // Every OR branch must satisfy the requested key or attributes.
 func (m *Model[T]) lookupQuery() *Model[T] {
 	q := m.Clone()
+	if q.buildErr == nil {
+		q.buildErr = q.validateDerivedRead()
+	}
 	if len(q.wheres) > 0 {
 		var sb strings.Builder
 		writeWhereConditions(&sb, q.wheres)
@@ -256,11 +263,23 @@ func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
 	return m.Find(ctx, id)
 }
 
+// validateDerivedRead rejects Raw state when a terminal builds a different
+// query or adds mandatory lookup predicates that raw SQL cannot incorporate.
+func (m *Model[T]) validateDerivedRead() error {
+	if m.rawQuery != "" {
+		return fmt.Errorf("zorm: %w: derived reads cannot be combined with Raw; use Get, First, Cursor, or Exec for raw SQL", ErrInvalidModel)
+	}
+	return nil
+}
+
 // Pluck retrieves a single column's values from the result set.
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return nil, err
+	}
+	if err := m.validateDerivedRead(); err != nil {
 		return nil, err
 	}
 	if err := ValidateColumnName(column); err != nil {
@@ -316,6 +335,9 @@ func validateScalarAggregate(groupBys, havings []string) error {
 // GroupBy and Having require selected aggregate expressions and Get instead.
 func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return 0, err
+	}
+	if err := m.validateDerivedRead(); err != nil {
 		return 0, err
 	}
 	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
@@ -401,6 +423,9 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return false, err
+	}
+	if err := m.validateDerivedRead(); err != nil {
 		return false, err
 	}
 	// Clone to avoid mutating shared state (thread-safe)
@@ -509,6 +534,9 @@ func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string
 	if err := m.GetBuildErr(); err != nil {
 		return 0, err
 	}
+	if err := m.validateDerivedRead(); err != nil {
+		return 0, err
+	}
 	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return 0, err
 	}
@@ -585,6 +613,9 @@ func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int64, error) {
 	if err := m.GetBuildErr(); err != nil {
+		return nil, err
+	}
+	if err := m.validateDerivedRead(); err != nil {
 		return nil, err
 	}
 	if err := ValidateColumnName(column); err != nil {

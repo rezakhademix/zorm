@@ -561,6 +561,10 @@ func parseFields(typ reflect.Type, info *ModelInfo, indexPrefix []int) {
 		// twice — invalid on PostgreSQL. Replace in place so the slice keeps
 		// both its single entry per column and a stable position.
 		if prev, shadowed := info.Columns[dbCol]; shadowed {
+			// Only the surviving field's tag determines the version role.
+			if info.VersionField == prev {
+				info.VersionField = nil
+			}
 			for i, f := range info.OrderedFields {
 				if f == prev {
 					info.OrderedFields[i] = fInfo

@@ -426,6 +426,13 @@ func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) erro
 		return fmt.Errorf("zorm: Chunk: size must be positive, got %d", size)
 	}
 
+	if err := m.GetBuildErr(); err != nil {
+		return err
+	}
+	if err := m.validateDerivedRead(); err != nil {
+		return err
+	}
+
 	page := 1
 	for {
 		// Clone to avoid mutating the original model's limit/offset
@@ -794,6 +801,12 @@ func (m *Model[T]) Paginate(ctx context.Context, page, perPage int) (*Pagination
 // If page is less than 1, it defaults to 1.
 // If perPage is less than 1, it defaults to 15.
 func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*PaginationResult[T], error) {
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
+	}
+	if err := m.validateDerivedRead(); err != nil {
+		return nil, err
+	}
 	if page < 1 {
 		page = 1
 	}
