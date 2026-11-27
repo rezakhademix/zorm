@@ -419,7 +419,12 @@ func (m *Model[T]) OrWhereNotNull(column string) *Model[T] {
 
 // Chunk processes the results in chunks to save memory.
 // Uses Clone() for each iteration to avoid mutating the original query state.
+// A non-positive size returns an error before any query is executed.
 func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) error) error {
+	if size <= 0 {
+		return fmt.Errorf("zorm: Chunk: size must be positive, got %d", size)
+	}
+
 	page := 1
 	for {
 		// Clone to avoid mutating the original model's limit/offset
@@ -912,10 +917,10 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 			return m
 		}
 		if len(constraints) > 0 {
-			for _, w := range constraints {
-				sb.WriteString(" ")
-				sb.WriteString(w)
-			}
+			// Keep every callback OR branch subject to the parent correlation.
+			sb.WriteString(" AND (")
+			writeWhereConditions(&sb, constraints)
+			sb.WriteByte(')')
 			m.args = append(m.args, args...)
 		}
 	}
@@ -1139,6 +1144,7 @@ func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
 // Common modes: "UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"
 // This will generate: SELECT ... FOR [mode]
 // Lock modes are validated against a whitelist to prevent SQL injection.
+// Outside a transaction, locking reads use the resolver's primary.
 func (m *Model[T]) Lock(mode string) *Model[T] {
 	// Validate lock mode to prevent SQL injection
 	normalizedMode := strings.ToUpper(strings.TrimSpace(mode))
