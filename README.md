@@ -1288,7 +1288,7 @@ Use `Raw(...).Get` / `First` for queries returning mapped rows and
 query itself: builder `Where`, `Select`, `OrderBy`, and `Limit` are not
 appended to it. Put the required clauses and placeholders in the SQL string.
 
-**Breaking change:** derived terminals (`Count`, `Sum`, `Avg`, `Min`, `Max`,
+derived terminals (`Count`, `Sum`, `Avg`, `Min`, `Max`,
 `Exists`, `CountOver`, `Pluck`, `Find`/`FindOrFail`, `FirstOrCreate`,
 `UpdateOrCreate`, `Paginate`, `SimplePaginate`, and `Chunk`) reject `Raw` state with `ErrInvalidModel` before preparing or
 executing SQL. Use `Get`, `First`, or `Cursor` to read the raw query, and write
