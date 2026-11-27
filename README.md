@@ -1524,7 +1524,9 @@ earlier versions, and making the key type explicit turns an out-of-date lookup
 (`counts[int64(5)]`) into a compile error rather than a silent zero.
 
 `CountOver` honors JOINs, CTEs, `WHERE` and the statement cache like the other
-aggregates.
+aggregates. Builders containing `GroupBy` or `Having` return
+`ErrGroupedAggregateRequiresGet` before SQL is executed; use selected aggregate
+expressions and `Get` for grouped results.
 
 ```go
 // Look up a partition using its string key
