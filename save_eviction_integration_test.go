@@ -21,25 +21,16 @@ func (e *evictionSaveItem) BeforeUpdate(context.Context) error {
 	return nil
 }
 
-// Loading enough entities inside BeforeUpdate can evict the entity being saved.
+// Evict the entity's baseline inside BeforeUpdate through the tracker's LRU.
 // Save must keep the validated baseline for both its diff and its final sync.
 func TestSave_EvictionCannotWidenPartialWrite(t *testing.T) {
 	for _, excluded := range []bool{false, true} {
 		old := globalTracker.Load()
-		ConfigureDirtyTracking(256)
+		ConfigureDirtyTracking(shardCount)
 		func() {
 			defer globalTracker.Store(old)
 			db := setupSaveDB(t)
 			defer db.Close()
-			_, err := db.Exec(`
-				WITH RECURSIVE ids(id) AS (
-					SELECT 3 UNION ALL SELECT id + 1 FROM ids WHERE id < 600
-				)
-				INSERT INTO save_items SELECT id, 'filler', 10 FROM ids
-			`)
-			if err != nil {
-				t.Fatal(err)
-			}
 			ctx := context.Background()
 			m := New[evictionSaveItem]().SetDB(db)
 			entity, err := m.Clone().Select("id", "name").Find(ctx, 1)
@@ -53,9 +44,10 @@ func TestSave_EvictionCannotWidenPartialWrite(t *testing.T) {
 				m.Exclude("value")
 			}
 			entity.Before = func() error {
-				if _, err := New[evictionSaveItem]().SetDB(db).Get(ctx); err != nil {
-					return err
-				}
+				// One entry fits per shard. A key offset by shardCount maps to
+				// the same shard, guaranteeing eviction without allocator assumptions.
+				key := getEntityKey(entity) + uintptr(shardCount)
+				globalTracker.Load().Store(key, map[string]any{"name": "filler"}, nil)
 				if IsTracked(entity) {
 					t.Fatal("test did not evict the entity's baseline")
 				}
