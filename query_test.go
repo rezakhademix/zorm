@@ -645,8 +645,8 @@ func TestWhere_IssueWithParentheses(t *testing.T) {
 		m := New[TestModel]().Where("name", "John")
 		query, _ := m.Print()
 
-		// Current implementation: "WHERE 1=1  AND (name = ?)"
-		// Should be: "WHERE 1=1 AND name = ?"
+		// Current implementation: "WHERE (name = ?)"
+		// Should be: "WHERE name = ?"
 		// The extra parentheses are being added on line 145 of query.go
 		t.Logf("Current query: %s", query)
 
@@ -1399,7 +1399,7 @@ func TestOrWhereIn_ValidatesColumn(t *testing.T) {
 
 	m1 := New[TestModel]().OrWhereIn("id", []any{1, 2, 3})
 	query1, _ := m1.Print()
-	if !strings.Contains(query1, "OR id IN") {
+	if !strings.Contains(query1, "WHERE id IN") {
 		t.Error("Valid column should generate IN clause" + query1)
 	}
 
@@ -1463,7 +1463,7 @@ func TestOrWhereNotIn_ValidatesColumn(t *testing.T) {
 
 	m1 := New[TestModel]().OrWhereNotIn("id", []any{1, 2, 3})
 	query1, _ := m1.Print()
-	if !strings.Contains(query1, "OR id NOT IN") {
+	if !strings.Contains(query1, "WHERE id NOT IN") {
 		t.Error("Valid column should generate NOT IN clause")
 	}
 
@@ -1620,7 +1620,7 @@ func TestWhereOperator_OrWhereMatchesWhere(t *testing.T) {
 		t.Fatalf("OrWhere rejected a valid operator: %v", m.buildErr)
 	}
 	query, _ := m.Print()
-	if !strings.Contains(query, "OR tags @> $1") {
-		t.Errorf("expected %q, got %q", "OR tags @> $1", query)
+	if !strings.Contains(query, "WHERE tags @> $1") {
+		t.Errorf("expected %q, got %q", "WHERE tags @> $1", query)
 	}
 }

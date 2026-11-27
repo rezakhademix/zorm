@@ -25,8 +25,8 @@ type unsafeStructFilter struct {
 
 func TestBuilderGuards_ConstraintExtractionAndStructFilters(t *testing.T) {
 	for _, input := range []any{nil, 1, emptyConstraintMethods{}, wrongConstraintMethods{}} {
-		wheres, args := extractQueryConstraints(input)
-		if len(wheres) != 0 || len(args) != 0 {
+		wheres, args, err := extractQueryConstraints(input)
+		if err != nil || len(wheres) != 0 || len(args) != 0 {
 			t.Errorf("invalid constraint source was accepted: %T", input)
 		}
 	}
@@ -43,7 +43,7 @@ func TestBuilderGuards_ConstraintExtractionAndStructFilters(t *testing.T) {
 		t.Errorf("unsafe internal column form accepted: %v", m.buildErr)
 	}
 	for _, source := range []string{"name IS NOT", "name IS", "name >="} {
-		if !hasTrailingOperator(source) {
+		if _, err := buildWhereComparison(source); err != nil {
 			t.Errorf("supported trailing operator rejected: %s", source)
 		}
 	}

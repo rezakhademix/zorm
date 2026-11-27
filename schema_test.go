@@ -365,9 +365,7 @@ func TestSetField_Exhaustive(t *testing.T) {
 			t.Error("expected error for invalid uint string")
 		}
 		if err := setUintField(fUint, -1); err == nil {
-			// -1 as int to uint64 works in Go bitwise, but let's see if zorm handles it.
-			// setUintField does uint64(v), which for -1 is huge.
-			// But zorm doesn't check sign for int types to uint conversion.
+			t.Error("expected error for negative int to uint")
 		}
 		if err := setUintField(fUint, true); err == nil {
 			t.Error("expected error for bool to uint")

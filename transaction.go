@@ -5,12 +5,43 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // Tx wraps sql.Tx.
 type Tx struct {
-	Tx  *sql.Tx
-	ctx context.Context
+	Tx    *sql.Tx
+	ctx   context.Context
+	state *transactionState
+}
+
+// transactionState retains the first baseline for each entity touched by a
+// managed transaction. A rollback restores it; an uncertain outcome invalidates it.
+type transactionState struct {
+	mu        sync.Mutex
+	originals map[uintptr]func(bool)
+}
+
+func (s *transactionState) remember(key uintptr, restore func(bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.originals != nil {
+		if _, exists := s.originals[key]; !exists {
+			s.originals[key] = restore
+		}
+	}
+}
+
+func (s *transactionState) finish(committed, rolledBack bool) {
+	s.mu.Lock()
+	originals := s.originals
+	s.originals = nil
+	s.mu.Unlock()
+	if !committed {
+		for _, restore := range originals {
+			restore(rolledBack)
+		}
+	}
 }
 
 // ErrRollbackFailed is joined into the returned error when a transaction fails
@@ -65,23 +96,27 @@ func transaction(ctx context.Context, db *sql.DB, fn func(tx *Tx) error) (err er
 		return err
 	}
 
-	zTx := &Tx{Tx: tx, ctx: ctx}
+	zTx := &Tx{Tx: tx, ctx: ctx, state: &transactionState{originals: make(map[uintptr]func(bool))}}
 
 	defer func() {
 		if p := recover(); p != nil {
 			// Attempt rollback on panic, but still re-panic with original value
 			// Rollback error is discarded as we must re-panic
-			_ = tx.Rollback()
+			rbErr := tx.Rollback()
+			zTx.state.finish(false, rbErr == nil)
 			panic(p)
 		} else if err != nil {
 			// Wrap rollback error with original error if rollback fails.
 			// Both the original error and ErrRollbackFailed stay identifiable
 			// through errors.Is.
-			if rbErr := tx.Rollback(); rbErr != nil {
+			rbErr := tx.Rollback()
+			zTx.state.finish(false, rbErr == nil)
+			if rbErr != nil {
 				err = fmt.Errorf("%w (%w: %v)", err, ErrRollbackFailed, rbErr)
 			}
 		} else {
 			err = tx.Commit()
+			zTx.state.finish(err == nil, false)
 		}
 	}()
 
@@ -104,6 +139,7 @@ func transaction(ctx context.Context, db *sql.DB, fn func(tx *Tx) error) (err er
 func (m *Model[T]) WithTx(tx *Tx) *Model[T] {
 	clone := m.Clone()
 	clone.tx = tx.Tx
+	clone.txState = tx.state
 	clone.ctx = tx.ctx
 	return clone
 }

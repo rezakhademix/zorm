@@ -175,8 +175,8 @@ func (m *Model[T]) prepareStmtForWrite(ctx context.Context, query string) (*sql.
 
 // Get executes the query and returns a slice of results.
 func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
-	if m.buildErr != nil {
-		return nil, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
 	}
 	query, args := m.buildSelectQuery()
 
@@ -248,8 +248,8 @@ func (m *Model[T]) FindOrFail(ctx context.Context, id any) (*T, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
-	if m.buildErr != nil {
-		return nil, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
 	}
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
@@ -294,8 +294,8 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 // When the query includes GROUP BY, DISTINCT, or DISTINCT ON, the count is wrapped
 // in a subquery to return the correct total number of rows.
 func (m *Model[T]) Count(ctx context.Context) (int64, error) {
-	if m.buildErr != nil {
-		return 0, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return 0, err
 	}
 	// Clone to avoid mutating shared state (thread-safe)
 	q := m.Clone()
@@ -385,8 +385,8 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 // It uses "SELECT 1 FROM table WHERE conditions LIMIT 1" for efficiency.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
-	if m.buildErr != nil {
-		return false, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return false, err
 	}
 	// Clone to avoid mutating shared state (thread-safe)
 	q := m.Clone()
@@ -441,8 +441,8 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
-	if m.buildErr != nil {
-		return 0, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return 0, err
 	}
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
@@ -501,8 +501,8 @@ func (m *Model[T]) Sum(ctx context.Context, column string) (float64, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
-	if m.buildErr != nil {
-		return 0, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return 0, err
 	}
 	if err := ValidateColumnName(column); err != nil {
 		return 0, err
@@ -574,8 +574,8 @@ func (m *Model[T]) Avg(ctx context.Context, column string) (float64, error) {
 // Column names are validated to prevent SQL injection.
 // This method is safe for concurrent use - it clones the model before modification.
 func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int64, error) {
-	if m.buildErr != nil {
-		return nil, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
 	}
 	if err := ValidateColumnName(column); err != nil {
 		return nil, err
@@ -771,15 +771,27 @@ func (m *Model[T]) buildJoinClause(sb *strings.Builder) {
 }
 
 // buildWhereClause appends WHERE conditions to the query builder.
-// It uses "WHERE 1=1" as a base to simplify appending AND/OR conditions.
 func (m *Model[T]) buildWhereClause(sb *strings.Builder) {
 	if len(m.wheres) > 0 {
-		sb.WriteString(" WHERE 1=1 ") // Simplifies appending AND/OR
-		for _, w := range m.wheres {
-			sb.WriteString(" ")
-			sb.WriteString(w)
-		}
+		sb.WriteString(" WHERE ")
+		writeWhereConditions(sb, m.wheres)
 	}
+}
+
+// buildEntityWhereClause combines the caller's scope with the entity key.
+// Parentheses keep every OR branch subject to the primary-key restriction.
+func (m *Model[T]) buildEntityWhereClause(sb *strings.Builder, pkVal any) []any {
+	sb.WriteString(" WHERE ")
+	if len(m.wheres) > 0 {
+		sb.WriteByte('(')
+		writeWhereConditions(sb, m.wheres)
+		sb.WriteString(") AND ")
+	}
+	sb.WriteString(m.modelInfo.PrimaryKey)
+	sb.WriteString(" = ?")
+	args := make([]any, 0, len(m.args)+1)
+	args = append(args, m.args...)
+	return append(args, pkVal)
 }
 
 // columnMappingCache caches column-to-field mappings per query signature.
@@ -952,7 +964,7 @@ func (m *Model[T]) scanRows(ctx context.Context, rows *sql.Rows) ([]*T, error) {
 		}
 
 		// Track originals for dirty tracking (with optional scope)
-		trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
+		m.trackOriginals(entity)
 
 		// AfterFind Hook
 		if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
@@ -977,8 +989,8 @@ func (m *Model[T]) scanRows(ctx context.Context, rows *sql.Rows) ([]*T, error) {
 // because it requires all rows to be available for batch loading. Use Get() instead
 // when relation loading is needed.
 func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
-	if m.buildErr != nil {
-		return nil, m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
 	}
 	if len(m.relations) > 0 || len(m.relationCallbacks) > 0 || len(m.morphRelations) > 0 {
 		return nil, fmt.Errorf("zorm: Cursor does not support eager relation loading (With/WithCallback/WithMorph); use Get() instead")
@@ -1045,7 +1057,7 @@ func (c *Cursor[T]) Scan(ctx context.Context) (*T, error) {
 	}
 
 	// Track originals for dirty tracking (with optional scope)
-	trackOriginalsWithScope(entity, c.model.modelInfo, c.model.trackingScope)
+	c.model.trackOriginals(entity)
 
 	// AfterFind Hook
 	if hook, ok := any(entity).(interface{ AfterFind(context.Context) error }); ok {
@@ -1279,31 +1291,14 @@ func (m *Model[T]) scanRowsDynamic(ctx context.Context, rows *sql.Rows, modelInf
 // commits on success or rolls back on error/panic. Used by write operations when the
 // entity implements a *Tx hook variant so the hook can do additional DB work that
 // rolls back atomically with the parent SQL.
-func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) (err error) {
+func (m *Model[T]) withAutoTx(ctx context.Context, op func(*Model[T]) error) error {
 	db := m.writeDB()
 	if db == nil {
 		return ErrNilDatabase
 	}
-	sqlTx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	txModel := m.WithTx(&Tx{Tx: sqlTx, ctx: ctx})
-	defer func() {
-		if p := recover(); p != nil {
-			_ = sqlTx.Rollback()
-			panic(p)
-		}
-		if err != nil {
-			if rbErr := sqlTx.Rollback(); rbErr != nil {
-				err = fmt.Errorf("%w (%w: %v)", err, ErrRollbackFailed, rbErr)
-			}
-			return
-		}
-		err = sqlTx.Commit()
-	}()
-	err = op(txModel)
-	return
+	return transaction(ctx, db, func(tx *Tx) error {
+		return op(m.WithTx(tx))
+	})
 }
 
 // writeOp identifies one of the three write operations that dispatch hooks.
@@ -1362,7 +1357,7 @@ func (m *Model[T]) callBeforeCreate(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		BeforeCreateTx(context.Context, *Tx) error
 	}); ok {
-		return hook.BeforeCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.BeforeCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		BeforeCreate(context.Context) error
@@ -1377,7 +1372,7 @@ func (m *Model[T]) callAfterCreate(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		AfterCreateTx(context.Context, *Tx) error
 	}); ok {
-		return hook.AfterCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.AfterCreateTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		AfterCreate(context.Context) error
@@ -1392,7 +1387,7 @@ func (m *Model[T]) callBeforeUpdate(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		BeforeUpdateTx(context.Context, *Tx) error
 	}); ok {
-		return hook.BeforeUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.BeforeUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		BeforeUpdate(context.Context) error
@@ -1407,7 +1402,7 @@ func (m *Model[T]) callAfterUpdate(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		AfterUpdateTx(context.Context, *Tx) error
 	}); ok {
-		return hook.AfterUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.AfterUpdateTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		AfterUpdate(context.Context) error
@@ -1423,7 +1418,7 @@ func (m *Model[T]) callBeforeDelete(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		BeforeDeleteTx(context.Context, *Tx) error
 	}); ok {
-		return hook.BeforeDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.BeforeDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		BeforeDelete(context.Context) error
@@ -1438,7 +1433,7 @@ func (m *Model[T]) callAfterDelete(ctx context.Context, entity *T) error {
 	if hook, ok := any(entity).(interface {
 		AfterDeleteTx(context.Context, *Tx) error
 	}); ok {
-		return hook.AfterDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx})
+		return hook.AfterDeleteTx(ctx, &Tx{Tx: m.tx, ctx: ctx, state: m.txState})
 	}
 	if hook, ok := any(entity).(interface {
 		AfterDelete(context.Context) error
@@ -1500,8 +1495,8 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	// Validate input
 	if entity == nil {
@@ -1511,19 +1506,11 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	// Auto-tx: if the entity uses a *Tx hook variant and we're not already in a
 	// transaction, open one so hook DB work rolls back atomically with the INSERT.
 	if m.tx == nil && needsAutoTx(opCreate, entity) {
-		err := m.withAutoTx(ctx, func(txm *Model[T]) error {
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
 			return txm.Create(ctx, entity)
 		})
-		if err != nil {
-			// The INSERT was rolled back, so the baseline recorded below no
-			// longer describes a row that exists. Leaving it would make the
-			// entity report as tracked and let Save() emit an UPDATE against a
-			// missing row. Field values (including the primary key) are left
-			// alone: in-memory mutations are never rolled back.
-			ClearOriginals(entity)
-		}
-		return err
 	}
+	m.rememberOriginals(entity)
 
 	// Auto-set created_at if it exists and the caller left it zero.
 	// Pre-set values are preserved so backfills / fixture imports keep control.
@@ -1588,7 +1575,7 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 	}
 
 	// Track the newly created entity so it can be used with dirty tracking
-	trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
+	m.trackOriginals(entity)
 
 	// AfterCreate Hook (prefers AfterCreateTx when implemented).
 	if err := m.callAfterCreate(ctx, entity); err != nil {
@@ -1616,8 +1603,8 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	// Validate input
 	if entity == nil {
@@ -1630,6 +1617,7 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 			return txm.Update(ctx, entity)
 		})
 	}
+	m.rememberOriginals(entity)
 
 	// Auto-update updated_at if it exists
 	if fieldInfo, ok := m.modelInfo.Columns["updated_at"]; ok {
@@ -1693,24 +1681,21 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 
-	// If entity is passed, update that entity.
-	// So add WHERE id = entity.ID
+	// Scope the write to the entity and the caller's conditions.
 
 	pkField, ok := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 	if !ok {
 		return fmt.Errorf("primary key field %q not found in model %s", m.modelInfo.PrimaryKey, m.modelInfo.TableName)
 	}
 	pkVal := val.FieldByIndex(pkField.Index).Interface()
-	sb.WriteString(" WHERE ")
-	sb.WriteString(m.modelInfo.PrimaryKey)
-	sb.WriteString(" = ?")
-	values = append(values, pkVal)
+	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
 
 	query := sb.String()
 
 	// args: CTE args + SET values + WHERE values
 	allArgs := append(cteArgs, values...)
 
+	var result sql.Result
 	var err error
 	// Use prepared statement if caching is enabled
 	if m.stmtCache != nil {
@@ -1722,17 +1707,24 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		}
 		defer release()
 
-		_, err = stmt.ExecContext(ctx, allArgs...)
+		result, err = stmt.ExecContext(ctx, allArgs...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
+		result, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
 	}
 
 	if err != nil {
 		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return WrapQueryError("UPDATE", query, allArgs, err)
+	}
+	if affected == 0 {
+		return ErrRecordNotFound
+	}
 
 	// Excluded and skipped columns retain their previous baseline.
-	syncOriginalColumns(entity, m.modelInfo, writtenColumns)
+	m.syncOriginalColumns(entity, writtenColumns)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {
@@ -1756,8 +1748,8 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	if entity == nil {
 		return ErrNilPointer
@@ -1773,6 +1765,7 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 			return txm.UpdateColumns(ctx, entity, columns...)
 		})
 	}
+	m.rememberOriginals(entity)
 
 	// Auto-update updated_at if it exists and not explicitly specified
 	hasUpdatedAt := false
@@ -1838,18 +1831,16 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
 
-	// WHERE id = ?
+	// Scope the write to the entity and the caller's conditions.
 	pkField := m.modelInfo.Columns[m.modelInfo.PrimaryKey]
 	pkVal := val.FieldByIndex(pkField.Index).Interface()
-	sb.WriteString(" WHERE ")
-	sb.WriteString(m.modelInfo.PrimaryKey)
-	sb.WriteString(" = ?")
-	values = append(values, pkVal)
+	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
 
 	query := sb.String()
 	allArgs := append(cteArgs, values...)
 
 	// Execute
+	var result sql.Result
 	var err error
 	if m.stmtCache != nil {
 		var stmt *sql.Stmt
@@ -1860,17 +1851,24 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		}
 		defer release()
 
-		_, err = stmt.ExecContext(ctx, allArgs...)
+		result, err = stmt.ExecContext(ctx, allArgs...)
 	} else {
-		_, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
+		result, err = m.queryerForWrite().ExecContext(ctx, rebind(query), allArgs...)
 	}
 
 	if err != nil {
 		return WrapQueryError("UPDATE", query, allArgs, err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return WrapQueryError("UPDATE", query, allArgs, err)
+	}
+	if affected == 0 {
+		return ErrRecordNotFound
+	}
 
 	// Only columns that reached SET are now clean.
-	syncOriginalColumns(entity, m.modelInfo, writtenColumns)
+	m.syncOriginalColumns(entity, writtenColumns)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {
@@ -1914,8 +1912,8 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	if entity == nil {
 		return ErrNilPointer
@@ -1927,6 +1925,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 			return txm.Save(ctx, entity)
 		})
 	}
+	m.rememberOriginals(entity)
 
 	val := reflect.ValueOf(entity).Elem()
 
@@ -1943,7 +1942,8 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	// non-PK field as dirty and silently rewrite the whole row (overwriting
 	// columns that the caller never intended to touch). Callers must load via
 	// Find / First / Get, or fall back to Update for full-column writes.
-	if !IsTracked(entity) {
+	originals, tracked := globalTracker.Load().LoadForTransaction(getEntityKey(entity), entity, m.tx)
+	if !tracked {
 		return ErrSaveUntracked
 	}
 
@@ -1955,9 +1955,23 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		return err
 	}
 
+	var loadedVersion int64
+	var hasVersion bool
+	var versionKind reflect.Kind
+	if field := m.modelInfo.VersionField; field != nil {
+		current := val.FieldByIndex(field.Index)
+		original := originals[field.Column]
+		if !fastEqual(original, current.Interface()) {
+			return fmt.Errorf("zorm: %w: version field %s was modified; reload the entity before saving", ErrOptimisticLock, field.Column)
+		}
+		hasVersion = true
+		versionKind = current.Kind()
+		loadedVersion = toInt64Version(reflect.ValueOf(original))
+	}
+
 	// Compute dirty set AFTER BeforeUpdate so hook mutations are observed,
 	// and BEFORE auto-touching updated_at so a true no-op stays a no-op.
-	dirty := getDirty(entity, m.modelInfo)
+	dirty := getDirtyFromOriginals(entity, m.modelInfo, originals)
 
 	// A created_at zeroed in memory must not erase the stored timestamp (see
 	// the same guard in Update). Dropped before the updated_at touch below so
@@ -2011,15 +2025,8 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 		values = append(values, dirty[col])
 	}
 
-	var loadedVersion int64
-	var hasVersion bool
-	var versionKind reflect.Kind
-	if m.modelInfo.VersionField != nil {
+	if hasVersion {
 		vf := m.modelInfo.VersionField
-		hasVersion = true
-		vVal := val.FieldByIndex(vf.Index)
-		versionKind = vVal.Kind()
-		loadedVersion = toInt64Version(vVal)
 		// Refuse to wrap around silently. The next increment would either
 		// overflow int64 or wrap a smaller integer type back to a negative
 		// value, breaking the optimistic-lock invariant.
@@ -2035,10 +2042,7 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	sb.WriteString(m.TableName())
 	sb.WriteString(" SET ")
 	sb.WriteString(strings.Join(sets, ", "))
-	sb.WriteString(" WHERE ")
-	sb.WriteString(m.modelInfo.PrimaryKey)
-	sb.WriteString(" = ?")
-	values = append(values, pkVal)
+	values = append(values, m.buildEntityWhereClause(&sb, pkVal)...)
 
 	if hasVersion {
 		sb.WriteString(" AND ")
@@ -2101,7 +2105,8 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	if hasVersion {
 		cols = append(cols, m.modelInfo.VersionField.Column)
 	}
-	syncOriginalColumns(entity, m.modelInfo, cols)
+	syncOriginalColumnsFromOriginals(entity, m.modelInfo, cols, originals)
+	m.bindOriginals(entity)
 
 	// AfterUpdate Hook (prefers AfterUpdateTx when implemented).
 	if err := m.callAfterUpdate(ctx, entity); err != nil {
@@ -2115,8 +2120,13 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 // the model's table. Used by Save to distinguish ErrRecordNotFound from
 // ErrOptimisticLock when an optimistic-lock UPDATE matches zero rows.
 func (m *Model[T]) rowExists(ctx context.Context, pkVal any) (bool, error) {
-	q := "SELECT 1 FROM " + m.TableName() + " WHERE " + m.modelInfo.PrimaryKey + " = ? LIMIT 1"
-	row := m.queryerForWrite().QueryRowContext(ctx, rebind(q), pkVal)
+	var sb strings.Builder
+	cteArgs := m.buildWithClause(&sb)
+	sb.WriteString("SELECT 1 FROM ")
+	sb.WriteString(m.TableName())
+	args := append(cteArgs, m.buildEntityWhereClause(&sb, pkVal)...)
+	sb.WriteString(" LIMIT 1")
+	row := m.queryerForWrite().QueryRowContext(ctx, rebind(sb.String()), args...)
 	var one int
 	switch err := row.Scan(&one); err {
 	case nil:
@@ -2147,10 +2157,10 @@ func isZeroPK(v any) bool {
 // At least one WHERE condition is required to prevent accidental full-table deletes.
 // To intentionally delete all records use ForceDeleteAll().
 func (m *Model[T]) Delete(ctx context.Context) error {
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
-	if len(m.wheres) == 0 && m.rawQuery == "" {
+	if len(m.wheres) == 0 {
 		return fmt.Errorf("zorm: %w: Delete requires at least one WHERE condition to prevent accidental full-table deletes; use ForceDeleteAll() to delete all records", ErrInvalidModel)
 	}
 	return m.execDelete(ctx)
@@ -2166,8 +2176,8 @@ func (m *Model[T]) DeleteMany(ctx context.Context) error {
 // ForceDeleteAll deletes ALL records in the table without any WHERE conditions.
 // Use this only when a full-table delete is intentional.
 func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	return m.execDelete(ctx)
 }
@@ -2181,6 +2191,12 @@ func (m *Model[T]) ForceDeleteAll(ctx context.Context) error {
 // model-level concerns (audit logging, cache invalidation, access control) rather than
 // per-record state inspection.
 func (m *Model[T]) execDelete(ctx context.Context) error {
+	// Delete renders its own statement; raw SQL belongs to Exec and must not
+	// be silently discarded, even when builder conditions are also present.
+	if m.rawQuery != "" {
+		return fmt.Errorf("zorm: %w: Delete cannot be combined with Raw; use Exec to execute raw SQL", ErrInvalidModel)
+	}
+
 	// Auto-tx: see Create for rationale. Delete hooks fire on a zero-value *T,
 	// so we probe T (not an entity) for *Tx variants.
 	if m.tx == nil && needsAutoTx(opDelete, new(T)) {
@@ -2236,6 +2252,9 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 
 // Exec executes the query (Raw or Builder) and returns the result.
 func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
+	if err := m.GetBuildErr(); err != nil {
+		return nil, err
+	}
 	if m.rawQuery != "" {
 		// Rebind like every other execution path, so a raw query written with ?
 		// placeholders works on PostgreSQL here as it does through Get/Print.
@@ -2386,8 +2405,8 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	if len(entities) == 0 {
 		return nil
@@ -2672,8 +2691,8 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	if len(values) == 0 {
 		return nil
@@ -2764,8 +2783,8 @@ func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColu
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	// Validate column names
 	if err := ValidateColumnName(lookupColumn); err != nil {
@@ -2857,14 +2876,13 @@ func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targe
 		args = append(args, time.Now())
 	}
 
-	// Build existing WHERE clause
-	m.buildWhereClause(sb)
-
-	// Add IN clause for lookup column
-	if len(m.wheres) == 0 {
-		sb.WriteString(" WHERE ")
-	} else {
-		sb.WriteString(" AND ")
+	// Every caller predicate must also satisfy the lookup-key restriction.
+	// Group OR branches before appending the mandatory IN clause.
+	sb.WriteString(" WHERE ")
+	if len(m.wheres) > 0 {
+		sb.WriteByte('(')
+		writeWhereConditions(sb, m.wheres)
+		sb.WriteString(") AND ")
 	}
 	sb.WriteString(lookupColumn)
 	sb.WriteString(" IN (")
@@ -2952,8 +2970,8 @@ func (m *Model[T]) BulkInsert(ctx context.Context, entities []*T) error {
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
-	if m.buildErr != nil {
-		return m.buildErr
+	if err := m.GetBuildErr(); err != nil {
+		return err
 	}
 	if len(entities) == 0 {
 		return nil

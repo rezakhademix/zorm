@@ -296,9 +296,9 @@ func (m *Model[T]) trackRelatedResults(ctx context.Context, relConfig any, resul
 	}
 
 	if tracker, ok := rel.NewModel(ctx, m.db).(interface {
-		trackDynamic([]any, *TrackingScope)
+		trackDynamic([]any, *TrackingScope, *sql.Tx, *transactionState)
 	}); ok {
-		tracker.trackDynamic(results, m.trackingScope)
+		tracker.trackDynamic(results, m.trackingScope, m.tx, m.txState)
 	}
 }
 
@@ -310,10 +310,14 @@ func (m *Model[T]) trackRelatedResults(ctx context.Context, relConfig any, resul
 //
 // Elements that are not *T are skipped rather than panicking: a caller mixing
 // types has a bug elsewhere, and dropping tracking is the harmless outcome.
-func (m *Model[T]) trackDynamic(results []any, scope *TrackingScope) {
+func (m *Model[T]) trackDynamic(results []any, scope *TrackingScope, tx *sql.Tx, state *transactionState) {
+	m.tx = tx
+	m.txState = state
 	for _, r := range results {
 		if entity, ok := r.(*T); ok {
+			m.rememberOriginals(entity)
 			trackOriginalsWithScope(entity, m.modelInfo, scope)
+			m.bindOriginals(entity)
 		}
 	}
 }

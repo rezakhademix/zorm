@@ -111,7 +111,7 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 		// Sorted for the same reason as Model.addWhere: a randomized walk emits
 		// a different statement per call.
 		for _, k := range sortedKeys(conditionMap) {
-			if err := ValidateColumnName(k); err != nil {
+			if err := validateColumnIdentifier(k); err != nil {
 				q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", k, err)
 				return q
 			}
@@ -153,20 +153,17 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 		}
 		q.wheres = append(q.wheres, typ+" "+queryStr)
 	case 1:
-		// column, value -> column = value
-		if err := ValidateColumnName(queryStr); err != nil {
-			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", queryStr, err)
+		// column, value -> column = value (or a trailing operator).
+		comparison, err := buildWhereComparison(queryStr)
+		if err != nil {
+			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: %w", err)
 			return q
 		}
-		sb := GetStringBuilder()
-		sb.WriteString(queryStr)
-		sb.WriteString(" = ?")
-		q.wheres = append(q.wheres, typ+" "+sb.String())
-		PutStringBuilder(sb)
+		q.wheres = append(q.wheres, typ+" "+comparison)
 		q.args = append(q.args, args[0])
 	case 2:
 		// column, operator, value -> column operator value
-		if err := ValidateColumnName(queryStr); err != nil {
+		if err := validateColumnIdentifier(queryStr); err != nil {
 			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: invalid column %q: %w", queryStr, err)
 			return q
 		}
@@ -467,11 +464,8 @@ func (q *ScalarQuery[T]) buildQuery() string {
 // buildWhereClause appends WHERE conditions to the query builder.
 func (q *ScalarQuery[T]) buildWhereClause(sb *strings.Builder) {
 	if len(q.wheres) > 0 {
-		sb.WriteString(" WHERE 1=1 ")
-		for _, w := range q.wheres {
-			sb.WriteByte(' ')
-			sb.WriteString(w)
-		}
+		sb.WriteString(" WHERE ")
+		writeWhereConditions(sb, q.wheres)
 	}
 }
 

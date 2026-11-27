@@ -307,8 +307,10 @@ users, err := zorm.New[User]().OrderBy("id", "ASC").Limit(50).Get(ctx)
 zero, empty strings, and nil pointers. A partially populated struct can
 therefore overwrite values you did not intend to change. Use `UpdateColumns`
 for an explicit field list, or load the entity and use `Save` for dirty fields.
-These entity methods select the row by its primary key; use `UpdateMany` for
-additional WHERE-based update conditions.
+These entity methods combine the primary key with any builder `Where`
+conditions. Every OR branch remains subject to the primary key. A write that
+matches no row returns `ErrRecordNotFound` and leaves its changes dirty.
+Use `UpdateMany` to update a filtered batch without an entity.
 
 ```go
 // Change one field without rewriting the rest of the row
@@ -354,11 +356,62 @@ or automatic timestamp handling. `Save` still manages its optimistic-lock
 version column. `UpdateColumns` uses its own explicit column list and does not
 apply exclusions.
 
+#### Scoping an entity update
+
+`Update`, `UpdateColumns`, and `Save` combine your filters with the entity's
+primary key. For a users table with a `tenant_id` column:
+
+```go
+user, err := zorm.New[User]().Find(ctx, 42)
+if err != nil {
+    return err
+}
+user.Name += " (updated)"
+
+// Update only user 42, and only if it belongs to tenant 1 or tenant 2
+query := zorm.New[User]().
+    Where("tenant_id", 1).
+    OrWhere("tenant_id", 2)
+
+err = query.Update(ctx, user)
+if zorm.IsNotFound(err) {
+    // No row matched: the name change has not been saved
+    fmt.Println(query.IsDirtyField(user, "name")) // true
+    return err
+}
+if err != nil {
+    return err
+}
+```
+
+The WHERE clause is equivalent to:
+
+```sql
+WHERE (tenant_id = 1 OR tenant_id = 2) AND id = 42
+```
+
+Every OR branch remains restricted to user 42. If the row was deleted or
+belongs to another tenant, the write returns `ErrRecordNotFound` and leaves
+the tracked entity's changes dirty. The same filtering applies when calling
+`query.UpdateColumns(ctx, user, "name")` or `query.Save(ctx, user)`.
+A clean `Save` remains a no-op and does not check whether a row matches.
+
+To update every matching user, use `UpdateMany` without an entity:
+
+```go
+// Deactivate all users in tenant 1, regardless of their primary keys
+err := zorm.New[User]().
+    Where("tenant_id", 1).
+    UpdateMany(ctx, map[string]any{"active": false})
+```
+
 #### Deleting records
 
 `Delete` and `DeleteMany` execute a WHERE-based delete and require at least
 one condition. They do not use an entity's ID unless you add that condition.
 They perform physical deletion; soft deletion is an application convention.
+Combining `Raw` with a delete builder returns `ErrInvalidModel`; execute raw
+SQL through `Exec` instead.
 
 ```go
 // Delete one row by its primary key
@@ -1243,14 +1296,61 @@ if errors.Is(err, zorm.ErrInvalidColumnName) {
 }
 ```
 
+Column/value `Where` forms accept a single identifier, optionally qualified
+with a table or schema name, and an optional recognized trailing operator.
+
+```go
+zorm.New[User]().Where("name", "Alice")           // name = ?
+zorm.New[User]().Where("users.name", "Alice")     // users.name = ?
+zorm.New[User]().Where("public.users.id", 42)     // public.users.id = ?
+zorm.New[User]().Where("age", ">", 18)            // age > ?
+zorm.New[User]().Where("age >", 18)               // age > ?
+
+// Expressions use trusted SQL text with explicit placeholders
+zorm.New[User]().Where("LOWER(name) = ?", "alice")
+
+// An expression is not a column identifier
+query := zorm.New[User]().Where("LOWER(name)", "alice")
+_, err := query.Get(ctx)
+// errors.Is(err, zorm.ErrInvalidColumnName) == true; the query never ran
+```
+
+Keep expression text fixed and pass user input as bound arguments.
+
+Map-based assignment, such as `UpdateOrCreate`, rejects numeric range and
+signedness overflow before writing. For example:
+
+| Map value        | Target struct field type | Result                                         |
+| ---------------- | ------------------------ | ---------------------------------------------- |
+| `int64(300)`     | `int8`                   | Error; does not wrap to `44`                   |
+| `int64(-1)`      | `uint64`                 | Error; does not wrap to a large positive value |
+| `int64(127)`     | `int8`                   | Accepted as `127`                              |
+| `float64(10.9)`  | `int`                    | Accepted as `10`                               |
+| `float64(-10.9)` | `int`                    | Accepted as `-10`                              |
+
+Valid float-to-integer conversions truncate toward zero: they remove the
+fractional part without rounding. If `User.Age` is an `int`:
+
+```go
+user, err := zorm.New[User]().UpdateOrCreate(ctx,
+    map[string]any{"id": 42},
+    map[string]any{"age": float64(10.9)},
+)
+if err != nil {
+    return err
+}
+fmt.Println(user.Age) // 10
+```
+
 Rules worth knowing:
 
 - **Write methods refuse to run with a build error.** This matters most for
   `UpdateMany` / `UpdateManyByKey`: a dropped `WHERE` would otherwise turn a
   targeted update into a table-wide one.
 - **Errors propagate out of nested scopes.** A rejected condition inside a
-  `Where(func)` group or a `WithCallback` callback fails the outer query rather
-  than silently dropping the group or the relation filter.
+  `Where(func)` group, a `WhereHas` / `WithCallback` callback, or a CTE builder
+  fails the outer query rather than silently dropping its filter. CTE builders
+  are checked again at execution time, including edits made after attachment.
 - **`OrderBy` rejects an unrecognized direction.** Earlier versions coerced
   anything that was not `ASC`/`DESC` to `DESC`, which silently ordered results the
   opposite way from the request. `"asc"`, `"ASC"`, `"desc"` and `"DESC"` are
@@ -2378,6 +2478,10 @@ Transaction features:
 - Auto-rollback on panic (re-panics after rollback)
 - Auto-commit on nil return
 - Routed to the primary when a `DBResolver` is configured
+- Restores pre-transaction dirty-tracking baselines and managed versions on
+  successful rollback, while retaining pending user edits
+- Invalidates affected baselines if commit or rollback fails; reload before
+  calling `Save` again when the transaction outcome is uncertain
 - If the rollback *itself* fails, the returned error matches both your original
   error and `errors.Is(err, zorm.ErrRollbackFailed)` — worth branching on, since
   the connection state is then unknown
@@ -2432,8 +2536,11 @@ return nativeTx.Commit()
 ```
 
 The application owns commit/rollback for a native transaction. Do not let a
-transaction-bound model escape beyond the transaction's lifetime. Reload
-entities after rollback before reusing dirty-tracking or version state.
+transaction-bound model escape beyond the transaction's lifetime. Baselines
+produced by native-transaction reads and writes are bound to that `sql.Tx`:
+repeated saves work inside it, but saving through another transaction or an
+unbound model returns `ErrSaveUntracked`. Reload after native commit or
+rollback before saving outside that transaction.
 
 ---
 
@@ -2712,7 +2819,9 @@ Supported version-field kinds: `int`, `int32`, `int64`, `uint`, `uint32`,
 
 Reload from the primary after a conflict, then decide whether the requested
 change is still valid. Do not overwrite the version in memory or retry a
-stale entity blindly. A concurrently deleted row returns
+stale entity blindly. `Save` compares against the loaded version and returns
+`ErrOptimisticLock` if application code or a hook changes that version field.
+A concurrently deleted row returns
 `ErrRecordNotFound`; a version that cannot be incremented returns
 `ErrVersionOverflow`.
 
@@ -3063,7 +3172,7 @@ sql, args := zorm.New[User]().
     Limit(10).
     Print()
 
-fmt.Println(sql)   // SELECT * FROM users WHERE 1=1 AND age > $1 ORDER BY name ASC LIMIT 10
+fmt.Println(sql)   // SELECT * FROM users WHERE age > $1 ORDER BY name ASC LIMIT 10
 fmt.Println(args)  // [18]
 ```
 
