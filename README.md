@@ -1347,6 +1347,9 @@ Rules worth knowing:
 - **Write methods refuse to run with a build error.** This matters most for
   `UpdateMany` / `UpdateManyByKey`: a dropped `WHERE` would otherwise turn a
   targeted update into a table-wide one.
+- **Updates and deletes reject `Raw` and JOIN state.** These write builders
+  cannot render those constraints and return `ErrInvalidModel` instead of
+  discarding them. Use `Raw(...).Exec(ctx)` for raw or joined write SQL.
 - **Errors propagate out of nested scopes.** A rejected condition inside a
   `Where(func)` group, a `WhereHas` / `WithCallback` callback, or a CTE builder
   fails the outer query rather than silently dropping its filter. CTE builders
@@ -1579,8 +1582,10 @@ also make `Next()` return false. Normal exhaustion returns a nil error.
 `Cursor` supports `AfterFind`, accessors, and dirty tracking, but rejects
 `With`, `WithCallback`, and `WithMorph`. Use `Get` or `Chunk` for eager-loaded
 results. A cursor holds a database connection until closed or exhausted;
-performing another query inside the loop may wait indefinitely on a pool
-with only one connection.
+performing another query inside the loop or its `AfterFind` hook may wait
+indefinitely on a pool with only one connection. Buffered reads through `Get`,
+`First`, `Find`, and relation loading close their result sets before running
+`AfterFind` hooks.
 
 ```go
 // Stream only the columns needed for an export
@@ -1629,11 +1634,17 @@ error, the lookup is retried once and the winning row is returned (or, for
 constraint — one the search attributes do not select for — is returned to you
 unchanged, since retrying could not resolve it.
 
+Both the initial lookup and duplicate-key recovery read from the primary when
+a resolver is configured, so replication lag cannot decide these writes.
+
 Use search attributes backed by a database unique constraint. `values` are
 defaults only for `FirstOrCreate`; an existing row is returned unchanged.
 `UpdateOrCreate` applies only the columns in `values` (plus the automatic
 `updated_at` timestamp) when the row already exists. Supply
 explicit values for required columns on the creation path.
+
+For an existing row, `UpdateOrCreate` rejects a primary-key change with
+`ErrInvalidModel`. Repeating the same key after type conversion is allowed.
 
 ```go
 // Preserve an existing name; set it only when the user is first created
@@ -2139,6 +2150,9 @@ users, _ := zorm.New[User]().WithCallback("Posts", func(q *zorm.Model[Post]) {
 
 A validation failure inside the callback is returned by `Get` / `Load`; the
 relation is not loaded unfiltered.
+
+`Load` and `LoadSlice` replace previous relation values. A missing match or
+cleared foreign key leaves an empty relation rather than retaining old data.
 
 Eager loading queries related rows separately; it does not flatten all rows
 with SQL JOINs. Select the parent matching keys and related foreign/owner

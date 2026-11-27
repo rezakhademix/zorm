@@ -454,6 +454,14 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 
 		// Dispatch based on type
 		if rel, ok := relConfig.(Relation); ok {
+			// A load replaces the previous relation, even when no rows match or
+			// a nullable foreign key no longer identifies a related record.
+			for _, parent := range results {
+				field := m.modelInfo.GetRelationField(reflect.ValueOf(parent).Elem(), relName)
+				if field.IsValid() && field.CanSet() {
+					field.SetZero()
+				}
+			}
 			switch rel.RelationType() {
 			case RelationHasMany:
 				// Pass group.Subs to loadHasMany to handle recursion
@@ -1489,6 +1497,17 @@ func (m *Model[T]) loadRelationsDynamic(ctx context.Context, results []any, mode
 		relConfig := retVals[0].Interface()
 
 		if rel, ok := relConfig.(Relation); ok {
+			// MorphTo is not dispatched by this dynamic loader.
+			if rel.RelationType() == RelationMorphTo {
+				continue
+			}
+			info := ParseModelType(modelType)
+			for _, parent := range results {
+				field := info.GetRelationField(reflect.ValueOf(parent).Elem(), relName)
+				if field.IsValid() && field.CanSet() {
+					field.SetZero()
+				}
+			}
 			switch rel.RelationType() {
 			case RelationHasMany, RelationHasOne:
 				if err := m.loadHasManyDynamic(ctx, results, modelType, relConfig, relName, group.Cols, group.Subs); err != nil {
