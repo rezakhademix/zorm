@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -158,6 +159,10 @@ func WrapQueryError(operation, query string, args []any, err error) error {
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrRecordNotFound
 	}
+
+	// Errors outlive pooled argument buffers. Retain our own slice before the
+	// caller clears or reuses the buffer that was passed to database/sql.
+	args = slices.Clone(args)
 
 	// Try PostgreSQL SQLSTATE codes first (more reliable)
 	sqlState := getSQLState(err)

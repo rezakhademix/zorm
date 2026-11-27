@@ -1161,6 +1161,11 @@ Join conditions compare column names; WHERE values remain bound arguments.
 Qualify ambiguous columns and alias joined results to fields on a result
 struct. A join returns flat rows; use `With` to fill relation fields instead.
 
+When `Select` is omitted, JOIN queries select the base table's columns
+(`base_table.*`) so a joined `id` cannot overwrite the model's identity.
+Select joined columns explicitly when building a combined result struct.
+`Find` qualifies its primary-key condition using the base table or its alias.
+
 ```go
 type UserPostRow struct {
     ID        int64
@@ -1282,6 +1287,26 @@ Use `Raw(...).Get` / `First` for queries returning mapped rows and
 `Raw(...).Exec` for statements returning a `sql.Result`. Raw SQL supplies the
 query itself: builder `Where`, `Select`, `OrderBy`, and `Limit` are not
 appended to it. Put the required clauses and placeholders in the SQL string.
+
+derived terminals (`Count`, `Sum`, `Avg`, `Min`, `Max`,
+`Exists`, `CountOver`, `Pluck`, `Find`/`FindOrFail`, `FirstOrCreate`,
+`UpdateOrCreate`, `Paginate`, `SimplePaginate`, and `Chunk`) reject `Raw` state with `ErrInvalidModel` before preparing or
+executing SQL. Use `Get`, `First`, or `Cursor` to read the raw query, and write
+any aggregation directly in that SQL:
+
+```go
+// Unsupported: Count cannot replace a raw SELECT.
+_, err := zorm.New[Order]().Raw("SELECT * FROM orders WHERE status = ?", "paid").Count(ctx)
+// errors.Is(err, zorm.ErrInvalidModel) == true
+
+// Supported: the raw SQL defines the aggregation explicitly.
+type OrderTotal struct {
+    Total float64
+}
+result, err := zorm.New[OrderTotal]().Raw(
+    "SELECT COALESCE(SUM(amount), 0) AS total FROM orders WHERE status = ?", "paid",
+).First(ctx)
+```
 
 ```go
 // Read a custom projection
@@ -2143,7 +2168,11 @@ the value type. A field and a method cannot share a Go name, so use the
 | `MorphTo[any]`        | `Imageable any`    | TypeMap selects the concrete parent model                         |
 
 Use explicit key configuration when joining through business keys instead
-of IDs. `LocalKey`, `ForeignKey`, and `OwnerKey` are database column names:
+of IDs. `HasOne` and `HasMany` match their configured `LocalKey`, defaulting
+to the parent's primary key. Nullable key pointers match by their values;
+in `BelongsTo`, a non-nil pointer containing zero is a present key, while nil
+represents SQL NULL. `LocalKey`, `ForeignKey`, and `OwnerKey` are database
+column names:
 
 ```go
 type Customer struct {
@@ -2692,6 +2721,9 @@ if zorm.IsSchemaError(err) {
 
 ### QueryError Details
 
+`QueryError` retains its own argument slice, so pooled batch-insert buffers
+can be cleared or reused without erasing the reported arguments.
+
 ```go
 user, err := zorm.New[User]().Create(ctx, &User{Email: "duplicate@example.com"})
 if err != nil {
@@ -2885,6 +2917,12 @@ stale entity blindly. `Save` compares against the loaded version and returns
 A concurrently deleted row returns
 `ErrRecordNotFound`; a version that cannot be incremented returns
 `ErrVersionOverflow`.
+
+When an outer field replaces an embedded field mapped to the same column,
+the outer field's tag determines whether optimistic locking is enabled.
+Repeat `zorm:"version"` on the outer field to keep locking; an untagged
+replacement is an ordinary column. The hidden embedded field is not used
+for version comparisons or increments.
 
 ```go
 // Distinguish a concurrent edit from a deleted row

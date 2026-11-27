@@ -46,6 +46,14 @@ func anyToKeyString(v any) string {
 		if s, ok := v.(fmt.Stringer); ok {
 			return s.String()
 		}
+		// Nullable keys must match the scanned value, not its pointer address.
+		value := reflect.ValueOf(v)
+		if value.IsValid() && value.Kind() == reflect.Pointer {
+			if value.IsNil() {
+				return "<nil>"
+			}
+			return anyToKeyString(value.Elem().Interface())
+		}
 		return fmt.Sprintf("%v", v)
 	}
 }
@@ -677,9 +685,25 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 }
 
 func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any, relName string, cols string, subRelations []string, constraints *relationConstraints) error {
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("invalid relation config")
+	}
+
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Ptr {
+		valConfig = valConfig.Elem()
+	}
 	// 1. Get IDs from results
 	ids := make([]any, len(results))
 	pkField := m.modelInfo.PrimaryKey
+	localKey := valConfig.FieldByName("LocalKey").String()
+	if localKey != "" {
+		pkField = localKey
+		if _, ok := m.modelInfo.Columns[localKey]; !ok {
+			return fmt.Errorf("zorm: %w: local key %q", ErrColumnNotFound, localKey)
+		}
+	}
 
 	// Look up field info once outside the loop
 	pkFieldInfo, hasPKField := m.modelInfo.Columns[pkField]
@@ -703,20 +727,11 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 	}
 
 	// 2. Get Related Model Instance
-	rel, ok := relConfig.(Relation)
-	if !ok {
-		return fmt.Errorf("invalid relation config")
-	}
-
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
 
 	// 3. Build Query
-	valConfig := reflect.ValueOf(relConfig)
-	if valConfig.Kind() == reflect.Ptr {
-		valConfig = valConfig.Elem()
-	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
@@ -1040,7 +1055,8 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 			fkVal = fieldVal.Interface()
 		}
 
-		if isZero(fkVal) {
+		// A non-nil pointer makes zero a present key rather than SQL NULL.
+		if fieldVal.Kind() != reflect.Pointer && isZero(fkVal) {
 			continue
 		}
 
@@ -1569,9 +1585,24 @@ func (m *Model[T]) loadRelationsDynamic(ctx context.Context, results []any, mode
 }
 
 func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelType reflect.Type, relConfig any, relName string, cols string, subRelations []string) error {
+	rel, ok := relConfig.(Relation)
+	if !ok {
+		return fmt.Errorf("loadHasManyDynamic: expected Relation interface, got %T", relConfig)
+	}
+	valConfig := reflect.ValueOf(relConfig)
+	if valConfig.Kind() == reflect.Pointer {
+		valConfig = valConfig.Elem()
+	}
 	modelInfo := ParseModelType(modelType)
 	ids := make([]any, len(results))
 	pkField := modelInfo.PrimaryKey
+	localKey := valConfig.FieldByName("LocalKey").String()
+	if localKey != "" {
+		pkField = localKey
+		if _, ok := modelInfo.Columns[localKey]; !ok {
+			return fmt.Errorf("zorm: %w: local key %q", ErrColumnNotFound, localKey)
+		}
+	}
 
 	for i, res := range results {
 		val := reflect.ValueOf(res).Elem()
@@ -1583,18 +1614,10 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		}
 	}
 
-	rel, ok := relConfig.(Relation)
-	if !ok {
-		return fmt.Errorf("loadHasManyDynamic: expected Relation interface, got %T", relConfig)
-	}
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
 
-	valConfig := reflect.ValueOf(relConfig)
-	if valConfig.Kind() == reflect.Pointer {
-		valConfig = valConfig.Elem()
-	}
 	foreignKey := valConfig.FieldByName("ForeignKey").String()
 	if foreignKey == "" {
 		foreignKey = ToSnakeCase(modelType.Name()) + "_id"
@@ -1719,7 +1742,8 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 			fkVal = fieldVal.Interface()
 		}
 
-		if isZero(fkVal) {
+		// A non-nil pointer makes zero a present key rather than SQL NULL.
+		if fieldVal.Kind() != reflect.Pointer && isZero(fkVal) {
 			continue
 		}
 
