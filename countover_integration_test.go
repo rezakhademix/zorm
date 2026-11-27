@@ -3,6 +3,9 @@ package zorm
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"reflect"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -128,5 +131,54 @@ func TestCountOver_UsesStmtCache(t *testing.T) {
 	}
 	if cache.Len() == 0 {
 		t.Error("expected CountOver to populate the statement cache")
+	}
+}
+
+func TestCountOver_RejectsGroupedQueriesBeforeSQL(t *testing.T) {
+	ctx := context.Background()
+	for _, shape := range []string{"group", "having", "both"} {
+		for _, mode := range []string{"direct", "cached", "transaction"} {
+			t.Run(shape+"/"+mode, func(t *testing.T) {
+				queries := 0
+				db := openFailureDB(t, &failureDB{query: func(string) (driver.Rows, error) {
+					queries++
+					return nil, errDatabaseFailure
+				}})
+				m := New[CoEvent]().SetDB(db).Where("kind", "click")
+				if shape != "having" {
+					m.GroupBy("bucket")
+				}
+				if shape != "group" {
+					m.Having("COUNT(*) > ?", 1000)
+				}
+				cache := NewStmtCache(10)
+				defer cache.Close()
+				if mode == "cached" {
+					m.WithStmtCache(cache)
+				}
+				run := func(q *Model[CoEvent]) error {
+					before, beforeArgs := q.Print()
+					counts, err := q.CountOver(ctx, "bucket")
+					if !errors.Is(err, ErrGroupedAggregateRequiresGet) || counts != nil {
+						t.Errorf("expected grouped aggregate rejection, got counts=%v, err=%v", counts, err)
+					}
+					after, afterArgs := q.Print()
+					if before != after || !reflect.DeepEqual(beforeArgs, afterArgs) {
+						t.Error("rejected CountOver changed query state")
+					}
+					return nil
+				}
+				if mode == "transaction" {
+					if err := m.Transaction(ctx, func(tx *Tx) error { return run(m.WithTx(tx)) }); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					_ = run(m)
+				}
+				if queries != 0 || cache.Len() != 0 {
+					t.Errorf("rejected CountOver reached SQL: queries=%d cache=%d", queries, cache.Len())
+				}
+			})
+		}
 	}
 }

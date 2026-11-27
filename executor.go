@@ -369,6 +369,10 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 		if q.distinct && len(q.columns) > 0 {
 			sb.WriteString(strings.Join(q.columns, ", "))
 		} else if q.distinct {
+			if len(q.joins) > 0 {
+				sb.WriteString(tableReference(tableName))
+				sb.WriteByte('.')
+			}
 			sb.WriteString("*")
 		} else {
 			sb.WriteString("1")
@@ -597,6 +601,7 @@ func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string
 // CountOver returns count of records partitioned by the specified column.
 // This uses window functions: COUNT(*) OVER (PARTITION BY column).
 // Returns a map of column value -> count.
+// GroupBy and Having require selected aggregate expressions and Get instead.
 //
 // Keys are normalized with the same conversion the relation loaders use, so a
 // key is always a string regardless of the type the driver scanned the column
@@ -616,6 +621,9 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int
 		return nil, err
 	}
 	if err := m.validateDerivedRead(); err != nil {
+		return nil, err
+	}
+	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return nil, err
 	}
 	if err := ValidateColumnName(column); err != nil {
