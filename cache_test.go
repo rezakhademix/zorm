@@ -1,6 +1,7 @@
 package zorm
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -9,15 +10,19 @@ import (
 // columnMappingCache Tests (executor.go)
 // =============================================================================
 
+func columnTestKey(columns string) columnCacheKey {
+	return columnCacheKey{modelType: reflect.TypeFor[TestModel](), columns: columns}
+}
+
 func TestColumnCache_BasicLoadStore(t *testing.T) {
 	cache := newColumnCache(100)
 
 	// Store a value
 	fields := []*FieldInfo{{Name: "ID", Column: "id"}}
-	cache.Store("test:id", fields)
+	cache.Store(columnTestKey("test:id"), fields)
 
 	// Load it back
-	loaded, ok := cache.Load("test:id")
+	loaded, ok := cache.Load(columnTestKey("test:id"))
 	if !ok {
 		t.Fatal("expected to find cached value")
 	}
@@ -29,7 +34,7 @@ func TestColumnCache_BasicLoadStore(t *testing.T) {
 func TestColumnCache_LoadMissing(t *testing.T) {
 	cache := newColumnCache(100)
 
-	loaded, ok := cache.Load("nonexistent")
+	loaded, ok := cache.Load(columnTestKey("nonexistent"))
 	if ok {
 		t.Error("expected ok to be false for missing key")
 	}
@@ -54,22 +59,22 @@ func TestColumnCache_LRUEviction(t *testing.T) {
 	fields3 := []*FieldInfo{{Name: "Field3"}}
 
 	// Find keys that hash to the same shard for testing
-	shard1 := cache.getShard(key1)
-	shard2 := cache.getShard(key2)
-	shard3 := cache.getShard(key3)
+	shard1 := cache.getShard(columnTestKey(key1))
+	shard2 := cache.getShard(columnTestKey(key2))
+	shard3 := cache.getShard(columnTestKey(key3))
 
 	// Store all three
-	cache.Store(key1, fields1)
-	cache.Store(key2, fields2)
-	cache.Store(key3, fields3)
+	cache.Store(columnTestKey(key1), fields1)
+	cache.Store(columnTestKey(key2), fields2)
+	cache.Store(columnTestKey(key3), fields3)
 
 	// Check if they're in the same shard - if not, the test needs different keys
 	// but the basic functionality still works
 	if shard1 == shard2 && shard2 == shard3 {
 		// All in same shard - first one should be evicted (shard capacity is 1)
-		_, ok1 := cache.Load(key1)
-		_, ok2 := cache.Load(key2)
-		_, ok3 := cache.Load(key3)
+		_, ok1 := cache.Load(columnTestKey(key1))
+		_, ok2 := cache.Load(columnTestKey(key2))
+		_, ok3 := cache.Load(columnTestKey(key3))
 
 		// With capacity 1 per shard, only the last one should remain
 		if ok1 && ok2 && ok3 {
@@ -89,7 +94,7 @@ func TestColumnCache_LRUAccessOrder(t *testing.T) {
 	baseKey := "testtype:col"
 	for i := 0; i < 1000 && len(keys) < 3; i++ {
 		key := baseKey + string(rune('a'+i%26)) + string(rune('0'+i/26))
-		s := cache.getShard(key)
+		s := cache.getShard(columnTestKey(key))
 		if shard == nil {
 			shard = s
 			keys = append(keys, key)
@@ -103,27 +108,27 @@ func TestColumnCache_LRUAccessOrder(t *testing.T) {
 	}
 
 	// Store first two keys (fills shard to capacity)
-	cache.Store(keys[0], []*FieldInfo{{Name: "First"}})
-	cache.Store(keys[1], []*FieldInfo{{Name: "Second"}})
+	cache.Store(columnTestKey(keys[0]), []*FieldInfo{{Name: "First"}})
+	cache.Store(columnTestKey(keys[1]), []*FieldInfo{{Name: "Second"}})
 
 	// Access the first key (moves it to front of LRU)
-	cache.Load(keys[0])
+	cache.Load(columnTestKey(keys[0]))
 
 	// Store third key - should evict keys[1] (LRU), not keys[0]
-	cache.Store(keys[2], []*FieldInfo{{Name: "Third"}})
+	cache.Store(columnTestKey(keys[2]), []*FieldInfo{{Name: "Third"}})
 
 	// keys[0] should still exist (was accessed, moved to front)
-	if _, ok := cache.Load(keys[0]); !ok {
+	if _, ok := cache.Load(columnTestKey(keys[0])); !ok {
 		t.Error("keys[0] should not have been evicted - it was recently accessed")
 	}
 
 	// keys[2] should exist (just added)
-	if _, ok := cache.Load(keys[2]); !ok {
+	if _, ok := cache.Load(columnTestKey(keys[2])); !ok {
 		t.Error("keys[2] should exist - it was just added")
 	}
 
 	// keys[1] should have been evicted (it was LRU)
-	if _, ok := cache.Load(keys[1]); ok {
+	if _, ok := cache.Load(columnTestKey(keys[1])); ok {
 		t.Error("keys[1] should have been evicted - it was LRU")
 	}
 }
@@ -142,7 +147,7 @@ func TestColumnCache_Concurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOps; j++ {
 				key := "type" + string(rune('A'+id%26)) + ":col" + string(rune('0'+j%10))
-				cache.Store(key, []*FieldInfo{{Name: key}})
+				cache.Store(columnTestKey(key), []*FieldInfo{{Name: key}})
 			}
 		}(i)
 	}
@@ -154,7 +159,7 @@ func TestColumnCache_Concurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOps; j++ {
 				key := "type" + string(rune('A'+id%26)) + ":col" + string(rune('0'+j%10))
-				cache.Load(key)
+				cache.Load(columnTestKey(key))
 			}
 		}(i)
 	}
@@ -168,10 +173,10 @@ func TestColumnCache_DuplicateStore(t *testing.T) {
 	fields1 := []*FieldInfo{{Name: "First"}}
 	fields2 := []*FieldInfo{{Name: "Second"}}
 
-	cache.Store("key", fields1)
-	cache.Store("key", fields2) // Should be ignored (key already exists)
+	cache.Store(columnTestKey("key"), fields1)
+	cache.Store(columnTestKey("key"), fields2) // Should be ignored (key already exists)
 
-	loaded, ok := cache.Load("key")
+	loaded, ok := cache.Load(columnTestKey("key"))
 	if !ok {
 		t.Fatal("expected to find cached value")
 	}
@@ -410,7 +415,7 @@ func TestColumnMappingCache_Integration(t *testing.T) {
 	// Test that the global columnMappingCache works correctly
 	// This is a basic sanity check
 
-	key := "TestIntegrationModel:id,name,email"
+	key := columnTestKey("TestIntegrationModel:id,name,email")
 	fields := []*FieldInfo{
 		{Name: "ID", Column: "id"},
 		{Name: "Name", Column: "name"},

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 	"weak"
 )
 
@@ -621,9 +622,13 @@ func cloneSnapshot(v reflect.Value, seen map[snapshotVisit]reflect.Value) reflec
 		result := reflect.New(v.Type()).Elem()
 		result.Set(v)
 		for i := 0; i < v.NumField(); i++ {
-			if v.Type().Field(i).IsExported() {
-				result.Field(i).Set(cloneSnapshot(v.Field(i), seen))
+			field := result.Field(i)
+			if !field.CanInterface() {
+				// Access only our addressable copy. Private scanner fields may
+				// hold mutable references that must not alias the entity.
+				field = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
 			}
+			field.Set(cloneSnapshot(field, seen))
 		}
 		return result
 	case reflect.Array:

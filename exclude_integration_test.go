@@ -378,7 +378,7 @@ func TestExclude_SavePreservesConflictDetection(t *testing.T) {
 	}
 }
 
-func TestExclude_SaveOnlyExcludedChangeTouchesTimestamp(t *testing.T) {
+func TestExclude_SaveOnlyExcludedChangePreservesTimestamp(t *testing.T) {
 	db := setupCreatedAtDB(t)
 	ctx := context.Background()
 	m := New[caItem]().SetDB(db)
@@ -396,10 +396,10 @@ func TestExclude_SaveOnlyExcludedChangeTouchesTimestamp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ClearOriginals(fresh)
-	if fresh.Name != "orig" || !fresh.UpdatedAt.Equal(entity.UpdatedAt) || fresh.UpdatedAt.Equal(caSeeded) {
-		t.Fatalf("timestamp-only Save changed excluded data or lost the timestamp: %v", fresh)
+	if fresh.Name != "orig" || !fresh.UpdatedAt.Equal(entity.UpdatedAt) || !fresh.UpdatedAt.Equal(caSeeded) {
+		t.Fatalf("excluded-only Save changed stored data or the timestamp: %v", fresh)
 	}
 	if !m.IsDirtyField(entity, "name") || m.IsDirtyField(entity, "updated_at") {
-		t.Fatalf("timestamp-only Save refreshed the wrong baseline: %v", m.GetDirtyFields(entity))
+		t.Fatalf("excluded-only Save refreshed the wrong baseline: %v", m.GetDirtyFields(entity))
 	}
 }

@@ -75,10 +75,9 @@ func TestBuilderGuards_DeferredErrorsReachEveryWrite(t *testing.T) {
 	if got, _ := New[ExModel]().Oldest().Print(); !strings.Contains(got, "created_at ASC") {
 		t.Error(got)
 	}
-	// Unsupported condition values have historically been ignored by the model
-	// builder; keep that behavior explicit while checking its no-predicate path.
-	if m := New[ExModel]().Where(42); len(m.wheres) != 0 {
-		t.Error("unsupported condition unexpectedly added a predicate")
+	// Unsupported conditions fail without appending a predicate.
+	if m := New[ExModel]().Where(42); len(m.wheres) != 0 || m.buildErr == nil {
+		t.Error("unsupported condition did not fail without adding a predicate")
 	}
 	db := setupExDB(t)
 	defer db.Close()
