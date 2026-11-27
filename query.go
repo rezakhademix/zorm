@@ -53,22 +53,6 @@ func isValidOperator(op string) bool {
 	return validOperators[normalizeOperator(op)]
 }
 
-// hasTrailingOperator reports whether s already ends with a whitelisted
-// operator, meaning addWhere should append a bare `?` rather than `= ?`.
-// Two-token operators (IS NOT) are checked before their single-token prefix.
-func hasTrailingOperator(s string) bool {
-	fields := strings.Fields(s)
-	if len(fields) < 2 {
-		return false
-	}
-	if len(fields) >= 3 {
-		if validOperators[normalizeOperator(fields[len(fields)-2]+" "+fields[len(fields)-1])] {
-			return true
-		}
-	}
-	return validOperators[normalizeOperator(fields[len(fields)-1])]
-}
-
 // validLockModes is a whitelist of safe SQL lock modes.
 var validLockModes = map[string]bool{
 	"UPDATE":        true,
@@ -178,16 +162,7 @@ func (m *Model[T]) where(typ, name string, query any, args ...any) *Model[T] {
 
 	switch len(args) {
 	case 1:
-		value = args[0]
-		operator = "="
-
-		sb := GetStringBuilder()
-		sb.WriteString(column)
-		sb.WriteByte(' ')
-		sb.WriteString(operator)
-		result := sb.String()
-		PutStringBuilder(sb)
-		return m.addWhere(typ, result, value)
+		return m.addWhere(typ, column, args[0])
 	case 2:
 		operator = fmt.Sprint(args[0])
 		value = args[1]
@@ -232,8 +207,8 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		callback(nested)
 		// Surface validation failures raised inside the group. Without this the
 		// group is dropped silently and the query runs missing a filter.
-		if nested.buildErr != nil {
-			m.buildErr = nested.buildErr
+		if err := nested.GetBuildErr(); err != nil {
+			m.buildErr = err
 			return m
 		}
 		if len(nested.wheres) > 0 {
@@ -262,7 +237,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		// emits a different (but equivalent) statement on every call, which
 		// defeats the statement cache and makes Print() unstable.
 		for _, k := range sortedKeys(conditionMap) {
-			if err := ValidateColumnName(k); err != nil {
+			if err := validateColumnIdentifier(k); err != nil {
 				m.buildErr = fmt.Errorf("Where map: invalid column name %q: %w", k, err)
 				return m
 			}
@@ -306,25 +281,12 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	}
 
 	if len(args) > 0 && !strings.Contains(queryStr, "?") {
-		trimmed := strings.TrimSpace(queryStr)
-		parts := strings.Fields(trimmed)
-		// Reuse the same whitelist that validates operators, so an operator
-		// accepted by Where always renders as `column OP ?`.
-		hasOperator := hasTrailingOperator(trimmed)
-
-		// Validate the column name portion (first word) to prevent SQL injection
-		if len(parts) > 0 {
-			if err := ValidateColumnName(parts[0]); err != nil {
-				m.buildErr = fmt.Errorf("Where: invalid column name %q: %w", parts[0], err)
-				return m
-			}
+		comparison, err := buildWhereComparison(queryStr)
+		if err != nil {
+			m.buildErr = fmt.Errorf("Where: %w", err)
+			return m
 		}
-
-		if hasOperator {
-			queryStr = trimmed + " ?"
-		} else {
-			queryStr = trimmed + " = ?"
-		}
+		queryStr = comparison
 	} else {
 		// Raw fragment, with or without bound args: check for the most dangerous
 		// injection patterns. SQL comments and multi-statement separators are
@@ -341,6 +303,41 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 	m.wheres = append(m.wheres, typ+" "+queryStr)
 	m.args = append(m.args, args...)
 	return m
+}
+
+// buildWhereComparison accepts a column identifier and an optional trailing
+// operator. Expressions belong to the raw form with explicit placeholders.
+func buildWhereComparison(query string) (string, error) {
+	parts := strings.Fields(query)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("%w: empty column name", ErrInvalidColumnName)
+	}
+	if err := validateColumnIdentifier(parts[0]); err != nil {
+		return "", err
+	}
+	operator := "="
+	if len(parts) > 1 {
+		operator = normalizeOperator(strings.Join(parts[1:], " "))
+		if !isValidOperator(operator) {
+			return "", fmt.Errorf("%w: invalid column comparison %q", ErrInvalidColumnName, query)
+		}
+	}
+	return parts[0] + " " + operator + " ?", nil
+}
+
+// writeWhereConditions renders predicates without a connector on the first
+// condition. Later connectors retain the caller's AND/OR grouping.
+func writeWhereConditions(sb *strings.Builder, wheres []string) {
+	for i, w := range wheres {
+		if i == 0 {
+			w = strings.TrimSpace(w)
+			w = strings.TrimPrefix(w, "AND ")
+			w = strings.TrimPrefix(w, "OR ")
+		} else {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(w)
+	}
 }
 
 // validateWhereRawString checks a raw WHERE string fragment for the most
@@ -894,6 +891,7 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 	if subQuery != nil {
 		var constraints []string
 		var args []any
+		var err error
 
 		// Check if it's a function
 		fnVal := reflect.ValueOf(subQuery)
@@ -903,12 +901,16 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 			if relatedModel != nil {
 				fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
 				// Extract constraints from the populated model
-				constraints, args = extractQueryConstraints(relatedModel)
+				constraints, args, err = extractQueryConstraints(relatedModel)
 			}
 		} else {
-			constraints, args = extractQueryConstraints(subQuery)
+			constraints, args, err = extractQueryConstraints(subQuery)
 		}
 
+		if err != nil {
+			m.buildErr = err
+			return m
+		}
 		if len(constraints) > 0 {
 			for _, w := range constraints {
 				sb.WriteString(" ")
@@ -926,9 +928,15 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 
 // extractQueryConstraints safely extracts WHERE clauses and args from a query builder.
 // Returns empty slices if extraction fails.
-func extractQueryConstraints(query any) ([]string, []any) {
+func extractQueryConstraints(query any) ([]string, []any, error) {
 	if query == nil {
-		return nil, nil
+		return nil, nil, nil
+	}
+
+	if builder, ok := query.(interface{ GetBuildErr() error }); ok {
+		if err := builder.GetBuildErr(); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	sqVal := reflect.ValueOf(query)
@@ -938,7 +946,7 @@ func extractQueryConstraints(query any) ([]string, []any) {
 	getArgs := sqVal.MethodByName("GetArgs")
 
 	if !getWheres.IsValid() || !getArgs.IsValid() {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Call methods and extract results
@@ -946,7 +954,7 @@ func extractQueryConstraints(query any) ([]string, []any) {
 	argsResult := getArgs.Call(nil)
 
 	if len(wheresResult) == 0 || len(argsResult) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Type assert with safety checks
@@ -954,10 +962,10 @@ func extractQueryConstraints(query any) ([]string, []any) {
 	args, ok2 := argsResult[0].Interface().([]any)
 
 	if !ok1 || !ok2 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	return wheres, args
+	return wheres, args, nil
 }
 
 // GetWheres returns the where clauses.
@@ -987,7 +995,19 @@ func (m *Model[T]) GetLimit() int {
 // failure inside a WithCallback callback would be invisible to the loader — the
 // rejected condition would be dropped and the relation would load every child.
 func (m *Model[T]) GetBuildErr() error {
-	return m.buildErr
+	if m.buildErr != nil {
+		return m.buildErr
+	}
+	// CTE builders remain mutable after attachment. Check them at execution
+	// time as well, including CTEs nested inside other CTE builders.
+	for _, cte := range m.ctes {
+		if builder, ok := cte.Query.(interface{ GetBuildErr() error }); ok {
+			if err := builder.GetBuildErr(); err != nil {
+				return fmt.Errorf("zorm: WithCTE %q: %w", cte.Name, err)
+			}
+		}
+	}
+	return nil
 }
 
 // Join adds an INNER JOIN clause.
@@ -1249,7 +1269,7 @@ func (m *Model[T]) UseReplica(index int) *Model[T] {
 //	sql, args := m.Where("status", "active").Limit(10).Print()
 //	fmt.Println(sql, args)
 //
-// Output: "SELECT * FROM users WHERE 1=1 AND (status = $1) LIMIT 10" [active]
+// Output: "SELECT * FROM users WHERE status = $1 LIMIT 10" [active]
 func (m *Model[T]) Print() (string, []any) {
 	var query string
 	var args []any

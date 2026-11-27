@@ -87,6 +87,7 @@ type Model[T any] struct {
 	ctx       context.Context
 	db        *sql.DB
 	tx        *sql.Tx
+	txState   *transactionState
 	modelInfo *ModelInfo
 
 	// Custom Table Name
@@ -264,6 +265,7 @@ func (m *Model[T]) reset() {
 	m.ctx = nil
 	m.db = nil
 	m.tx = nil
+	m.txState = nil
 	m.tableName = ""
 
 	// Reuse slices if they have reasonable capacity, otherwise replace
@@ -346,6 +348,7 @@ func (m *Model[T]) Clone() *Model[T] {
 		ctx:          m.ctx,
 		db:           m.db,
 		tx:           m.tx,
+		txState:      m.txState,
 		modelInfo:    m.modelInfo,
 		tableName:    m.tableName,
 		distinct:     m.distinct,

@@ -46,7 +46,7 @@ func TestExists_QueryLogic(t *testing.T) {
 	m.orderBys = orderBys
 
 	// Expected query based on zorm's query builder (double space is from implementation artifact)
-	expected := "SELECT 1 FROM test_models WHERE 1=1  AND id = ? LIMIT 1"
+	expected := "SELECT 1 FROM test_models WHERE id = ? LIMIT 1"
 	if query != expected {
 		t.Errorf("expected query %q, got %q", expected, query)
 	}

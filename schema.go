@@ -196,6 +196,25 @@ func validateColumnNameUncached(name string) error {
 	return nil
 }
 
+// validateColumnIdentifier validates a single, optionally qualified identifier.
+// SELECT expressions use ValidateColumnName; predicate columns cannot contain SQL.
+func validateColumnIdentifier(name string) error {
+	if err := ValidateColumnName(name); err != nil {
+		return err
+	}
+	for _, part := range strings.Split(name, ".") {
+		if part == "" {
+			return fmt.Errorf("%w: invalid identifier %q", ErrInvalidColumnName, name)
+		}
+		for i, r := range part {
+			if r != '_' && !unicode.IsLetter(r) && !(i > 0 && unicode.IsDigit(r)) {
+				return fmt.Errorf("%w: invalid identifier %q", ErrInvalidColumnName, name)
+			}
+		}
+	}
+	return nil
+}
+
 // MustValidateColumnName validates a column name and panics if invalid.
 // Use this for internal validation where invalid column names indicate programming errors.
 func MustValidateColumnName(name string) {
@@ -784,7 +803,12 @@ func setFieldValue(field reflect.Value, value any) error {
 		// If value is nil, handled above.
 		// Allocate new value if nil
 		if field.IsNil() {
-			field.Set(reflect.New(field.Type().Elem()))
+			pointer := reflect.New(field.Type().Elem())
+			if err := setFieldValue(pointer.Elem(), value); err != nil {
+				return err
+			}
+			field.Set(pointer)
+			return nil
 		}
 		// Recurse to set the element
 		return setFieldValue(field.Elem(), value)
@@ -807,27 +831,29 @@ func setFieldValue(field reflect.Value, value any) error {
 		return nil
 	}
 
+	// Numeric conversion must check the destination range before reflect.Convert
+	// can silently wrap an integer or overflow a float.
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return setIntField(field, value)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return setUintField(field, value)
+	case reflect.Float32, reflect.Float64:
+		return setFloatField(field, value)
+	}
+
 	// Type Conversion
 	if valType.ConvertibleTo(fieldType) {
 		field.Set(val.Convert(fieldType))
 		return nil
 	}
 
-	// Common conversions (e.g. int64 -> int, []byte -> string)
+	// Remaining scalar conversions
 	switch field.Kind() {
 	case reflect.String:
 		// Fallback to fmt.Sprint
 		field.SetString(fmt.Sprint(value))
 		return nil
-
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return setIntField(field, value)
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return setUintField(field, value)
-
-	case reflect.Float32, reflect.Float64:
-		return setFloatField(field, value)
 
 	case reflect.Bool:
 		return setBoolField(field, value)
@@ -837,92 +863,112 @@ func setFieldValue(field reflect.Value, value any) error {
 }
 
 func setIntField(field reflect.Value, value any) error {
-	switch v := value.(type) {
-	case int64:
-		field.SetInt(v)
-	case int:
-		field.SetInt(int64(v))
-	case int32:
-		field.SetInt(int64(v))
-	case int16:
-		field.SetInt(int64(v))
-	case int8:
-		field.SetInt(int64(v))
-	case float64:
-		field.SetInt(int64(v))
-	case float32:
-		field.SetInt(int64(v))
-	case []byte:
-		i, err := strconv.ParseInt(string(v), 10, 64)
+	var number int64
+	val := reflect.ValueOf(value)
+	switch val.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		number = val.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if val.Uint() > math.MaxInt64 {
+			return fmt.Errorf("value %v overflows %s", value, field.Type())
+		}
+		number = int64(val.Uint())
+	case reflect.Float32, reflect.Float64:
+		// Preserve truncation toward zero, but validate before converting: the
+		// upper int64 boundary cannot be represented as a float64 integer.
+		f := math.Trunc(val.Float())
+		limit := math.Ldexp(1, field.Type().Bits()-1)
+		if math.IsNaN(f) || f < -limit || f >= limit {
+			return fmt.Errorf("value %v overflows %s", value, field.Type())
+		}
+		number = int64(f)
+	case reflect.String:
+		n, err := strconv.ParseInt(val.String(), 10, field.Type().Bits())
 		if err != nil {
 			return err
 		}
-		field.SetInt(i)
-	case string:
-		i, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return err
+		number = n
+	case reflect.Slice:
+		if val.Type().Elem().Kind() != reflect.Uint8 {
+			return fmt.Errorf("cannot convert %T to int", value)
 		}
-		field.SetInt(i)
+		return setIntField(field, string(val.Bytes()))
 	default:
 		return fmt.Errorf("cannot convert %T to int", value)
 	}
+	if field.OverflowInt(number) {
+		return fmt.Errorf("value %v overflows %s", value, field.Type())
+	}
+	field.SetInt(number)
 	return nil
 }
 
 func setUintField(field reflect.Value, value any) error {
-	switch v := value.(type) {
-	case int64:
-		field.SetUint(uint64(v))
-	case uint64:
-		field.SetUint(v)
-	case int:
-		field.SetUint(uint64(v))
-	case float64:
-		field.SetUint(uint64(v))
-	case []byte:
-		i, err := strconv.ParseUint(string(v), 10, 64)
+	var number uint64
+	val := reflect.ValueOf(value)
+	switch val.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if val.Int() < 0 {
+			return fmt.Errorf("negative value %v cannot be assigned to %s", value, field.Type())
+		}
+		number = uint64(val.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		number = val.Uint()
+	case reflect.Float32, reflect.Float64:
+		f := val.Float()
+		if math.IsNaN(f) || f < 0 || math.Trunc(f) >= math.Ldexp(1, field.Type().Bits()) {
+			return fmt.Errorf("value %v overflows %s", value, field.Type())
+		}
+		number = uint64(f)
+	case reflect.String:
+		n, err := strconv.ParseUint(val.String(), 10, field.Type().Bits())
 		if err != nil {
 			return err
 		}
-		field.SetUint(i)
-	case string:
-		i, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return err
+		number = n
+	case reflect.Slice:
+		if val.Type().Elem().Kind() != reflect.Uint8 {
+			return fmt.Errorf("cannot convert %T to uint", value)
 		}
-		field.SetUint(i)
+		return setUintField(field, string(val.Bytes()))
 	default:
 		return fmt.Errorf("cannot convert %T to uint", value)
 	}
+	if field.OverflowUint(number) {
+		return fmt.Errorf("value %v overflows %s", value, field.Type())
+	}
+	field.SetUint(number)
 	return nil
 }
 
 func setFloatField(field reflect.Value, value any) error {
-	switch v := value.(type) {
-	case float64:
-		field.SetFloat(v)
-	case float32:
-		field.SetFloat(float64(v))
-	case int64:
-		field.SetFloat(float64(v))
-	case int:
-		field.SetFloat(float64(v))
-	case []byte:
-		f, err := strconv.ParseFloat(string(v), 64)
+	var number float64
+	val := reflect.ValueOf(value)
+	switch val.Kind() {
+	case reflect.Float32, reflect.Float64:
+		number = val.Float()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		number = float64(val.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		number = float64(val.Uint())
+	case reflect.String:
+		n, err := strconv.ParseFloat(val.String(), field.Type().Bits())
 		if err != nil {
 			return err
 		}
-		field.SetFloat(f)
-	case string:
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return err
+		number = n
+	case reflect.Slice:
+		if val.Type().Elem().Kind() != reflect.Uint8 {
+			return fmt.Errorf("cannot convert %T to float", value)
 		}
-		field.SetFloat(f)
+		return setFloatField(field, string(val.Bytes()))
 	default:
 		return fmt.Errorf("cannot convert %T to float", value)
 	}
+	if field.OverflowFloat(number) {
+		return fmt.Errorf("value %v overflows %s", value, field.Type())
+	}
+	field.SetFloat(number)
 	return nil
 }
 

@@ -228,7 +228,7 @@ func TestDirtySnapshot_EntitiesHaveIndependentBaselines(t *testing.T) {
 	defer ClearOriginals(first)
 	defer ClearOriginals(second)
 	*shared = 2
-	syncOriginalColumns(first, m.modelInfo, []string{"value"})
+	syncOriginalColumns(first, m.modelInfo, []string{"value"}, nil)
 	if m.HasDirtyFields(first) || !m.HasDirtyFields(second) || *GetOriginal(second, "value").(*int) != 1 {
 		t.Error("synchronizing one entity changed another entity's baseline")
 	}

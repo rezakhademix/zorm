@@ -2,6 +2,7 @@ package zorm
 
 import (
 	"container/list"
+	"database/sql"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,7 @@ type trackerEntry struct {
 	key       uintptr
 	originals map[string]any
 	ref       entityRef     // Identifies the entity this baseline belongs to
+	tx        *sql.Tx       // Caller-owned transaction that produced the baseline
 	element   *list.Element // Position in LRU list
 }
 
@@ -235,6 +237,7 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any, ref entityRef)
 		// lookup report untracked.
 		entry.originals = originals
 		entry.ref = ref
+		entry.tx = nil
 		shard.lruList.MoveToFront(entry.element)
 		return
 	}
@@ -280,6 +283,30 @@ func (t *lruTracker) Load(key uintptr, entity any) (map[string]any, bool) {
 	// Move to front (mark as recently used)
 	shard.lruList.MoveToFront(entry.element)
 	return entry.originals, true
+}
+
+// LoadForTransaction rejects a baseline produced by another caller-owned
+// transaction. Its commit/rollback is invisible to ZORM, so it cannot be reused
+// outside that transaction without reloading the entity.
+func (t *lruTracker) LoadForTransaction(key uintptr, entity any, tx *sql.Tx) (map[string]any, bool) {
+	shard := t.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	entry, exists := shard.items[key]
+	if !exists || (entry.ref != nil && !entry.ref.matches(entity)) || (entry.tx != nil && entry.tx != tx) {
+		return nil, false
+	}
+	shard.lruList.MoveToFront(entry.element)
+	return entry.originals, true
+}
+
+func (t *lruTracker) BindTransaction(key uintptr, entity any, tx *sql.Tx) {
+	shard := t.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if entry, exists := shard.items[key]; exists && (entry.ref == nil || entry.ref.matches(entity)) {
+		entry.tx = tx
+	}
 }
 
 // Delete removes tracking data for an entity.
@@ -486,6 +513,50 @@ func trackOriginalsWithScope[T any](entity *T, modelInfo *ModelInfo, scope *Trac
 	}
 }
 
+// rememberOriginals records rollback metadata before a transaction changes an
+// entity's baseline. User edits remain pending; only the managed version is reset.
+func (m *Model[T]) rememberOriginals(entity *T) {
+	if m.txState == nil {
+		return
+	}
+	key := getEntityKey(entity)
+	originals, tracked := globalTracker.Load().LoadForTransaction(key, entity, m.tx)
+	ref := weakRef[T]{p: weak.Make(entity)}
+	m.txState.remember(key, func(rolledBack bool) {
+		if !rolledBack || !tracked {
+			ClearOriginals(entity)
+			return
+		}
+		globalTracker.Load().Store(key, originals, ref)
+		if field := m.modelInfo.VersionField; field != nil {
+			if version, ok := originals[field.Column]; ok {
+				reflect.ValueOf(entity).Elem().FieldByIndex(field.Index).Set(reflect.ValueOf(version))
+			}
+		}
+	})
+}
+
+// trackOriginals also arranges cleanup when a transaction-created baseline is
+// rolled back. The same rule applies to reads, cursors, and newly created rows.
+func (m *Model[T]) trackOriginals(entity *T) {
+	m.rememberOriginals(entity)
+	trackOriginalsWithScope(entity, m.modelInfo, m.trackingScope)
+	m.bindOriginals(entity)
+}
+
+// bindOriginals keeps caller-owned transaction baselines usable for repeated
+// writes inside that transaction, while Save rejects them outside it.
+func (m *Model[T]) bindOriginals(entity *T) {
+	if m.tx != nil && m.txState == nil {
+		globalTracker.Load().BindTransaction(getEntityKey(entity), entity, m.tx)
+	}
+}
+
+func (m *Model[T]) syncOriginalColumns(entity *T, columns []string) {
+	syncOriginalColumns(entity, m.modelInfo, columns, m.tx)
+	m.bindOriginals(entity)
+}
+
 // snapshotValue detaches mutable column values from the entity. A shallow copy
 // would let in-place pointer, slice, or map edits also change the baseline.
 func snapshotValue(value any) any {
@@ -650,30 +721,24 @@ func getDirty[T any](entity *T, modelInfo *ModelInfo) map[string]any {
 	if entity == nil {
 		return nil
 	}
+	originals, _ := globalTracker.Load().Load(getEntityKey(entity), entity)
+	return getDirtyFromOriginals(entity, modelInfo, originals)
+}
 
+// getDirtyFromOriginals uses one retained baseline for the whole comparison.
+// Save holds this snapshot across hooks so cache eviction cannot widen a write.
+func getDirtyFromOriginals[T any](entity *T, modelInfo *ModelInfo, originals map[string]any) map[string]any {
 	val := reflect.ValueOf(entity).Elem()
-	orig, tracked := globalTracker.Load().Load(getEntityKey(entity), entity)
-
-	// Pre-allocate with reasonable capacity
 	dirty := make(map[string]any, 4)
-
 	for _, field := range modelInfo.Fields {
 		if field.IsPrimary {
 			continue
 		}
-
 		current := val.FieldByIndex(field.Index).Interface()
-
-		if !tracked {
-			dirty[field.Column] = current
-			continue
-		}
-
-		if original, exists := orig[field.Column]; !exists || !fastEqual(original, current) {
+		if original, exists := originals[field.Column]; !exists || !fastEqual(original, current) {
 			dirty[field.Column] = current
 		}
 	}
-
 	return dirty
 }
 
@@ -694,9 +759,10 @@ func syncOriginals[T any](entity *T, modelInfo *ModelInfo) {
 }
 
 // syncOriginalColumns marks only persisted columns clean. Excluded values must
-// retain their previous baseline so a later Save can still write them.
-func syncOriginalColumns[T any](entity *T, modelInfo *ModelInfo, columns []string) {
-	originals, tracked := globalTracker.Load().Load(getEntityKey(entity), entity)
+// retain their previous baseline so a later Save can still write them. Only a
+// baseline belonging to the writer can describe the unwritten columns safely.
+func syncOriginalColumns[T any](entity *T, modelInfo *ModelInfo, columns []string, tx *sql.Tx) {
+	originals, tracked := globalTracker.Load().LoadForTransaction(getEntityKey(entity), entity, tx)
 	if !tracked {
 		// A partial write cannot establish a safe baseline for an entity whose
 		// other values were never loaded. A full write can, as Update always did.
@@ -713,6 +779,12 @@ func syncOriginalColumns[T any](entity *T, modelInfo *ModelInfo, columns []strin
 		return
 	}
 
+	syncOriginalColumnsFromOriginals(entity, modelInfo, columns, originals)
+}
+
+// syncOriginalColumnsFromOriginals preserves unwritten values even when the
+// retained baseline has been evicted from the global tracker during a write.
+func syncOriginalColumnsFromOriginals[T any](entity *T, modelInfo *ModelInfo, columns []string, originals map[string]any) {
 	// Replace the map instead of mutating it: readers can still hold the old
 	// baseline after the tracker's lock has been released.
 	next := make(map[string]any, len(originals))

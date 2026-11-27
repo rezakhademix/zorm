@@ -592,8 +592,8 @@ func TestScalarQuery_BuildQuery(t *testing.T) {
 	if !strings.Contains(query, "FROM users") {
 		t.Errorf("expected FROM users, got %q", query)
 	}
-	if !strings.Contains(query, "WHERE 1=1") {
-		t.Errorf("expected WHERE 1=1, got %q", query)
+	if !strings.Contains(query, "WHERE active = ?") {
+		t.Errorf("expected WHERE active = ?, got %q", query)
 	}
 	if !strings.Contains(query, "GROUP BY role") {
 		t.Errorf("expected GROUP BY role, got %q", query)
