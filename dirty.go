@@ -176,10 +176,9 @@ type trackerEntry struct {
 
 // lruTrackerShard is a single shard of the tracker with its own lock.
 type lruTrackerShard struct {
-	mu       sync.Mutex
-	capacity int
-	items    map[uintptr]*trackerEntry
-	lruList  *list.List // Front = most recently used, Back = least recently used
+	mu      sync.Mutex
+	items   map[uintptr]*trackerEntry
+	lruList *list.List // Front = most recently used, Back = least recently used
 }
 
 // shardCount is the number of shards for the tracker.
@@ -187,9 +186,10 @@ type lruTrackerShard struct {
 const shardCount = 256
 
 // lruTracker provides bounded dirty tracking with LRU eviction.
-// When the tracker reaches capacity, the least recently used entries are evicted.
+// At the shared capacity, it evicts an LRU entry within a shard.
 // Uses sharded locking to reduce contention under high concurrency.
 type lruTracker struct {
+	storeMu  sync.Mutex
 	shards   [shardCount]*lruTrackerShard
 	capacity int          // total capacity across all shards
 	count    atomic.Int64 // total count across all shards for O(1) Len()
@@ -198,21 +198,14 @@ type lruTracker struct {
 // newLRUTracker creates a new LRU tracker with the specified capacity.
 // A capacity of 0 means unbounded (no eviction).
 func newLRUTracker(capacity int) *lruTracker {
-	// Distribute capacity across shards
-	shardCapacity := capacity / shardCount
-	if shardCapacity < 1 && capacity > 0 {
-		shardCapacity = 1
-	}
-
 	t := &lruTracker{
 		capacity: capacity,
 	}
 
 	for i := 0; i < shardCount; i++ {
 		t.shards[i] = &lruTrackerShard{
-			capacity: shardCapacity,
-			items:    make(map[uintptr]*trackerEntry),
-			lruList:  list.New(),
+			items:   make(map[uintptr]*trackerEntry),
+			lruList: list.New(),
 		}
 	}
 
@@ -233,6 +226,8 @@ func (t *lruTracker) getShard(key uintptr) *lruTrackerShard {
 // Store adds or updates tracking data for an entity. ref identifies the entity
 // the baseline belongs to; see entityRef.
 func (t *lruTracker) Store(key uintptr, originals map[string]any, ref entityRef) {
+	t.storeMu.Lock()
+	defer t.storeMu.Unlock()
 	shard := t.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -249,11 +244,28 @@ func (t *lruTracker) Store(key uintptr, originals map[string]any, ref entityRef)
 		return
 	}
 
-	// Evict if at capacity (count stays the same on eviction+add)
+	// Shards share the total capacity, so a busy shard can use free slots.
 	evicted := false
-	if shard.capacity > 0 && len(shard.items) >= shard.capacity {
-		shard.evictLRU()
-		evicted = true
+	if t.capacity > 0 && t.count.Load() >= int64(t.capacity) {
+		if len(shard.items) > 0 {
+			shard.evictLRU()
+			evicted = true
+		} else {
+			for _, other := range t.shards {
+				if other == shard {
+					continue
+				}
+				other.mu.Lock()
+				if len(other.items) > 0 {
+					other.evictLRU()
+					evicted = true
+				}
+				other.mu.Unlock()
+				if evicted {
+					break
+				}
+			}
+		}
 	}
 
 	// Add new entry
@@ -352,14 +364,16 @@ func (t *lruTracker) deleteMatching(key uintptr, ref entityRef) {
 
 // Clear removes all tracking data.
 func (t *lruTracker) Clear() {
+	t.storeMu.Lock()
+	defer t.storeMu.Unlock()
 	for i := 0; i < shardCount; i++ {
 		shard := t.shards[i]
 		shard.mu.Lock()
+		t.count.Add(-int64(len(shard.items)))
 		shard.items = make(map[uintptr]*trackerEntry)
 		shard.lruList.Init()
 		shard.mu.Unlock()
 	}
-	t.count.Store(0)
 }
 
 // Len returns the number of tracked entities.

@@ -87,7 +87,7 @@ func TestPartialUpdate_ColumnSelection(t *testing.T) {
 		{"empty", nil, false, false},
 		{"unknown", []string{"missing"}, false, false},
 		{"primary key only", []string{"id"}, false, false},
-		{"mixed skipped columns", []string{"missing", "id", "name"}, true, false},
+		{"mixed skipped columns", []string{"missing", "id", "name"}, false, false},
 		{"duplicates", []string{"name", "name"}, true, false},
 		{"all columns", []string{"name", "value"}, true, true},
 	}
@@ -103,7 +103,9 @@ func TestPartialUpdate_ColumnSelection(t *testing.T) {
 			}
 			defer ClearOriginals(entity)
 			entity.Name, entity.Value = "changed", 999
-			if err := m.UpdateColumns(ctx, entity, tt.columns...); err != nil {
+			err = m.UpdateColumns(ctx, entity, tt.columns...)
+			invalid := tt.name == "unknown" || tt.name == "mixed skipped columns"
+			if invalid && !errors.Is(err, ErrColumnNotFound) || !invalid && err != nil {
 				t.Fatal(err)
 			}
 			if m.IsCleanField(entity, "name") != tt.writesName || m.IsCleanField(entity, "value") != tt.writesBoth {

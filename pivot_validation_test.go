@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -96,7 +97,11 @@ func TestPivotFailures_SyncDoesNotIgnoreReadErrors(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			failure := &failureDB{columns: []string{"child_id"}}
 			writes := 0
-			failure.onExec = func(string) { writes++ }
+			failure.onExec = func(query string) {
+				if !strings.HasSuffix(query, "FOR UPDATE") {
+					writes++
+				}
+			}
 			switch mode {
 			case "query":
 				failure.queryErr = errDatabaseFailure

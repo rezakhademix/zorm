@@ -1,5 +1,8 @@
 walkthrough.md
 
+# Real PostgreSQL test report
+/pg-tests-report.log
+
 # Go standard ignores
 *.exe
 *.exe~

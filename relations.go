@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -402,6 +403,10 @@ func (m *Model[T]) loadRelations(ctx context.Context, results []*T) error {
 		return nil
 	}
 
+	if err := m.validateDatabase(false); err != nil {
+		return err
+	}
+
 	// Group relations by root
 	// Map: RootRelation -> {Cols, []SubRelations}
 	type relGroup struct {
@@ -655,7 +660,7 @@ func (m *Model[T]) loadMorphTo(ctx context.Context, results []*T, relConfig any,
 
 		// Recursive Load
 		if len(subRelations) > 0 && len(relatedResults) > 0 {
-			if err := m.loadRelationsDynamic(ctx, relatedResults, modelType, subRelations); err != nil {
+			if err := m.loadNestedRelations(ctx, relatedResults, modelType, subRelations, relName); err != nil {
 				return err
 			}
 		}
@@ -752,7 +757,7 @@ func (m *Model[T]) loadHasMany(ctx context.Context, results []*T, relConfig any,
 
 	// 4.5 Recursive Loading
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -942,7 +947,13 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 	// Extract Table Name if overriden
 	relTable := valConfig.FieldByName("Table").String()
 
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, constraints)
+	queryConstraints := constraints
+	if constraints != nil {
+		copy := *constraints
+		copy.limit = 0
+		queryConstraints = &copy
+	}
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, queryConstraints)
 	if err != nil {
 		return err
 	}
@@ -953,7 +964,7 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 
 	// 5. Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -972,6 +983,12 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 		relatedIdxMap[rKey] = reflect.ValueOf(res)
 	}
 
+	relatedOrder := make(map[string]int, len(relatedResults))
+	for i, res := range relatedResults {
+		value := reflect.ValueOf(res).Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+		relatedOrder[anyToKeyString(value)] = i
+	}
+
 	for i, parent := range results {
 		parentVal := reflect.ValueOf(parent).Elem()
 		parentID := ids[i]
@@ -986,6 +1003,19 @@ func (m *Model[T]) loadBelongsToMany(ctx context.Context, results []*T, relConfi
 		for _, rKey := range rIDs {
 			if child, ok := relatedIdxMap[rKey]; ok {
 				children = append(children, child)
+			}
+		}
+
+		if constraints != nil {
+			if len(constraints.orderBys) > 0 {
+				sort.SliceStable(children, func(i, j int) bool {
+					left := children[i].Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+					right := children[j].Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+					return relatedOrder[anyToKeyString(left)] < relatedOrder[anyToKeyString(right)]
+				})
+			}
+			if constraints.limit > 0 && len(children) > constraints.limit {
+				children = children[:constraints.limit]
 			}
 		}
 
@@ -1105,7 +1135,7 @@ func (m *Model[T]) loadBelongsTo(ctx context.Context, results []*T, relConfig an
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -1287,7 +1317,7 @@ func buildRelationQuery(cols, table, whereBody, partitionKey string, constraints
 // loadRelationQuery executes a SELECT * FROM table WHERE key IN (ids)
 func (m *Model[T]) loadRelationQuery(ctx context.Context, relatedInfo *ModelInfo, key string, ids []any, cols string, tableName string, constraints *relationConstraints) ([]any, error) {
 	// Validate column name to prevent SQL injection
-	if err := ValidateColumnName(key); err != nil {
+	if err := validateColumnIdentifier(key); err != nil {
 		return nil, fmt.Errorf("invalid relation key column: %w", err)
 	}
 
@@ -1375,10 +1405,10 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 	}
 
 	// Validate column names to prevent SQL injection
-	if err := ValidateColumnName(typeColumn); err != nil {
+	if err := validateColumnIdentifier(typeColumn); err != nil {
 		return fmt.Errorf("invalid morph type column: %w", err)
 	}
-	if err := ValidateColumnName(idColumn); err != nil {
+	if err := validateColumnIdentifier(idColumn); err != nil {
 		return fmt.Errorf("invalid morph id column: %w", err)
 	}
 
@@ -1439,7 +1469,7 @@ func (m *Model[T]) loadMorphOneOrMany(ctx context.Context, results []*T, relConf
 
 	// Recursive Load
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -1477,6 +1507,26 @@ func isZero(v any) bool {
 		return true
 	}
 	return reflect.ValueOf(v).IsZero()
+}
+
+// loadNestedRelations rebases callback paths for the next relation level.
+func (m *Model[T]) loadNestedRelations(ctx context.Context, results []any, modelType reflect.Type, relations []string, root string) error {
+	nested := m.Clone()
+	nested.relationCallbacks = make(map[string]any)
+	for path, callback := range m.relationCallbacks {
+		if child, ok := strings.CutPrefix(path, root+"."); ok {
+			nested.relationCallbacks[child] = callback
+		}
+	}
+	return nested.loadRelationsDynamic(ctx, results, modelType, relations)
+}
+
+func (m *Model[T]) dynamicRelationConstraints(ctx context.Context, rel Relation, name string) (*relationConstraints, error) {
+	constraints := extractRelationConstraints(rel, m.relationCallbacks[name], ctx, m.db)
+	if constraints != nil && constraints.buildErr != nil {
+		return nil, constraints.buildErr
+	}
+	return constraints, nil
 }
 
 // loadRelationsDynamic is a helper to load relations on a slice of any (which are *R).
@@ -1614,6 +1664,11 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		}
 	}
 
+	constraints, err := m.dynamicRelationConstraints(ctx, rel, relName)
+	if err != nil {
+		return err
+	}
+
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
@@ -1628,30 +1683,7 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 		tableName = override
 	}
 
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	if cols != "" {
-		sb.WriteString(cols)
-	} else {
-		sb.WriteString("*")
-	}
-	sb.WriteString(" FROM ")
-	sb.WriteString(tableName)
-	sb.WriteString(" WHERE ")
-	inFrag, args, err := buildInClause(foreignKey, ids, m.effectiveDialect())
-	if err != nil {
-		return err
-	}
-	sb.WriteString(inFrag)
-
-	// Execute
-	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	relatedResults, err := m.scanRowsDynamic(ctx, rows, relatedInfo)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, foreignKey, ids, cols, tableName, constraints)
 	if err != nil {
 		return err
 	}
@@ -1661,7 +1693,7 @@ func (m *Model[T]) loadHasManyDynamic(ctx context.Context, results []any, modelT
 	}
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -1765,6 +1797,11 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 		return fmt.Errorf("loadBelongsToDynamic: expected Relation interface, got %T", relConfig)
 	}
 
+	constraints, err := m.dynamicRelationConstraints(ctx, rel, relName)
+	if err != nil {
+		return err
+	}
+
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
@@ -1774,7 +1811,7 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 	}
 
 	relTable := valConfig.FieldByName("Table").String()
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable, nil)
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, ownerKey, fks, cols, relTable, constraints)
 	if err != nil {
 		return err
 	}
@@ -1784,7 +1821,7 @@ func (m *Model[T]) loadBelongsToDynamic(ctx context.Context, results []any, mode
 	}
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -1943,8 +1980,19 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 		joinKey = relatedInfo.PrimaryKey
 	}
 
+	constraints, err := m.dynamicRelationConstraints(ctx, rel, relName)
+	if err != nil {
+		return err
+	}
+
 	relTable := valConfig.FieldByName("Table").String()
-	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, nil)
+	queryConstraints := constraints
+	if constraints != nil {
+		copy := *constraints
+		copy.limit = 0
+		queryConstraints = &copy
+	}
+	relatedResults, err := m.loadRelationQuery(ctx, relatedInfo, joinKey, allRelatedIDs, cols, relTable, queryConstraints)
 	if err != nil {
 		return err
 	}
@@ -1954,7 +2002,7 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 	}
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -1971,6 +2019,12 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 		relatedIdxMap[rKey] = reflect.ValueOf(res)
 	}
 
+	relatedOrder := make(map[string]int, len(relatedResults))
+	for i, res := range relatedResults {
+		value := reflect.ValueOf(res).Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+		relatedOrder[anyToKeyString(value)] = i
+	}
+
 	for i, parent := range results {
 		parentVal := reflect.ValueOf(parent).Elem()
 		parentID := ids[i]
@@ -1985,6 +2039,19 @@ func (m *Model[T]) loadBelongsToManyDynamic(ctx context.Context, results []any, 
 		for _, rKey := range rIDs {
 			if child, ok := relatedIdxMap[rKey]; ok {
 				children = append(children, child)
+			}
+		}
+
+		if constraints != nil {
+			if len(constraints.orderBys) > 0 {
+				sort.SliceStable(children, func(i, j int) bool {
+					left := children[i].Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+					right := children[j].Elem().FieldByIndex(joinKeyFieldInfo.Index).Interface()
+					return relatedOrder[anyToKeyString(left)] < relatedOrder[anyToKeyString(right)]
+				})
+			}
+			if constraints.limit > 0 && len(children) > constraints.limit {
+				children = children[:constraints.limit]
 			}
 		}
 
@@ -2019,6 +2086,11 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 		return fmt.Errorf("loadMorphOneOrManyDynamic: expected Relation interface, got %T", relConfig)
 	}
 
+	constraints, err := m.dynamicRelationConstraints(ctx, rel, relName)
+	if err != nil {
+		return err
+	}
+
 	relatedPtr := rel.NewRelated()
 	relatedType := reflect.TypeOf(relatedPtr).Elem()
 	relatedInfo := ParseModelType(relatedType)
@@ -2042,29 +2114,23 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 		tableName = relTable
 	}
 
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	if cols != "" {
-		sb.WriteString(cols)
-	} else {
-		sb.WriteString("*")
-	}
-	sb.WriteString(" FROM ")
-	sb.WriteString(tableName)
-	sb.WriteString(" WHERE ")
-	sb.WriteString(typeColumn)
-	sb.WriteString(" = ? AND ")
 	inFrag, inArgs, err := buildInClause(idColumn, ids, m.effectiveDialect())
 	if err != nil {
 		return err
 	}
-	sb.WriteString(inFrag)
-
-	args := make([]any, 0, len(inArgs)+1)
-	args = append(args, parentType)
-	args = append(args, inArgs...)
-
-	rows, err := m.queryer().QueryContext(ctx, rebind(sb.String()), args...)
+	var where strings.Builder
+	where.WriteString(typeColumn + " = ? AND " + inFrag)
+	args := append([]any{parentType}, inArgs...)
+	if constraints != nil {
+		if len(constraints.wheres) > 0 {
+			where.WriteString(" AND (")
+			writeWhereConditions(&where, constraints.wheres)
+			where.WriteByte(')')
+		}
+		args = append(args, constraints.args...)
+	}
+	query := buildRelationQuery(cols, tableName, where.String(), idColumn, constraints)
+	rows, err := m.queryer().QueryContext(ctx, rebind(query), args...)
 	if err != nil {
 		return err
 	}
@@ -2080,7 +2146,7 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 	}
 
 	if len(subRelations) > 0 && len(relatedResults) > 0 {
-		if err := m.loadRelationsDynamic(ctx, relatedResults, relatedType, subRelations); err != nil {
+		if err := m.loadNestedRelations(ctx, relatedResults, relatedType, subRelations, relName); err != nil {
 			return err
 		}
 	}
@@ -2107,6 +2173,27 @@ func (m *Model[T]) loadMorphOneOrManyDynamic(ctx context.Context, results []any,
 	}
 
 	return nil
+}
+
+// pivotParentID resolves the same local key used by the eager loader.
+func (m *Model[T]) pivotParentID(entity *T, localKey string) (any, error) {
+	if entity == nil {
+		return nil, ErrNilPointer
+	}
+	if localKey == "" {
+		localKey = m.modelInfo.PrimaryKey
+		if _, ok := m.modelInfo.Columns[localKey]; !ok {
+			localKey = "ID"
+		}
+	}
+	field, ok := m.modelInfo.Columns[localKey]
+	if !ok {
+		field, ok = m.modelInfo.Fields[localKey]
+	}
+	if !ok {
+		return nil, fmt.Errorf("zorm: %w: local key %q", ErrColumnNotFound, localKey)
+	}
+	return fieldDatabaseValue(reflect.ValueOf(entity).Elem().FieldByIndex(field.Index)), nil
 }
 
 // Attach inserts rows into the pivot table for a BelongsToMany relation.
@@ -2145,19 +2232,14 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Validate relation identifiers to prevent SQL injection
-	if err := ValidateColumnName(pivotTable); err != nil {
+	if err := validateColumnIdentifier(pivotTable); err != nil {
 		return fmt.Errorf("invalid pivot table name: %w", err)
 	}
 
 	// 2. Get Parent ID
-	parentVal := reflect.ValueOf(entity).Elem()
-	pkField := m.modelInfo.PrimaryKey
-	var parentID any
-	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		// Use FieldByIndex for access instead of FieldByName O(n)
-		parentID = parentVal.FieldByIndex(field.Index).Interface()
-	} else {
-		parentID = parentVal.FieldByName("ID").Interface()
+	parentID, err := m.pivotParentID(entity, valConfig.FieldByName("LocalKey").String())
+	if err != nil {
+		return err
 	}
 
 	if foreignKey == "" {
@@ -2168,10 +2250,10 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Validate key columns
-	if err := ValidateColumnName(foreignKey); err != nil {
+	if err := validateColumnIdentifier(foreignKey); err != nil {
 		return fmt.Errorf("invalid foreign key name: %w", err)
 	}
-	if err := ValidateColumnName(relatedKey); err != nil {
+	if err := validateColumnIdentifier(relatedKey); err != nil {
 		return fmt.Errorf("invalid related key name: %w", err)
 	}
 
@@ -2193,7 +2275,7 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	extraCols := sortedKeys(pivotColsMap)
 	for _, k := range extraCols {
 		// Validate extra column names
-		if err := ValidateColumnName(k); err != nil {
+		if err := validateColumnIdentifier(k); err != nil {
 			return fmt.Errorf("invalid pivot column name %q: %w", k, err)
 		}
 	}
@@ -2235,7 +2317,10 @@ func (m *Model[T]) Attach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Pivot inserts are writes: always route to the primary.
-	_, err := m.queryerForWrite().ExecContext(ctx, rebind(sb.String()), args...)
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+	_, err = m.queryerForWrite().ExecContext(ctx, rebind(sb.String()), args...)
 	return err
 }
 
@@ -2273,19 +2358,14 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Validate relation identifiers to prevent SQL injection
-	if err := ValidateColumnName(pivotTable); err != nil {
+	if err := validateColumnIdentifier(pivotTable); err != nil {
 		return fmt.Errorf("invalid pivot table name: %w", err)
 	}
 
 	// 2. Get Parent ID
-	parentVal := reflect.ValueOf(entity).Elem()
-	pkField := m.modelInfo.PrimaryKey
-	var parentID any
-	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		// Use FieldByIndex for access instead of FieldByName O(n)
-		parentID = parentVal.FieldByIndex(field.Index).Interface()
-	} else {
-		parentID = parentVal.FieldByName("ID").Interface()
+	parentID, err := m.pivotParentID(entity, valConfig.FieldByName("LocalKey").String())
+	if err != nil {
+		return err
 	}
 
 	if foreignKey == "" {
@@ -2293,7 +2373,7 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Validate foreign key column
-	if err := ValidateColumnName(foreignKey); err != nil {
+	if err := validateColumnIdentifier(foreignKey); err != nil {
 		return fmt.Errorf("invalid foreign key name: %w", err)
 	}
 
@@ -2311,7 +2391,7 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 			return fmt.Errorf("RelatedKey must be defined for Detach with IDs")
 		}
 		// Validate related key column
-		if err := ValidateColumnName(relatedKey); err != nil {
+		if err := validateColumnIdentifier(relatedKey); err != nil {
 			return fmt.Errorf("invalid related key name: %w", err)
 		}
 		sb.WriteString(" AND ")
@@ -2324,7 +2404,10 @@ func (m *Model[T]) Detach(ctx context.Context, entity *T, relation string, ids [
 	}
 
 	// Pivot deletes are writes: always route to the primary.
-	_, err := m.queryerForWrite().ExecContext(ctx, rebind(sb.String()), args...)
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+	_, err = m.queryerForWrite().ExecContext(ctx, rebind(sb.String()), args...)
 	return err
 }
 
@@ -2380,19 +2463,14 @@ func (m *Model[T]) syncPivot(ctx context.Context, entity *T, relation string, id
 	}
 
 	// Validate relation identifiers to prevent SQL injection
-	if err := ValidateColumnName(pivotTable); err != nil {
+	if err := validateColumnIdentifier(pivotTable); err != nil {
 		return fmt.Errorf("invalid pivot table name: %w", err)
 	}
 
 	// 2. Get Parent ID
-	parentVal := reflect.ValueOf(entity).Elem()
-	pkField := m.modelInfo.PrimaryKey
-	var parentID any
-	if field, ok := m.modelInfo.Columns[pkField]; ok {
-		// Use FieldByIndex for access instead of FieldByName O(n)
-		parentID = parentVal.FieldByIndex(field.Index).Interface()
-	} else {
-		parentID = parentVal.FieldByName("ID").Interface()
+	parentID, err := m.pivotParentID(entity, valConfig.FieldByName("LocalKey").String())
+	if err != nil {
+		return err
 	}
 
 	if foreignKey == "" {
@@ -2403,11 +2481,30 @@ func (m *Model[T]) syncPivot(ctx context.Context, entity *T, relation string, id
 	}
 
 	// Validate key columns
-	if err := ValidateColumnName(foreignKey); err != nil {
+	if err := validateColumnIdentifier(foreignKey); err != nil {
 		return fmt.Errorf("invalid foreign key name: %w", err)
 	}
-	if err := ValidateColumnName(relatedKey); err != nil {
+	if err := validateColumnIdentifier(relatedKey); err != nil {
 		return fmt.Errorf("invalid related key name: %w", err)
+	}
+
+	if m.effectiveDialect() == DialectPostgres {
+		// Lock the parent even when it has no pivot rows yet. Locking only
+		// existing pivot rows leaves concurrent initial Sync calls unprotected.
+		localKey := valConfig.FieldByName("LocalKey").String()
+		if localKey == "" {
+			localKey = m.modelInfo.PrimaryKey
+		}
+		if field, ok := m.modelInfo.Fields[localKey]; ok {
+			localKey = field.Column
+		}
+		if err := validateColumnIdentifier(localKey); err != nil {
+			return err
+		}
+		query := "SELECT " + localKey + " FROM " + m.TableName() + " WHERE " + localKey + " = ? FOR UPDATE"
+		if _, err := m.queryerForWrite().ExecContext(ctx, rebind(query), parentID); err != nil {
+			return err
+		}
 	}
 
 	// 3. Get Current IDs

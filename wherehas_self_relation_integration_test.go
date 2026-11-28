@@ -66,7 +66,7 @@ func TestWhereHas_ReplacesCollidingRelatedAlias(t *testing.T) {
 	}
 	q := New[selfRelationNode]().SetDB(db).Table("self_relation_nodes AS zorm_related")
 	config := HasMany[selfRelationNode]{ForeignKey: "parent_id", Table: "self_relation_nodes AS zorm_related"}
-	q.applyWhereHas([]reflect.Value{reflect.ValueOf(config)}, nil)
+	q.applyWhereHas([]reflect.Value{reflect.ValueOf(config)}, nil, "Children")
 	rows, err := q.Get(context.Background())
 	if err != nil {
 		t.Fatal(err)

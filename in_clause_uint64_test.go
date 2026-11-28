@@ -4,6 +4,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 // toTypedArraySlice cast every uint64 straight to int64 so PostgreSQL could
@@ -84,7 +86,7 @@ func TestBuildInClause_InRangeUint64StillUsesAnyFastPath(t *testing.T) {
 	if len(args) != 1 {
 		t.Fatalf("expected the args to collapse to one array, got %v", args)
 	}
-	if _, ok := args[0].([]int64); !ok {
+	if _, ok := args[0].(*pq.Int64Array); !ok {
 		t.Errorf("expected []int64 for pgx, got %T", args[0])
 	}
 }

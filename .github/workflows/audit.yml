@@ -116,10 +116,40 @@ jobs:
           disable_search: true
           fail_ci_if_error: false
 
+  postgres:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: zorm
+          POSTGRES_PASSWORD: zorm
+          POSTGRES_DB: zorm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zorm -d zorm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ZORM_POSTGRES_DSN: postgres://zorm:zorm@localhost:5432/zorm_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: Test PostgreSQL drivers
+        run: go test -race -count=1 -timeout=5m -run '^TestPostgres_' ./...
+
   # Preserve the existing check name for branch protection, across all matrix jobs.
   audit:
     if: always()
-    needs: [quality, tests]
+    needs: [quality, tests, postgres]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -127,5 +157,6 @@ jobs:
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           TEST_RESULT: ${{ needs.tests.result }}
+          POSTGRES_RESULT: ${{ needs.postgres.result }}
         run: |
-          [[ "$QUALITY_RESULT" == success && "$TEST_RESULT" == success ]]
+          [[ "$QUALITY_RESULT" == success && "$TEST_RESULT" == success && "$POSTGRES_RESULT" == success ]]

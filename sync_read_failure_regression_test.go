@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -42,7 +43,11 @@ func TestSyncReadFailure_NoWritesFromIncompletePivotState(t *testing.T) {
 							onBegin:    func() { begins++ },
 							onCommit:   func() { commits++ },
 							onRollback: func() { rollbacks++ },
-							onExec:     func(string) { writes++ },
+							onExec: func(query string) {
+								if !strings.HasSuffix(query, "FOR UPDATE") {
+									writes++
+								}
+							},
 						}
 						db := openFailureDB(t, state)
 						ctx := context.Background()
