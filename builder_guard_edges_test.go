@@ -49,7 +49,7 @@ func TestBuilderGuards_ConstraintExtractionAndStructFilters(t *testing.T) {
 	}
 	for _, values := range [][]reflect.Value{nil, {reflect.ValueOf(42)}} {
 		m := New[ExModel]().Where("id", 1)
-		m.applyWhereHas(values, nil)
+		m.applyWhereHas(values, nil, "Invalid")
 		if len(m.wheres) != 1 {
 			t.Error("invalid relation result changed existing predicates")
 		}

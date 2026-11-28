@@ -4,6 +4,8 @@ import (
 	"math"
 	"reflect"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 func TestBuildInClause_PostgresArrayTypes(t *testing.T) {
@@ -41,7 +43,7 @@ func TestBuildInClause_PostgresArrayTypes(t *testing.T) {
 				if len(args) != 1 {
 					t.Fatalf("expected one array parameter, got %v", args)
 				}
-				if !reflect.DeepEqual(args[0], tt.expected) {
+				if !reflect.DeepEqual(args[0], pq.Array(tt.expected)) {
 					t.Errorf("expected array %#v, got %#v", tt.expected, args[0])
 				}
 			}

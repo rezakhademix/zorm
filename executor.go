@@ -94,14 +94,36 @@ func (m *Model[T]) queryerForWrite() interface {
 // auto-opened transaction lands on the same handle as the SQL it wraps.
 func (m *Model[T]) writeDB() *sql.DB {
 	if resolver := GetGlobalResolver(); resolver != nil {
-		if db := resolver.Primary(); db != nil {
-			return db
-		}
+		return resolver.Primary()
 	}
 	if m.db != nil {
 		return m.db
 	}
 	return GetGlobalDB()
+}
+
+// validateDatabase rejects missing connections before database/sql is called.
+func (m *Model[T]) validateDatabase(write bool) error {
+	if m.tx != nil {
+		return nil
+	}
+	if resolver := GetGlobalResolver(); resolver != nil {
+		if resolver.Primary() != nil {
+			return nil
+		}
+		if !write && !m.forcePrimary && m.lockMode == "" {
+			for _, db := range resolver.replicas {
+				if db != nil {
+					return nil
+				}
+			}
+		}
+		return ErrNilDatabase
+	}
+	if m.db == nil && GetGlobalDB() == nil {
+		return ErrNilDatabase
+	}
+	return nil
 }
 
 // stmtCacheKey namespaces a cached statement by the database handle it was
@@ -126,6 +148,9 @@ func (m *Model[T]) prepareStmtWithQueryer(ctx context.Context, query string, q i
 }) (*sql.Stmt, func(), error) {
 	switch handle := q.(type) {
 	case *sql.DB:
+		if handle == nil {
+			return nil, nil, ErrNilDatabase
+		}
 		key := stmtCacheKey(handle, query)
 		if stmt, release := m.stmtCache.Get(key); stmt != nil {
 			return stmt, release, nil
@@ -178,6 +203,10 @@ func (m *Model[T]) Get(ctx context.Context) ([]*T, error) {
 	if err := m.GetBuildErr(); err != nil {
 		return nil, err
 	}
+	if err := m.validateDatabase(false); err != nil {
+		return nil, err
+	}
+
 	query, args := m.buildSelectQuery()
 
 	var rows *sql.Rows
@@ -282,13 +311,17 @@ func (m *Model[T]) Pluck(ctx context.Context, column string) ([]any, error) {
 	if err := m.validateDerivedRead(); err != nil {
 		return nil, err
 	}
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		return nil, err
 	}
 
 	// Clone to avoid mutating shared state (thread-safe)
 	q := m.Clone()
 	q.columns = []string{column}
+
+	if err := m.validateDatabase(false); err != nil {
+		return nil, err
+	}
 
 	query, args := q.buildSelectQuery()
 
@@ -394,6 +427,10 @@ func (m *Model[T]) Count(ctx context.Context) (int64, error) {
 	args := append(cteArgs, q.args...)
 	args = append(args, q.havingArgs...)
 
+	if err := m.validateDatabase(false); err != nil {
+		return 0, err
+	}
+
 	var count int64
 	var err error
 
@@ -433,6 +470,10 @@ func (m *Model[T]) Exists(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	// Clone to avoid mutating shared state (thread-safe)
+	if err := m.validateDatabase(false); err != nil {
+		return false, err
+	}
+
 	q := m.Clone()
 	q.limit = 1
 	q.offset = 0
@@ -544,7 +585,7 @@ func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string
 	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return 0, err
 	}
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		return 0, err
 	}
 
@@ -569,6 +610,10 @@ func (m *Model[T]) aggregateFloat64(ctx context.Context, function, column string
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
+
+	if err := m.validateDatabase(false); err != nil {
+		return 0, err
+	}
 
 	var result sql.NullFloat64
 	var err error
@@ -626,7 +671,7 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int
 	if err := validateScalarAggregate(m.groupBys, m.havings); err != nil {
 		return nil, err
 	}
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		return nil, err
 	}
 
@@ -651,6 +696,10 @@ func (m *Model[T]) CountOver(ctx context.Context, column string) (map[string]int
 
 	query := sb.String()
 	args := append(cteArgs, q.args...)
+
+	if err := m.validateDatabase(false); err != nil {
+		return nil, err
+	}
 
 	var rows *sql.Rows
 	var err error
@@ -1087,6 +1136,10 @@ func (m *Model[T]) Cursor(ctx context.Context) (*Cursor[T], error) {
 	}
 	if len(m.relations) > 0 || len(m.relationCallbacks) > 0 || len(m.morphRelations) > 0 {
 		return nil, fmt.Errorf("zorm: Cursor does not support eager relation loading (With/WithCallback/WithMorph); use Get() instead")
+	}
+
+	if err := m.validateDatabase(false); err != nil {
+		return nil, err
 	}
 
 	query, args := m.buildSelectQuery()
@@ -1659,6 +1712,10 @@ func (m *Model[T]) Create(ctx context.Context, entity *T) error {
 		return ErrNilPointer
 	}
 
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+
 	// Auto-tx: if the entity uses a *Tx hook variant and we're not already in a
 	// transaction, open one so hook DB work rolls back atomically with the INSERT.
 	if m.tx == nil && needsAutoTx(opCreate, entity) {
@@ -1806,6 +1863,10 @@ func (m *Model[T]) Update(ctx context.Context, entity *T) error {
 		}
 	}
 
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+
 	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
 	if err := m.callBeforeUpdate(ctx, entity); err != nil {
 		return err
@@ -1938,6 +1999,12 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 		return nil // Nothing to update
 	}
 
+	for _, column := range columns {
+		if _, ok := m.modelInfo.Columns[column]; !ok {
+			return fmt.Errorf("zorm: %w: %q", ErrColumnNotFound, column)
+		}
+	}
+
 	// Auto-tx: see Create for rationale.
 	if m.tx == nil && needsAutoTx(opUpdate, entity) {
 		return m.withAutoTx(ctx, func(txm *Model[T]) error {
@@ -1964,6 +2031,10 @@ func (m *Model[T]) UpdateColumns(ctx context.Context, entity *T, columns ...stri
 				columns = append(columns, "updated_at")
 			}
 		}
+	}
+
+	if err := m.validateDatabase(true); err != nil {
+		return err
 	}
 
 	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented).
@@ -2126,6 +2197,10 @@ func (m *Model[T]) Save(ctx context.Context, entity *T) error {
 	originals, tracked := globalTracker.Load().LoadForTransaction(getEntityKey(entity), entity, m.tx)
 	if !tracked {
 		return ErrSaveUntracked
+	}
+
+	if err := m.validateDatabase(true); err != nil {
+		return err
 	}
 
 	// BeforeUpdate Hook (prefers BeforeUpdateTx when implemented). Fires
@@ -2388,6 +2463,10 @@ func (m *Model[T]) execDelete(ctx context.Context) error {
 		return err
 	}
 
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+
 	// Auto-tx: see Create for rationale. Delete hooks fire on a zero-value *T,
 	// so we probe T (not an entity) for *Tx variants.
 	if m.tx == nil && needsAutoTx(opDelete, new(T)) {
@@ -2447,6 +2526,9 @@ func (m *Model[T]) Exec(ctx context.Context) (sql.Result, error) {
 		return nil, err
 	}
 	if m.rawQuery != "" {
+		if err := m.validateDatabase(true); err != nil {
+			return nil, err
+		}
 		// Rebind like every other execution path, so a raw query written with ?
 		// placeholders works on PostgreSQL here as it does through Get/Print.
 		return m.queryerForWrite().ExecContext(ctx, rebind(m.rawQuery), m.rawArgs...)
@@ -2575,7 +2657,7 @@ func buildBulkInsertSQL(table, pk string, columns []string, numRows int, dialect
 	return actual.(string)
 }
 
-// CreateMany inserts multiple records in a single query.
+// CreateMany inserts multiple records, using per-entity inserts when create hooks are present.
 func (m *Model[T]) CreateMany(ctx context.Context, entities []*T) error {
 	return m.createManyImpl(ctx, entities, false)
 }
@@ -2610,6 +2692,17 @@ func (m *Model[T]) createManyImpl(ctx context.Context, entities []*T, skipPKScan
 			return ErrNilPointer
 		}
 		m.autoSetCreatedAt(e)
+	}
+
+	_, before := any(new(T)).(interface{ BeforeCreate(context.Context) error })
+	_, after := any(new(T)).(interface{ AfterCreate(context.Context) error })
+	if before || after || needsAutoTx(opCreate, new(T)) {
+		if m.tx != nil {
+			return m.BulkInsert(ctx, entities)
+		}
+		return m.withAutoTx(ctx, func(txm *Model[T]) error {
+			return txm.BulkInsert(ctx, entities)
+		})
 	}
 
 	// A batch that mixes set and unset auto primary keys cannot share one
@@ -2808,7 +2901,13 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 	}
 
 	dialect := m.effectiveDialect()
-	query := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, len(entities), dialect)
+	rowsPerStatement := len(entities)
+	if dialect == DialectSQLite {
+		// SQLite does not guarantee RETURNING order. Reuse one statement per
+		// row inside the batch transaction so each returned ID has one owner.
+		rowsPerStatement = 1
+	}
+	query := buildBulkInsertSQL(m.TableName(), m.modelInfo.PrimaryKey, columns, rowsPerStatement, dialect)
 
 	// Pool the args buffer; arg slices for big batches can be 4000+ entries.
 	argsP := getArgs(len(entities) * len(fieldsToInsert))
@@ -2847,38 +2946,48 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 	}
 
 	run := func(tx *sql.Tx) error {
-		var rows *sql.Rows
-		var err error
+		var txStmt *sql.Stmt
 		if stmt != nil {
-			txStmt := tx.StmtContext(ctx, stmt)
+			txStmt = tx.StmtContext(ctx, stmt)
 			defer txStmt.Close()
-			rows, err = txStmt.QueryContext(ctx, args...)
-		} else {
-			rows, err = tx.QueryContext(ctx, query, args...)
 		}
-		if err != nil {
-			return WrapQueryError("INSERT", query, args, err)
-		}
-		defer rows.Close()
-
-		// Buffer IDs until every input has a returned row. Assigning while scanning
-		// would attach a later row's ID to an input skipped by a database trigger.
+		// Buffer IDs until every input has a returned row. A failing statement
+		// or skipped row must not assign any of this batch's IDs.
 		ids := make([]reflect.Value, 0, len(entities))
-		for rows.Next() {
-			if len(ids) == len(entities) {
-				return fmt.Errorf("zorm: INSERT returned more than %d rows", len(entities))
+		for start := 0; start < len(entities); start += rowsPerStatement {
+			values := args[start*len(fieldsToInsert) : (start+rowsPerStatement)*len(fieldsToInsert)]
+			var rows *sql.Rows
+			var err error
+			if txStmt != nil {
+				rows, err = txStmt.QueryContext(ctx, values...)
+			} else {
+				rows, err = tx.QueryContext(ctx, query, values...)
 			}
-			id := reflect.New(pkField.FieldType)
-			if err := rows.Scan(id.Interface()); err != nil {
+			if err != nil {
+				return WrapQueryError("INSERT", query, values, err)
+			}
+			count := 0
+			for rows.Next() {
+				if count == rowsPerStatement {
+					rows.Close()
+					return fmt.Errorf("zorm: INSERT returned more than %d rows", rowsPerStatement)
+				}
+				id := reflect.New(pkField.FieldType)
+				if err := rows.Scan(id.Interface()); err != nil {
+					rows.Close()
+					return err
+				}
+				ids = append(ids, id.Elem())
+				count++
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
 				return err
 			}
-			ids = append(ids, id.Elem())
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if len(ids) != len(entities) {
-			return fmt.Errorf("zorm: INSERT returned %d rows for %d entities", len(ids), len(entities))
+			if count != rowsPerStatement {
+				return fmt.Errorf("zorm: INSERT returned %d rows for %d entities", count, rowsPerStatement)
+			}
 		}
 		for i, id := range ids {
 			reflect.ValueOf(entities[i]).Elem().FieldByIndex(pkField.Index).Set(id)
@@ -2897,6 +3006,16 @@ func (m *Model[T]) createBatch(ctx context.Context, tx *sql.Tx, entities []*T, c
 
 // UpdateMany updates records matching the query with values.
 func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error {
+	return m.execUpdateMany(ctx, values, false)
+}
+
+// ForceUpdateAll updates records without requiring a WHERE condition.
+// Any existing WHERE conditions are still applied.
+func (m *Model[T]) ForceUpdateAll(ctx context.Context, values map[string]any) error {
+	return m.execUpdateMany(ctx, values, true)
+}
+
+func (m *Model[T]) execUpdateMany(ctx context.Context, values map[string]any, force bool) error {
 	// A rejected builder input must not reach the database: the offending
 	// clause is dropped from the statement, so an unguarded write runs against
 	// a wider set of rows than the caller asked for.
@@ -2934,12 +3053,20 @@ func (m *Model[T]) UpdateMany(ctx context.Context, values map[string]any) error 
 		return nil
 	}
 
+	if !force && len(m.wheres) == 0 {
+		return fmt.Errorf("zorm: %w: UpdateMany requires at least one WHERE condition; use ForceUpdateAll() to update all records", ErrInvalidModel)
+	}
+
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+
 	var sets []string
 	var setArgs []any
 
 	// Sorted so the same call always emits the same SET list.
 	for _, k := range sortedKeys(values) {
-		if err := ValidateColumnName(k); err != nil {
+		if err := validateColumnIdentifier(k); err != nil {
 			return err
 		}
 
@@ -3002,10 +3129,10 @@ func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColu
 		return err
 	}
 	// Validate column names
-	if err := ValidateColumnName(lookupColumn); err != nil {
+	if err := validateColumnIdentifier(lookupColumn); err != nil {
 		return err
 	}
-	if err := ValidateColumnName(targetColumn); err != nil {
+	if err := validateColumnIdentifier(targetColumn); err != nil {
 		return err
 	}
 
@@ -3055,6 +3182,10 @@ func (m *Model[T]) UpdateManyByKey(ctx context.Context, lookupColumn, targetColu
 
 // updateManyByKeyBatch performs a single batch update for UpdateManyByKey.
 func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targetColumn string, mapVal reflect.Value, keys []reflect.Value) error {
+	if err := m.validateDatabase(true); err != nil {
+		return err
+	}
+
 	sb := GetStringBuilder()
 	defer PutStringBuilder(sb)
 
@@ -3086,6 +3217,10 @@ func (m *Model[T]) updateManyByKeyBatch(ctx context.Context, lookupColumn, targe
 		args = append(args, keyVal, mapVal.MapIndex(key).Interface())
 		lookupKeys = append(lookupKeys, keyVal)
 	}
+	// The existing column anchors PostgreSQL CASE result types when every
+	// THEN value is an otherwise untyped parameter.
+	sb.WriteString(" ELSE ")
+	sb.WriteString(targetColumn)
 	sb.WriteString(" END")
 
 	// Auto-update updated_at unless it is the explicit target.
@@ -3175,7 +3310,7 @@ func (m *Model[T]) updateManyByKeyChunked(ctx context.Context, lookupColumn, tar
 // fine-grained control or want to handle errors per-entity.
 // The prepared statement is reused for each entity, reducing preparation overhead.
 //
-// Unlike CreateMany, BulkInsert runs the create hooks: created_at is auto-set
+// BulkInsert runs the create hooks: created_at is auto-set
 // (zero-only) and BeforeCreate/BeforeCreateTx runs for every entity before the
 // first row is inserted, so a hook can still change the values that get written.
 // AfterCreate/AfterCreateTx runs per row as it is inserted.

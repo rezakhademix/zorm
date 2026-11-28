@@ -80,8 +80,12 @@ func Transaction(ctx context.Context, fn func(tx *Tx) error) error {
 
 // Transaction executes a function within a transaction using the model's database connection.
 // When a DBResolver is configured, the transaction is opened on the primary,
-// matching where the model's writes would go.
+// matching where the model's writes would go. An existing transaction is
+// rejected instead of opening an independent transaction.
 func (m *Model[T]) Transaction(ctx context.Context, fn func(tx *Tx) error) error {
+	if m.tx != nil {
+		return fmt.Errorf("zorm: %w: Transaction cannot open a nested transaction; use the existing transaction", ErrInvalidModel)
+	}
 	return transaction(ctx, transactionDB(m.db), fn)
 }
 
@@ -90,9 +94,7 @@ func (m *Model[T]) Transaction(ctx context.Context, fn func(tx *Tx) error) error
 // order queryerForWrite and (*Model[T]).writeDB use. preferred may be nil.
 func transactionDB(preferred *sql.DB) *sql.DB {
 	if resolver := GetGlobalResolver(); resolver != nil {
-		if db := resolver.Primary(); db != nil {
-			return db
-		}
+		return resolver.Primary()
 	}
 	if preferred != nil {
 		return preferred

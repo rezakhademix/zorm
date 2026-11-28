@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 // TestSelect tests the Select method
@@ -865,7 +867,7 @@ func TestWhereIn_LargeListUsesANYOnPostgres(t *testing.T) {
 	if len(outArgs) != 1 {
 		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
 	}
-	if _, ok := outArgs[0].([]int64); !ok {
+	if _, ok := outArgs[0].(*pq.Int64Array); !ok {
 		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
 	}
 }
@@ -892,7 +894,7 @@ func TestWhereNotIn_LargeListUsesALLOnPostgres(t *testing.T) {
 	if len(outArgs) != 1 {
 		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
 	}
-	if _, ok := outArgs[0].([]int64); !ok {
+	if _, ok := outArgs[0].(*pq.Int64Array); !ok {
 		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
 	}
 }
@@ -1387,7 +1389,7 @@ func TestOrWhereIn_LargeListUsesANYOnPostgres(t *testing.T) {
 	if len(outArgs) != 1 {
 		t.Fatalf("expected 1 bound argument (the typed slice), got %d", len(outArgs))
 	}
-	if _, ok := outArgs[0].([]int64); !ok {
+	if _, ok := outArgs[0].(*pq.Int64Array); !ok {
 		t.Fatalf("expected []int64 argument, got %T", outArgs[0])
 	}
 }

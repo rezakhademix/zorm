@@ -6,6 +6,10 @@ default: help
 test: ## run all tests
 	go test -v --race ./...
 
+.PHONY: run-pg-tests
+run-pg-tests: ## run real PostgreSQL tests with a temporary Docker container
+	@bash -o pipefail -c 'bash scripts/run-pg-tests.sh 2>&1 | tee pg-tests-report.log'
+
 test-one: ## run only tests matching the passed regex as `name`
 ifdef name
 	go test -run ${name}

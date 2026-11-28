@@ -2,6 +2,7 @@ package zorm
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -62,7 +63,7 @@ var validLockModes = map[string]bool{
 }
 
 // Select specifies which columns to select.
-// Column names are validated to prevent SQL injection.
+// Expressions must be trusted constants; pass user input as bound values.
 // Returns the model with buildErr set if any column name is invalid; the error
 // is surfaced when a terminal method (Get, First, etc.) is called.
 func (m *Model[T]) Select(columns ...string) *Model[T] {
@@ -89,7 +90,7 @@ func (m *Model[T]) Distinct() *Model[T] {
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) DistinctBy(columns ...string) *Model[T] {
 	for _, col := range columns {
-		if err := ValidateColumnName(col); err != nil {
+		if err := validateColumnIdentifier(col); err != nil {
 			m.buildErr = fmt.Errorf("zorm: DistinctBy: invalid column %q: %w", col, err)
 			return m
 		}
@@ -263,7 +264,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 		for _, field := range info.OrderedFields {
 			fVal := val.FieldByIndex(field.Index)
 			if !fVal.IsZero() {
-				if err := ValidateColumnName(field.Column); err != nil {
+				if err := validateColumnIdentifier(field.Column); err != nil {
 					m.buildErr = fmt.Errorf("Where struct: invalid column name %q: %w", field.Column, err)
 					return m
 				}
@@ -299,6 +300,7 @@ func (m *Model[T]) addWhere(typ string, query any, args ...any) *Model[T] {
 			m.buildErr = fmt.Errorf("zorm: Where: %w", err)
 			return m
 		}
+		queryStr = "(" + queryStr + ")"
 	}
 
 	m.wheres = append(m.wheres, typ+" "+queryStr)
@@ -362,7 +364,7 @@ func validateWhereRawString(s string) error {
 //	Model[User]().WhereNull("deleted_at")
 //	// WHERE deleted_at IS NULL
 func (m *Model[T]) WhereNull(column string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereNull: invalid column %q: %w", column, err)
 		return m
 	}
@@ -378,7 +380,7 @@ func (m *Model[T]) WhereNull(column string) *Model[T] {
 //	Model[User]().OrWhereNull("deleted_at")
 //	// OR deleted_at IS NULL
 func (m *Model[T]) OrWhereNull(column string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: OrWhereNull: invalid column %q: %w", column, err)
 		return m
 	}
@@ -394,7 +396,7 @@ func (m *Model[T]) OrWhereNull(column string) *Model[T] {
 //	Model[User]().WhereNotNull("verified_at")
 //	// WHERE verified_at IS NOT NULL
 func (m *Model[T]) WhereNotNull(column string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereNotNull: invalid column %q: %w", column, err)
 		return m
 	}
@@ -410,7 +412,7 @@ func (m *Model[T]) WhereNotNull(column string) *Model[T] {
 //	Model[User]().OrWhereNotNull("verified_at")
 //	// OR verified_at IS NOT NULL
 func (m *Model[T]) OrWhereNotNull(column string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: OrWhereNotNull: invalid column %q: %w", column, err)
 		return m
 	}
@@ -433,32 +435,105 @@ func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) erro
 		return err
 	}
 
-	page := 1
+	base := m.Clone()
+	if len(base.wheres) > 0 {
+		var where strings.Builder
+		where.WriteString("AND (")
+		writeWhereConditions(&where, base.wheres)
+		where.WriteByte(')')
+		base.wheres = []string{where.String()}
+	}
+	pk := m.modelInfo.PrimaryKey
+	orders := append([]string(nil), m.orderBys...)
+	hasPK := false
+	for _, order := range orders {
+		column := strings.Fields(order)[0]
+		parts := strings.Split(column, ".")
+		if parts[len(parts)-1] == pk {
+			hasPK = true
+		}
+	}
+	if !hasPK {
+		orders = append(orders, tableReference(m.TableName())+"."+pk+" ASC")
+	}
+	base.orderBys = orders
+	fields := make([]*FieldInfo, len(orders))
+	columns := make([]string, len(orders))
+	for i, order := range orders {
+		columns[i] = strings.Fields(order)[0]
+		parts := strings.Split(columns[i], ".")
+		fields[i] = m.modelInfo.Columns[parts[len(parts)-1]]
+		if fields[i] == nil {
+			return fmt.Errorf("zorm: %w: Chunk order column %q", ErrColumnNotFound, columns[i])
+		}
+		if len(base.columns) > 0 {
+			base.columns = append(base.columns, columns[i])
+		}
+	}
+	var cursor []any
 	for {
-		// Clone to avoid mutating the original model's limit/offset
-		q := m.Clone()
-		offset := (page - 1) * size
+		q := base.Clone()
 		q.limit = size
-		q.offset = offset
-
+		if cursor != nil {
+			q.offset = 0
+			q.Where(func(group *Model[T]) {
+				for i, order := range orders {
+					desc := strings.HasSuffix(order, " DESC")
+					nullsFirst := desc == (m.effectiveDialect() == DialectPostgres)
+					if cursor[i] == nil && !nullsFirst {
+						continue
+					}
+					group.OrWhere(func(term *Model[T]) {
+						for j := 0; j < i; j++ {
+							if cursor[j] == nil {
+								term.WhereNull(columns[j])
+							} else {
+								term.Where(columns[j], cursor[j])
+							}
+						}
+						if cursor[i] == nil {
+							term.WhereNotNull(columns[i])
+							return
+						}
+						op := ">"
+						if desc {
+							op = "<"
+						}
+						term.Where(func(comparison *Model[T]) {
+							comparison.Where(columns[i], op, cursor[i])
+							if !nullsFirst {
+								comparison.OrWhereNull(columns[i])
+							}
+						})
+					})
+				}
+			})
+		}
 		results, err := q.Get(ctx)
 		if err != nil {
 			return err
 		}
-
 		if len(results) == 0 {
 			break
 		}
-
+		// Capture the next cursor before the callback changes or deletes rows.
+		last := reflect.ValueOf(results[len(results)-1]).Elem()
+		cursor = make([]any, len(fields))
+		for i, field := range fields {
+			cursor[i], err = driver.DefaultParameterConverter.ConvertValue(fieldDatabaseValue(last.FieldByIndex(field.Index)))
+			if err != nil {
+				return err
+			}
+			if value, ok := cursor[i].([]byte); ok {
+				cursor[i] = append([]byte(nil), value...)
+			}
+		}
 		if err := callback(results); err != nil {
 			return err
 		}
-
 		if len(results) < size {
 			break
 		}
-
-		page++
 	}
 	return nil
 }
@@ -466,7 +541,7 @@ func (m *Model[T]) Chunk(ctx context.Context, size int, callback func([]*T) erro
 // WhereIn adds a WHERE IN clause.
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereIn: invalid column %q: %w", column, err)
 		return m
 	}
@@ -487,7 +562,7 @@ func (m *Model[T]) WhereIn(column string, args []any) *Model[T] {
 //
 //	Model[User]().OrWhereIn("status", []string{"active", "inactive"})
 func (m *Model[T]) OrWhereIn(column string, args []any) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: OrWhereIn: invalid column %q: %w", column, err)
 		return m
 	}
@@ -504,7 +579,7 @@ func (m *Model[T]) OrWhereIn(column string, args []any) *Model[T] {
 // WhereNotIn adds a WHERE NOT IN clause.
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) WhereNotIn(column string, args []any) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereNotIn: invalid column %q: %w", column, err)
 		return m
 	}
@@ -525,7 +600,7 @@ func (m *Model[T]) WhereNotIn(column string, args []any) *Model[T] {
 //
 //	Model[User]().OrWhereNotIn("status", []string{"active", "inactive"})
 func (m *Model[T]) OrWhereNotIn(column string, args []any) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: OrWhereNotIn: invalid column %q: %w", column, err)
 		return m
 	}
@@ -544,7 +619,7 @@ func (m *Model[T]) OrWhereNotIn(column string, args []any) *Model[T] {
 // Returns the model with buildErr set if either is invalid; the error is
 // surfaced when a terminal method (Get, First, etc.) is called.
 func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: OrderBy: invalid column %q: %w", column, err)
 		return m
 	}
@@ -568,7 +643,7 @@ func (m *Model[T]) OrderBy(column, direction string) *Model[T] {
 // Column names are validated to prevent SQL injection.
 func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
 	for _, col := range columns {
-		if err := ValidateColumnName(col); err != nil {
+		if err := validateColumnIdentifier(col); err != nil {
 			m.buildErr = fmt.Errorf("zorm: GroupBy: invalid column %q: %w", col, err)
 			return m
 		}
@@ -582,7 +657,7 @@ func (m *Model[T]) GroupBy(columns ...string) *Model[T] {
 func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
 	var validCols []string
 	for _, col := range columns {
-		if err := ValidateColumnName(col); err != nil {
+		if err := validateColumnIdentifier(col); err != nil {
 			m.buildErr = fmt.Errorf("zorm: GroupByRollup: invalid column %q: %w", col, err)
 			return m
 		}
@@ -604,7 +679,7 @@ func (m *Model[T]) GroupByRollup(columns ...string) *Model[T] {
 func (m *Model[T]) GroupByCube(columns ...string) *Model[T] {
 	var validCols []string
 	for _, col := range columns {
-		if err := ValidateColumnName(col); err != nil {
+		if err := validateColumnIdentifier(col); err != nil {
 			m.buildErr = fmt.Errorf("zorm: GroupByCube: invalid column %q: %w", col, err)
 			return m
 		}
@@ -633,7 +708,7 @@ func (m *Model[T]) GroupByGroupingSets(sets ...[]string) *Model[T] {
 		} else {
 			var validCols []string
 			for _, col := range set {
-				if err := ValidateColumnName(col); err != nil {
+				if err := validateColumnIdentifier(col); err != nil {
 					m.buildErr = fmt.Errorf("zorm: GroupByGroupingSets: invalid column %q: %w", col, err)
 					return m
 				}
@@ -835,6 +910,7 @@ func (m *Model[T]) SimplePaginate(ctx context.Context, page, perPage int) (*Pagi
 }
 
 // WhereHas adds a WHERE EXISTS clause for a relation.
+// MorphTo is unsupported and returns a deferred ErrInvalidRelation.
 func (m *Model[T]) WhereHas(relation string, callback any) *Model[T] {
 	return m.whereHasInternal(relation, callback)
 }
@@ -849,21 +925,28 @@ func (m *Model[T]) whereHasInternal(relation string, subQuery any) *Model[T] {
 		methodVal = parent.MethodByName(relation + "Relation")
 	}
 	if !methodVal.IsValid() {
+		m.buildErr = WrapRelationError(relation, m.modelInfo.Type.Name(), ErrRelationNotFound)
+		return m
+	}
+	if methodVal.Type().NumIn() != 0 || methodVal.Type().NumOut() != 1 {
+		m.buildErr = WrapRelationError(relation, m.modelInfo.Type.Name(), ErrInvalidRelation)
 		return m
 	}
 
 	retVals := methodVal.Call(nil)
-	return m.applyWhereHas(retVals, subQuery)
+	return m.applyWhereHas(retVals, subQuery, relation)
 }
 
-func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T] {
-	if len(retVals) == 0 {
+func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any, relation string) *Model[T] {
+	if len(retVals) != 1 {
+		m.buildErr = ErrInvalidRelation
 		return m
 	}
 
 	relConfig := retVals[0].Interface()
 	rel, ok := relConfig.(Relation)
-	if !ok {
+	if !ok || rel.RelationType() == RelationMorphTo || rel.NewRelated() == nil {
+		m.buildErr = fmt.Errorf("zorm: %w: unsupported WhereHas relation %T", ErrInvalidRelation, relConfig)
 		return m
 	}
 
@@ -872,10 +955,12 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 	if valConfig.Kind() == reflect.Ptr {
 		valConfig = valConfig.Elem()
 	}
-	foreignKey := valConfig.FieldByName("ForeignKey").String()
-	if foreignKey == "" {
-		// Default: parent_table_id (e.g., user_id)
-		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	configString := func(name string) string {
+		field := valConfig.FieldByName(name)
+		if field.IsValid() && field.Kind() == reflect.String {
+			return field.String()
+		}
+		return ""
 	}
 
 	// 3. Get related model info
@@ -913,18 +998,72 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 		tableName += " AS " + relatedReference
 	}
 
-	// 4. Build EXISTS subquery
+	// 4. Build EXISTS subquery using each relation's key direction.
+	localKey := configString("LocalKey")
+	if localKey == "" {
+		localKey = m.modelInfo.PrimaryKey
+	}
+	foreignKey := configString("ForeignKey")
+	if foreignKey == "" {
+		foreignKey = ToSnakeCase(m.modelInfo.Type.Name()) + "_id"
+	}
+	var correlation string
+	var relationArgs []any
+	switch rel.RelationType() {
+	case RelationHasOne, RelationHasMany:
+		correlation = relatedReference + "." + foreignKey + " = " + outerReference + "." + localKey
+	case RelationBelongsTo:
+		foreignKey = configString("ForeignKey")
+		if foreignKey == "" {
+			foreignKey = ToSnakeCase(strings.TrimSuffix(relation, "Relation")) + "_id"
+		}
+		ownerKey := configString("OwnerKey")
+		if ownerKey == "" {
+			ownerKey = relatedInfo.PrimaryKey
+		}
+		correlation = relatedReference + "." + ownerKey + " = " + outerReference + "." + foreignKey
+	case RelationBelongsToMany:
+		pivot := configString("PivotTable")
+		relatedKey := configString("RelatedKey")
+		if relatedKey == "" {
+			relatedKey = ToSnakeCase(relatedType.Name()) + "_id"
+		}
+		relatedPK := configString("RelatedPK")
+		if relatedPK == "" {
+			relatedPK = relatedInfo.PrimaryKey
+		}
+		for _, key := range []string{pivot, foreignKey, relatedKey, relatedPK, localKey} {
+			if err := validateColumnIdentifier(key); err != nil {
+				m.buildErr = err
+				return m
+			}
+		}
+		pivotAlias := "zorm_pivot"
+		for pivotAlias == outerReference || pivotAlias == relatedReference {
+			pivotAlias += "_"
+		}
+		correlation = "EXISTS (SELECT 1 FROM " + pivot + " AS " + pivotAlias + " WHERE " + pivotAlias + "." + foreignKey + " = " + outerReference + "." + localKey + " AND " + pivotAlias + "." + relatedKey + " = " + relatedReference + "." + relatedPK + ")"
+	case RelationMorphOne, RelationMorphMany:
+		id, kind := configString("ID"), configString("Type")
+		if err := validateColumnIdentifier(id); err != nil {
+			m.buildErr = err
+			return m
+		}
+		if err := validateColumnIdentifier(kind); err != nil {
+			m.buildErr = err
+			return m
+		}
+		correlation = relatedReference + "." + id + " = " + outerReference + "." + m.modelInfo.PrimaryKey + " AND " + relatedReference + "." + kind + " = ?"
+		relationArgs = append(relationArgs, m.modelInfo.MorphType)
+	default:
+		m.buildErr = ErrInvalidRelation
+		return m
+	}
 	var sb strings.Builder
 	sb.WriteString("EXISTS (SELECT 1 FROM ")
 	sb.WriteString(tableName)
 	sb.WriteString(" WHERE ")
-	sb.WriteString(relatedReference)
-	sb.WriteByte('.')
-	sb.WriteString(foreignKey)
-	sb.WriteString(" = ")
-	sb.WriteString(outerReference)
-	sb.WriteByte('.')
-	sb.WriteString(m.modelInfo.PrimaryKey)
+	sb.WriteString(correlation)
 
 	// 5. Apply additional constraints from callback
 	if subQuery != nil {
@@ -943,6 +1082,10 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 						table.Call([]reflect.Value{reflect.ValueOf(relatedReference)})
 					}
 				}
+				if fnVal.IsNil() || fnVal.Type().NumIn() != 1 || !reflect.TypeOf(relatedModel).AssignableTo(fnVal.Type().In(0)) {
+					m.buildErr = fmt.Errorf("zorm: %w: invalid WhereHas callback", ErrInvalidRelation)
+					return m
+				}
 				fnVal.Call([]reflect.Value{reflect.ValueOf(relatedModel)})
 				// Extract constraints from the populated model
 				constraints, args, err = extractQueryConstraints(relatedModel)
@@ -960,10 +1103,11 @@ func (m *Model[T]) applyWhereHas(retVals []reflect.Value, subQuery any) *Model[T
 			sb.WriteString(" AND (")
 			writeWhereConditions(&sb, constraints)
 			sb.WriteByte(')')
-			m.args = append(m.args, args...)
+			relationArgs = append(relationArgs, args...)
 		}
 	}
 
+	m.args = append(m.args, relationArgs...)
 	sb.WriteString(")")
 	m.wheres = append(m.wheres, "AND "+sb.String())
 
@@ -1098,11 +1242,11 @@ func (m *Model[T]) addJoin(joinType, table, col1, op, col2 string) *Model[T] {
 		m.buildErr = fmt.Errorf("zorm: %s: invalid table %q: %w", joinType, table, err)
 		return m
 	}
-	if err := ValidateColumnName(col1); err != nil {
+	if err := validateColumnIdentifier(col1); err != nil {
 		m.buildErr = fmt.Errorf("zorm: %s: invalid column %q: %w", joinType, col1, err)
 		return m
 	}
-	if err := ValidateColumnName(col2); err != nil {
+	if err := validateColumnIdentifier(col2); err != nil {
 		m.buildErr = fmt.Errorf("zorm: %s: invalid column %q: %w", joinType, col2, err)
 		return m
 	}
@@ -1147,7 +1291,7 @@ func (m *Model[T]) WithCallback(relation string, callback any) *Model[T] {
 		m.relationCallbacks = make(map[string]any)
 	}
 	m.relations = append(m.relations, relation)
-	m.relationCallbacks[relation] = callback
+	m.relationCallbacks[strings.SplitN(relation, ":", 2)[0]] = callback
 	return m
 }
 
@@ -1167,7 +1311,7 @@ func (m *Model[T]) WithMorph(relation string, typeMap map[string][]string) *Mode
 // CTE names are validated to prevent SQL injection.
 func (m *Model[T]) WithCTE(name string, query any) *Model[T] {
 	// Validate CTE name to prevent SQL injection
-	if err := ValidateColumnName(name); err != nil {
+	if err := validateColumnIdentifier(name); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WithCTE: invalid name %q: %w", name, err)
 		return m
 	}
@@ -1201,7 +1345,7 @@ func (m *Model[T]) Lock(mode string) *Model[T] {
 // Example: WhereFullText("content", "search terms")
 // Generates: WHERE to_tsvector('english', content) @@ plainto_tsquery('english', ?)
 func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereFullText: invalid column %q: %w", column, err)
 		return m
 	}
@@ -1221,11 +1365,11 @@ func (m *Model[T]) WhereFullText(column, searchText string) *Model[T] {
 // Example: WhereFullTextWithConfig("content", "search terms", "spanish")
 // Generates: WHERE to_tsvector('spanish', content) @@ plainto_tsquery('spanish', ?)
 func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereFullTextWithConfig: invalid column %q: %w", column, err)
 		return m
 	}
-	if err := ValidateColumnName(config); err != nil {
+	if err := validateColumnIdentifier(config); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereFullTextWithConfig: invalid config %q: %w", config, err)
 		return m
 	}
@@ -1250,7 +1394,7 @@ func (m *Model[T]) WhereFullTextWithConfig(column, searchText, config string) *M
 // Example: WhereTsVector("search_vector", "fat & rat")
 // Generates: WHERE search_vector @@ to_tsquery('english', ?)
 func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
-	if err := ValidateColumnName(tsvectorColumn); err != nil {
+	if err := validateColumnIdentifier(tsvectorColumn); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WhereTsVector: invalid column %q: %w", tsvectorColumn, err)
 		return m
 	}
@@ -1272,7 +1416,7 @@ func (m *Model[T]) WhereTsVector(tsvectorColumn, tsquery string) *Model[T] {
 // Example: WherePhraseSearch("content", "fat cat")
 // Generates: WHERE to_tsvector('english', content) @@ phraseto_tsquery('english', ?)
 func (m *Model[T]) WherePhraseSearch(column, phrase string) *Model[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		m.buildErr = fmt.Errorf("zorm: WherePhraseSearch: invalid column %q: %w", column, err)
 		return m
 	}

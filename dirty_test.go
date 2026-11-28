@@ -762,9 +762,9 @@ func trackerKeysInShard(tracker *lruTracker, count int) []uintptr {
 }
 
 func TestLRUTracker_Eviction(t *testing.T) {
-	// With sharded tracker (256 shards), a capacity of 512 gives 2 per shard.
+	// A capacity of 2 retains both entries before eviction.
 	// Use keys that hash to the same shard to test eviction within a shard.
-	tracker := newLRUTracker(512)
+	tracker := newLRUTracker(2)
 
 	// Pick colliding keys independently of the hash function.
 	keys := trackerKeysInShard(tracker, 3)
@@ -800,9 +800,8 @@ func TestLRUTracker_Eviction(t *testing.T) {
 }
 
 func TestLRUTracker_AccessOrder(t *testing.T) {
-	// Create a tracker with a larger capacity so each shard can hold multiple items
-	// With 256 shards, a capacity of 512 gives each shard capacity of 2
-	tracker := newLRUTracker(512)
+	// Access order determines which entry is evicted at capacity.
+	tracker := newLRUTracker(2)
 
 	// Pick colliding keys independently of the hash function.
 	keys := trackerKeysInShard(tracker, 3)
@@ -988,20 +987,16 @@ func TestConfigureDirtyTracking(t *testing.T) {
 	// Clear existing tracking data first
 	ClearAllOriginals()
 
-	// Configure with a larger capacity (768 = 3 per shard)
-	// With 256 shards, this gives 768/256 = 3 per shard
+	// Configure a shared capacity across all shards.
 	ConfigureDirtyTracking(768)
 
-	// Add 1024 entities - this exceeds capacity but due to sharding,
-	// entities are distributed. Just verify the mechanism works
-	// and capacity is enforced within shards
+	// Add enough entities to exceed the shared capacity.
 	for i := 0; i < 1024; i++ {
 		user := &DirtyUser{ID: i, Name: "User"}
 		trackOriginals(user, ParseModel[DirtyUser]())
 	}
 
-	// With sharding, we can't guarantee exact total count due to
-	// uneven distribution, but should be less than total entities added
+	// The total must remain within the configured capacity.
 	count := TrackedEntityCount()
 	if count == 0 {
 		t.Error("Expected some tracked entities")

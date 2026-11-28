@@ -440,7 +440,7 @@ Use raw `Exec` when you need `RowsAffected`.
 ### 4. Bulk Operations
 
 ```go
-// CreateMany - Insert multiple records in a single query
+// CreateMany - Insert multiple records, honoring create hooks
 users := []*User{
     {Name: "Alice", Email: "alice@example.com"},
     {Name: "Bob", Email: "bob@example.com"},
@@ -469,14 +469,15 @@ err = zorm.New[User]().Where("status", "inactive").DeleteMany(ctx)
 ```
 
 **CreateMany Features:**
-- Inserts all records in a single SQL statement for efficiency
+- Uses multi-row INSERTs on PostgreSQL when the model has no create hooks
+- Uses per-row INSERTs on SQLite so returned IDs cannot be assigned out of order
 - Automatically chunks large batches to stay within database limits (65535 parameters for PostgreSQL)
 - Uses transactions for multi-chunk inserts to ensure atomicity
 - Returns inserted IDs via `RETURNING` clause
 - Splits a batch that mixes set and unset primary keys into two INSERTs inside one
   transaction, so explicit IDs are honored and zero-PK rows are still auto-assigned
-- Auto-sets `created_at` (when the column exists and the field is zero), but runs
-  **no create hooks** — use `BulkInsert` if you need `BeforeCreate` / `AfterCreate`
+- Auto-sets `created_at` (when the column exists and the field is zero) and
+  runs create hooks through the `BulkInsert` path when hooks are present
 
 ```go
 // For very large datasets, CreateMany automatically chunks
@@ -501,14 +502,14 @@ err := zorm.New[User]().BulkInsert(ctx, users)
 ```
 
 `BulkInsert` reuses one prepared statement across the batch instead of building a
-single multi-row INSERT. Pick it over `CreateMany` when you need hooks; pick
-`CreateMany` when you want the fewest round trips.
+single multi-row INSERT. `CreateMany` uses this path too when create hooks are
+present; hook-free PostgreSQL batches use fewer round trips.
 
 |                                | `CreateMany`                              | `BulkInsert`                             |
 | ------------------------------ | ----------------------------------------- | ---------------------------------------- |
-| SQL shape                      | one multi-row INSERT (chunked)            | one prepared statement, executed per row |
+| SQL shape                      | multi-row on PostgreSQL; per-row on SQLite or with hooks | one prepared statement, executed per row |
 | `created_at` auto-set          | yes                                       | yes                                      |
-| `BeforeCreate` / `AfterCreate` | no                                        | yes                                      |
+| `BeforeCreate` / `AfterCreate` | yes                                       | yes                                      |
 | Mixed set/unset primary keys   | split into two INSERTs in one transaction | inserted as two groups                   |
 
 `BulkInsert` runs `BeforeCreate` for the whole batch *before* the first row is
@@ -577,10 +578,10 @@ imported := []*User{
 err = zorm.New[User]().CreateMany(ctx, imported)
 ```
 
-`CreateMany` and `CreateManyNewPK` skip create hooks. Use `BulkInsert` for
-hook-driven validation or defaults. Outside an explicit transaction, plain
-`BulkInsert` can leave earlier rows inserted if a later row fails. Wrap it
-when the entire operation must succeed or fail together:
+`CreateMany` and `CreateManyNewPK` honor create hooks by using `BulkInsert`
+when the model declares them, retaining one transaction for the batch. Outside
+an explicit transaction, plain `BulkInsert` can leave earlier rows inserted if
+a later row fails. Wrap it when the entire operation must succeed or fail together:
 
 ```go
 // Insert every row and its transactional hook side effects atomically
@@ -599,8 +600,13 @@ Rollback does not restore IDs or other fields already changed in Go memory.
 `UpdateMany` sets the same values on all matching rows, including zero and
 nil values. `UpdateManyByKey` assigns a different value per lookup key.
 Neither method runs per-entity update hooks or performs `Save`'s optimistic
-version check. Unlike `Delete`, `UpdateMany` allows an empty WHERE; add the
-conditions that define the intended batch.
+version check. `UpdateMany`, like `Delete`, requires a WHERE condition. Use
+`ForceUpdateAll(ctx, values)` for an intentional full-table update; existing
+WHERE conditions are still applied.
+
+```go
+err := zorm.New[User]().ForceUpdateAll(ctx, map[string]any{"active": false})
+```
 
 `UpdateManyByKey` preserves supplied timestamps when `updated_at` is the target
 column. Updates to other columns still touch `updated_at` automatically.
@@ -878,7 +884,7 @@ zorm.ClearOriginals(user)
 | Method                                      | Description                                       |
 | ------------------------------------------- | ------------------------------------------------- |
 | `Create(ctx, entity)`                       | Insert single record                              |
-| `CreateMany(ctx, entities)`                 | Insert multiple records in one statement          |
+| `CreateMany(ctx, entities)`                 | Insert multiple records and honor create hooks          |
 | `BulkInsert(ctx, entities)`                 | Insert multiple records, running the create hooks |
 | `Update(ctx, entity)`                       | Update all non-PK columns by primary key          |
 | `Save(ctx, entity)`                         | Update only dirty columns; optimistic-lock aware  |
@@ -943,9 +949,10 @@ when zorm owns the transaction, the batch is rolled back.
 | `CreateManyNewPK(ctx, entities)`                                                 | Insert rows known to have unset auto-generated keys   | [Fresh inserts](#fresh-inserts-and-atomic-batches)                 |
 | `UpdateColumns(ctx, entity, columns...)`                                         | Write an explicit column list by primary key          | [Selected fields](#updating-selected-fields-including-zero-values) |
 | `Exclude(columns...)`                                                            | Exclude columns from `Update` or `Save`               | [Dirty tracking](#inspecting-dirty-fields-and-pending-changes)     |
+| `ForceUpdateAll(ctx, values)` | Allow an update without WHERE | [Filtered batches](#updating-a-filtered-batch) |
 | `ForceDeleteAll(ctx)`                                                            | Allow a delete without WHERE                          | [Deleting records](#deleting-records)                              |
 | `Cursor(ctx)`                                                                    | Stream mapped rows                                    | [Cursor](#cursor-memory-efficient-iteration)                       |
-| `Chunk(ctx, size, callback)`                                                     | Process batches using LIMIT/OFFSET                    | [Chunking](#chunking-large-datasets)                               |
+| `Chunk(ctx, size, callback)`                                                     | Process batches using an ordered cursor                    | [Chunking](#chunking-large-datasets)                               |
 | `Paginate(ctx, page, perPage)`                                                   | Return data and total-count metadata                  | [Pagination](#pagination)                                          |
 | `SimplePaginate(ctx, page, perPage)`                                             | Return data without a count query                     | [Pagination](#pagination)                                          |
 | `Join`, `LeftJoin`, `RightJoin`, `CrossJoin`                                     | Build SQL joins                                       | [Joins](#joins-and-result-structs)                                 |
@@ -1410,6 +1417,11 @@ Rules worth knowing:
 - **Write methods refuse to run with a build error.** This matters most for
   `UpdateMany` / `UpdateManyByKey`: a dropped `WHERE` would otherwise turn a
   targeted update into a table-wide one.
+- **Unknown `UpdateColumns` names return `ErrColumnNotFound`.** No columns or
+  timestamps are written when any requested name is unknown.
+- **Invalid `WhereHas` relations produce a build error.** HasOne, HasMany,
+  BelongsTo, BelongsToMany, MorphOne and MorphMany use their configured keys.
+  MorphTo is unsupported and returns `ErrInvalidRelation`.
 - **Unsupported WHERE condition types produce a build error.** This includes
   nil conditions; use one of the documented string, map, struct, or callback forms.
 - **Updates and deletes reject unsupported query state.** `Raw`, JOINs,
@@ -1447,9 +1459,12 @@ if err := query.GetBuildErr(); err != nil {
 users, err := query.Get(ctx)
 ```
 
-`ValidateColumnName` returns an error for a rejected identifier;
-`MustValidateColumnName` panics and is intended for programmer-controlled
-configuration. `ValidateRawQuery` checks a SQL fragment, not authorization
+`OrderBy`, `GroupBy`, `DistinctBy`, joins, predicates, `Pluck`, and aggregate
+column arguments accept single identifiers, optionally qualified with a table or
+schema. SQL expressions belong in trusted `Select` or `Raw` text.
+`ValidateColumnName` checks characters in trusted expressions; it does not make
+user-supplied SQL expressions safe. `MustValidateColumnName` panics and is intended
+for programmer-controlled configuration. `ValidateRawQuery` checks a SQL fragment, not authorization
 or the safety of interpolated user values.
 
 ### Exists Check
@@ -2013,7 +2028,7 @@ func (u *User) AfterDelete(ctx context.Context) error {
 
 Delete hooks do not receive the matching rows or the WHERE arguments, so
 `u.ID` is not the ID of each deleted user. Batch update methods and raw SQL
-do not invoke entity update hooks; `CreateMany` skips create hooks.
+do not invoke entity update hooks. `CreateMany` honors create hooks.
 
 #### Driver placeholders inside hooks
 
@@ -2226,7 +2241,9 @@ users, _ := zorm.New[User]().WithCallback("Posts", func(q *zorm.Model[Post]) {
 ```
 
 A validation failure inside the callback is returned by `Get` / `Load`; the
-relation is not loaded unfiltered.
+relation is not loaded unfiltered. Callbacks also apply to nested paths
+(`Posts.Comments`) and column-limited paths (`Posts:id,user_id,title`).
+BelongsToMany callback ordering and limits apply to each parent's matched rows.
 
 `Load` and `LoadSlice` replace previous relation values. A missing match or
 cleared foreign key leaves an empty relation rather than retaining old data.
@@ -2279,12 +2296,12 @@ users, err := zorm.New[User]().
 users, err = zorm.New[User]().WhereHas("Posts", nil).Get(ctx)
 ```
 
-The callback contributes WHERE predicates to an EXISTS subquery; it is not
-a general child SELECT builder. This helper does not implement pivot-table
-or polymorphic filtering, dot-separated relation paths, or custom LocalKey
-matching. A missing relation method currently leaves the query unchanged,
-so use known relation names and keep predicate columns and callback types
-under application control. Use a bound raw EXISTS fragment for other shapes:
+The callback contributes WHERE predicates to an EXISTS subquery. HasOne,
+HasMany, BelongsTo and BelongsToMany honor their local, owner and pivot keys;
+MorphOne and MorphMany also constrain the morph type. Unknown or invalid
+relations fail with a build error. MorphTo and dot-separated paths are
+unsupported; nest `WhereHas` calls in callbacks or use a bound raw EXISTS
+fragment for other shapes:
 
 ```go
 // Filter through a many-to-many pivot table explicitly
@@ -3190,11 +3207,13 @@ err := zorm.New[User]().Chunk(ctx, 1000, func(users []*User) error {
 })
 ```
 
-Use a positive chunk size and stable ordering. A non-positive size returns
-an error before any query or callback runs. `Chunk` uses LIMIT/OFFSET,
-overrides its cloned query's limit/offset for each batch, and stops when the
-callback returns an error or the final batch is exhausted. Modifying the
-rows used by the filter while iterating can shift offsets and skip rows.
+Use a positive chunk size. A non-positive size returns an error before any
+query or callback runs. `Chunk` uses an ordered cursor and adds the primary
+key as a tie-breaker. Deleting processed rows or changing their filter values
+does not shift later batches. Keep ordering columns unchanged while iterating.
+Order columns must belong to the model; they are included in limited projections
+so the next cursor can be read. An initial offset applies only to the first
+batch. The callback can return an error to stop iteration.
 
 ```go
 // Export in ordered batches and release tracking after each batch
@@ -3500,6 +3519,23 @@ Recorded on Apple M3 Pro / darwin/arm64, SQLite `:memory:`, single connection. R
 | EagerLoadHasMany    | 1,466,133 · 627,644 · 17,223    | 1,147,633 · 442,953 · 11,536    | **zorm** 22% faster, 29% less memory, 33% fewer allocs |
 | EagerLoadBelongsTo  | 322,497 · 177,939 · 3,798       | 304,350 · 153,179 · 3,491       | **zorm** 6% faster, 14% less memory, 8% fewer allocs   |
 
+
+## Running PostgreSQL Tests Locally
+
+With Docker Compose and Go installed, run:
+
+```bash
+make run-pg-tests
+```
+
+This starts `postgres:18-alpine`, waits for its health check, and runs the
+`TestPostgres_*` integration tests, including pgx and lib/pq. PostgreSQL uses a
+random localhost port and temporary in-memory storage.
+
+Output, PostgreSQL logs, and the exit status are saved to `pg-tests-report.log`.
+The report is overwritten on each run and ignored by Git. The container,
+network, and volumes are removed after success, failure, or interruption.
+The make command returns a failure status if startup, tests, or cleanup fail.
 
 ## Contributing
 

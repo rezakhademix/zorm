@@ -26,7 +26,7 @@ func (e *evictionSaveItem) BeforeUpdate(context.Context) error {
 func TestSave_EvictionCannotWidenPartialWrite(t *testing.T) {
 	for _, excluded := range []bool{false, true} {
 		old := globalTracker.Load()
-		ConfigureDirtyTracking(shardCount)
+		ConfigureDirtyTracking(1)
 		func() {
 			defer globalTracker.Store(old)
 			db := setupSaveDB(t)
@@ -44,7 +44,7 @@ func TestSave_EvictionCannotWidenPartialWrite(t *testing.T) {
 				m.Exclude("value")
 			}
 			entity.Before = func() error {
-				// One entry fits per shard. Find a colliding key without
+				// One entry fits in the tracker. Find a colliding key without
 				// relying on pointer alignment or a particular hash function.
 				tracker := globalTracker.Load()
 				entityKey := getEntityKey(entity)

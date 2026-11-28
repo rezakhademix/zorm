@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/lib/pq"
 )
 
 // Dialect identifies the SQL dialect used to build queries. ZORM targets
@@ -110,7 +112,7 @@ func detectDialect(db *sql.DB) Dialect {
 // On PostgreSQL with a slice whose elements share a supported scalar type
 // (int / int32 / int64 / uint / uint32 / uint64 / string / float32 / float64
 // / bool), it returns `col = ANY(?)` with a single typed-slice arg —
-// sidestepping the 65535 parameter limit via pgx's native array binding.
+// sidestepping the 65535 parameter limit via driver-compatible PostgreSQL array binding.
 //
 // On SQLite, or when the slice is mixed-type or of an unsupported element
 // type, it returns the classic `col IN (?, ?, ...)` form with spread args.
@@ -140,9 +142,9 @@ func buildInClauseWithOperator(col string, args []any, dialect Dialect, negate b
 	if dialect == DialectPostgres {
 		if typed, ok := toTypedArraySlice(args); ok {
 			if negate {
-				return col + " <> ALL(?)", []any{typed}, nil
+				return col + " <> ALL(?)", []any{pq.Array(typed)}, nil
 			}
-			return col + " = ANY(?)", []any{typed}, nil
+			return col + " = ANY(?)", []any{pq.Array(typed)}, nil
 		}
 	}
 	if len(args) > maxInArgs {

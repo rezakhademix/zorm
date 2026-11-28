@@ -80,6 +80,7 @@ func (q *ScalarQuery[T]) Table(name string) *ScalarQuery[T] {
 }
 
 // Select sets the column to select (single column only).
+// Expressions must be trusted constants; pass user input as bound values.
 func (q *ScalarQuery[T]) Select(column string) *ScalarQuery[T] {
 	if err := ValidateColumnName(column); err != nil {
 		q.buildErr = fmt.Errorf("ScalarQuery.Select: invalid column name %q: %w", column, err)
@@ -138,7 +139,7 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: %w", err)
 			return q
 		}
-		q.wheres = append(q.wheres, typ+" "+queryStr)
+		q.wheres = append(q.wheres, typ+" ("+queryStr+")")
 		q.args = append(q.args, args...)
 		return q
 	}
@@ -151,7 +152,7 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 			q.buildErr = fmt.Errorf("zorm: ScalarQuery.Where: %w", err)
 			return q
 		}
-		q.wheres = append(q.wheres, typ+" "+queryStr)
+		q.wheres = append(q.wheres, typ+" ("+queryStr+")")
 	case 1:
 		// column, value -> column = value (or a trailing operator).
 		comparison, err := buildWhereComparison(queryStr)
@@ -202,7 +203,7 @@ func (q *ScalarQuery[T]) addWhere(typ string, query any, args ...any) *ScalarQue
 
 // WhereIn adds a WHERE column IN (...) condition.
 func (q *ScalarQuery[T]) WhereIn(column string, values []any) *ScalarQuery[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereIn: invalid column %q: %w", column, err)
 		return q
 	}
@@ -218,7 +219,7 @@ func (q *ScalarQuery[T]) WhereIn(column string, values []any) *ScalarQuery[T] {
 
 // WhereNotIn adds a WHERE column NOT IN (...) condition.
 func (q *ScalarQuery[T]) WhereNotIn(column string, values []any) *ScalarQuery[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNotIn: invalid column %q: %w", column, err)
 		return q
 	}
@@ -234,7 +235,7 @@ func (q *ScalarQuery[T]) WhereNotIn(column string, values []any) *ScalarQuery[T]
 
 // WhereNull adds a WHERE column IS NULL condition.
 func (q *ScalarQuery[T]) WhereNull(column string) *ScalarQuery[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNull: invalid column %q: %w", column, err)
 		return q
 	}
@@ -244,7 +245,7 @@ func (q *ScalarQuery[T]) WhereNull(column string) *ScalarQuery[T] {
 
 // WhereNotNull adds a WHERE column IS NOT NULL condition.
 func (q *ScalarQuery[T]) WhereNotNull(column string) *ScalarQuery[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		q.buildErr = fmt.Errorf("zorm: ScalarQuery.WhereNotNull: invalid column %q: %w", column, err)
 		return q
 	}
@@ -256,7 +257,7 @@ func (q *ScalarQuery[T]) WhereNotNull(column string) *ScalarQuery[T] {
 // The column name and direction are validated; invalid input sets buildErr,
 // which is surfaced by the terminal call.
 func (q *ScalarQuery[T]) OrderBy(column, direction string) *ScalarQuery[T] {
-	if err := ValidateColumnName(column); err != nil {
+	if err := validateColumnIdentifier(column); err != nil {
 		q.buildErr = fmt.Errorf("zorm: ScalarQuery.OrderBy: invalid column %q: %w", column, err)
 		return q
 	}
@@ -296,7 +297,7 @@ func (q *ScalarQuery[T]) Distinct() *ScalarQuery[T] {
 // GroupBy adds GROUP BY columns.
 func (q *ScalarQuery[T]) GroupBy(columns ...string) *ScalarQuery[T] {
 	for _, col := range columns {
-		if err := ValidateColumnName(col); err != nil {
+		if err := validateColumnIdentifier(col); err != nil {
 			q.buildErr = fmt.Errorf("zorm: ScalarQuery.GroupBy: invalid column %q: %w", col, err)
 			return q
 		}
@@ -337,6 +338,11 @@ func (q *ScalarQuery[T]) Get(ctx context.Context) ([]T, error) {
 	if q.buildErr != nil {
 		return nil, q.buildErr
 	}
+	m := &Model[T]{db: q.db, tx: q.tx}
+	if err := m.validateDatabase(false); err != nil {
+		return nil, err
+	}
+
 	query := q.buildQuery()
 	args := q.queryArgs()
 
@@ -393,6 +399,11 @@ func (q *ScalarQuery[T]) Count(ctx context.Context) (int64, error) {
 	if q.buildErr != nil {
 		return 0, q.buildErr
 	}
+	m := &Model[T]{db: q.db, tx: q.tx}
+	if err := m.validateDatabase(false); err != nil {
+		return 0, err
+	}
+
 	if err := validateScalarAggregate(q.groupBys, q.havings); err != nil {
 		return 0, err
 	}
